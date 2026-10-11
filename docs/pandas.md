@@ -35,7 +35,7 @@ print(df.describe())
 
 If you want to use the query results output to S3 directly, you can use {ref}`pandas-cursor`.
 This cursor reads query results directly from S3 as pandas DataFrames.
-The [benchmark tooling](https://github.com/pyathena-dev/PyAthena/tree/master/benchmarks) compares cursor performance and memory use; measurements for the current harness are pending.
+The [benchmark tooling](https://github.com/pyathena-dev/PyAthena/tree/master/benchmarks) compares cursor performance and memory use, and its [recorded results](https://github.com/pyathena-dev/PyAthena/blob/master/benchmarks/RESULTS.md) list the measured runs.
 
 (to-sql)=
 

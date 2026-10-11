@@ -7,7 +7,7 @@
 
 import csv
 import io
-from unittest.mock import MagicMock, PropertyMock, patch, sentinel
+from unittest.mock import ANY, MagicMock, PropertyMock, patch, sentinel
 
 import pandas as pd
 import pyarrow as pa
@@ -157,6 +157,8 @@ class TestAthenaPandasResultSet:
         result_set._keep_default_na = False
         result_set._na_values = ("",)
         result_set._kwargs = read_csv_kwargs
+        result_set._block_size = None
+        result_set._cache_type = None
         result_set._fs = MagicMock()
         result_set._fs.open.return_value = stream = io.BytesIO(data)
         description = [(name, "string", None, None, 0, 0, "UNKNOWN") for name in names]
@@ -180,6 +182,9 @@ class TestAthenaPandasResultSet:
         assert actual.iloc[:, 0].tolist() == expected_names
         read_csv.assert_called_once()
         assert read_csv.call_args.kwargs["engine"] == "c"
+        result_set._fs.open.assert_called_once_with(
+            "s3://bucket/result.txt", mode="rb", **result_set._get_csv_open_options(True)
+        )
         assert stream.closed
 
     @pytest.mark.parametrize(
@@ -208,6 +213,32 @@ class TestAthenaPandasResultSet:
         result_set._chunksize = chunksize
         result_set._kwargs = execute_kwargs
         assert result_set._reads_parquet_in_chunks() is expected
+
+    @pytest.mark.parametrize(
+        ("block_size", "cache_type", "prefetch", "expected"),
+        [
+            (
+                None,
+                None,
+                True,
+                {
+                    "block_size": 32 * 2**20,
+                    "cache_type": "background",
+                    "cache_options": {"maxblocks": 2},
+                },
+            ),
+            (None, None, False, {}),
+            (5 * 2**20, None, True, {}),
+            (None, "bytes", True, {}),
+            (5 * 2**20, "readahead", True, {}),
+        ],
+    )
+    def test_get_csv_open_options(self, block_size, cache_type, prefetch, expected):
+        """Whole CSV results are prefetched unless the cursor sets block_size or cache_type."""
+        result_set = AthenaPandasResultSet.__new__(AthenaPandasResultSet)
+        result_set._block_size = block_size
+        result_set._cache_type = cache_type
+        assert result_set._get_csv_open_options(prefetch) == expected
 
     @pytest.mark.parametrize(
         ("execute_kwargs", "path", "filesystem_kwargs"),
@@ -319,6 +350,44 @@ class TestParquetChunkDtypes:
         assert_frame_equal(pd.concat(chunks), whole, check_exact=True)
 
 
+_READ_MODES = [
+    pytest.param(None, {}, True, id="dataframe"),
+    pytest.param(1, {}, False, id="chunksize"),
+    pytest.param(None, {"iterator": True}, False, id="iterator"),
+]
+
+
+@pytest.mark.parametrize(("chunksize", "kwargs", "prefetch"), _READ_MODES)
+def test_read_csv_prefetches_without_reader(chunksize, kwargs, prefetch):
+    """Only a CSV result read in one pandas.read_csv() call uses the background cache."""
+    with patch.object(
+        AthenaPandasResultSet, "_get_csv_open_options", autospec=True, return_value={}
+    ) as open_options:
+        result, _ = _read_csv_result(
+            '"v"\n"a"\n"b"\n', {"v": "varchar"}, chunksize=chunksize, **kwargs
+        )
+        if not prefetch:
+            result.close()
+    open_options.assert_called_once_with(ANY, prefetch)
+
+
+@pytest.mark.parametrize(("chunksize", "kwargs", "prefetch"), _READ_MODES)
+def test_read_csv_binary_stream_prefetch(chunksize, kwargs, prefetch):
+    """The text stream for binary columns is opened for the same kind of read."""
+    with patch.object(
+        AthenaPandasResultSet,
+        "_open_binary_csv_stream",
+        autospec=True,
+        side_effect=lambda *args, **_: io.StringIO('"b"\n"00 ff"\n'),
+    ) as open_stream:
+        result, _ = _read_csv_result(
+            '"b"\n"00 ff"\n', {"b": "varbinary"}, chunksize=chunksize, **kwargs
+        )
+        if not prefetch:
+            result.close()
+    assert open_stream.call_args.kwargs == {"prefetch": prefetch}
+
+
 # A CSV result of Athena with each type the PyArrow engine reads, then a row of NULLs.
 _TYPES_CSV = (
     '"ti","si","i","bi","r","d","c","v","ml","arr","m","rw","dt","ts","ts6","tm","iv","nul","u",'
@@ -407,6 +476,8 @@ def _read_csv_result(data, types, engine="c", chunksize=None, **kwargs):
     result_set._kwargs = kwargs
     result_set._time_columns = []
     result_set._csv_stream = None
+    result_set._block_size = None
+    result_set._cache_type = None
     result_set._fs = MagicMock()
     result_set._fs.open.return_value = io.BytesIO(data.encode())
     description = [(name, type_, None, None, 0, 0, "UNKNOWN") for name, type_ in types.items()]
