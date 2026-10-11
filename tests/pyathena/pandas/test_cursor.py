@@ -894,6 +894,38 @@ class TestPandasCursor:
         assert pandas_cursor.fetchall() == []
 
     @pytest.mark.parametrize(
+        "pandas_cursor", [{"cursor_kwargs": {"unload": True}}], indirect=["pandas_cursor"]
+    )
+    def test_unload_chunks_complex(self, pandas_cursor):
+        """Chunks of complex-typed UNLOAD results convert as the whole result does."""
+        # NOT_SUPPORTED: Unsupported Hive type: time, json
+        query = """
+            SELECT
+              col_boolean
+              ,col_tinyint
+              ,col_smallint
+              ,col_int
+              ,col_bigint
+              ,col_float
+              ,col_double
+              ,col_string
+              ,col_varchar
+              ,col_timestamp
+              ,col_date
+              ,col_binary
+              ,col_array
+              ,col_map
+              ,col_struct
+              ,col_decimal
+            FROM one_row_complex
+            """
+        whole = pandas_cursor.execute(query).as_pandas()
+        chunks = list(pandas_cursor.execute(query, chunksize=1).as_pandas())
+        assert len(chunks) == 1
+        pd.testing.assert_series_equal(chunks[0].dtypes, whole.dtypes)
+        pd.testing.assert_frame_equal(chunks[0], whole)
+
+    @pytest.mark.parametrize(
         ("pandas_cursor", "parquet_engine"),
         [
             ({"cursor_kwargs": {"unload": True}}, "auto"),

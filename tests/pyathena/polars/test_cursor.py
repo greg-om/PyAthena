@@ -584,6 +584,38 @@ class TestPolarsCursor:
             assert chunk.schema == whole.schema
         assert pl.concat(chunks).sort("k").equals(whole.sort("k"))
 
+    @pytest.mark.parametrize(
+        "polars_cursor", [{"cursor_kwargs": {"unload": True}}], indirect=["polars_cursor"]
+    )
+    def test_unload_chunks_complex(self, polars_cursor):
+        """Chunks of complex-typed UNLOAD results convert as the whole result does."""
+        # NOT_SUPPORTED: Unsupported Hive type: time, json
+        query = """
+            SELECT
+              col_boolean
+              ,col_tinyint
+              ,col_smallint
+              ,col_int
+              ,col_bigint
+              ,col_float
+              ,col_double
+              ,col_string
+              ,col_varchar
+              ,col_timestamp
+              ,col_date
+              ,col_binary
+              ,col_array
+              ,col_map
+              ,col_struct
+              ,col_decimal
+            FROM one_row_complex
+            """
+        whole = polars_cursor.execute(query).as_polars()
+        chunks = list(polars_cursor.execute(query, chunksize=1).iter_chunks())
+        assert len(chunks) == 1
+        assert chunks[0].schema == whole.schema
+        assert chunks[0].equals(whole)
+
     def test_iter_chunks_data_consistency(self):
         """Test that chunked and regular reading produce the same data."""
         with contextlib.closing(connect(schema_name=ENV.schema)) as conn:

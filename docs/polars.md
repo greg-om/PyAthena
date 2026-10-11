@@ -331,7 +331,7 @@ The chunked iteration also works with the unload option.
 With pyarrow installed, the Parquet files of the result are read one at a time through PyAthena's S3 filesystem,
 and each chunk is converted from pyarrow, so memory usage depends on the size of each chunk rather than on the files.
 With read options given to `execute()`, or without pyarrow, Polars' `scan_parquet()` reads the files with those options;
-it decodes whole row groups and reads ahead, so memory usage can reach the size of the whole result:
+it decodes whole row groups and reads ahead, so `chunksize` does not limit memory usage:
 
 ```python
 from pyathena import connect

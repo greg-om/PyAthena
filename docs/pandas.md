@@ -340,7 +340,7 @@ The Pandas cursor can read the CSV file for each specified number of rows by usi
 This option should reduce memory usage.
 With the unload option, the cursor reads the Parquet files of the result in chunks of the specified number of rows,
 unless `execute()` is given `pandas.read_parquet()` options other than `columns` and `dtype_backend`, in which case the whole result is read.
-Integer and boolean columns that hold NULL anywhere in the result have the same dtype in every chunk as in the whole result.
+When the Parquet files record NULL counts, as Athena's do, integer and boolean columns that hold NULL anywhere in the result have the same dtype in every chunk as in the whole result.
 
 The chunksize option can be enabled by specifying an integer value in the `cursor_kwargs` argument of the connect method or as an argument to the cursor method.
 An argument to the cursor method takes precedence over the same key in `cursor_kwargs`.
