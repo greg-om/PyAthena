@@ -15,4 +15,4 @@ Compare entries only when they used the same instance type, architecture, and sc
 
 | Date | Commit | PyAthena | Hosts | Purchase | Scales | Entry |
 | --- | --- | --- | --- | --- | --- | --- |
-| 2026-10-11 | `8a69ce03` | 4.0.0 | `r7g.2xlarge` (arm64), 12 hosts | Spot | medium, large, xlarge | [2026-10-11-8a69ce03](history/2026-10-11-8a69ce03.md) |
+| 2026-10-11 | `8a69ce03` | 4.0.0 | `r7g.2xlarge` (arm64), fleet of 12 | Spot | medium, large, xlarge | [2026-10-11-8a69ce03](history/2026-10-11-8a69ce03.md) |
