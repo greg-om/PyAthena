@@ -990,9 +990,10 @@ class AthenaPandasResultSet(AthenaResultSet):
         is read with fsspec's background cache in blocks of ``CSV_BLOCK_SIZE`` bytes:
         the next block is read while pandas parses the current one, and two blocks
         are kept. Otherwise the filesystem's settings apply. Callers prefetch only a
-        file that ``pandas.read_csv()`` reads to its end in one call: closing a
-        prefetching file early, as the callers of a reader can, waits for the block
-        being read, which would block the event loop of an asyncio cursor.
+        file for which ``pandas.read_csv()`` returns a DataFrame rather than a reader:
+        a reader keeps the file open after the call, and closing a prefetching file
+        while a block is being read waits for it, which would block the event loop of
+        an asyncio cursor that closes the reader.
 
         Args:
             prefetch: Whether to read the next block in the background.
