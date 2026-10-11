@@ -5,12 +5,35 @@
 #
 # SPDX-License-Identifier: MIT
 
+from concurrent.futures import Future
+
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 from fsspec.implementations.local import LocalFileSystem
 
 from pyathena.arrow.reader import ParquetChunkReader
+
+
+class _ImmediateExecutor:
+    """An executor that runs each call when it is submitted."""
+
+    def __init__(self, max_workers=None):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        pass
+
+    def submit(self, fn, *args, **kwargs):
+        future = Future()
+        try:
+            future.set_result(fn(*args, **kwargs))
+        except Exception as e:
+            future.set_exception(e)
+        return future
 
 
 class TestParquetChunkReader:
@@ -90,6 +113,8 @@ class TestParquetChunkReader:
             return source
 
         monkeypatch.setattr(ParquetChunkReader, "_open", open_)
+        # Open ahead at once, so that a file opened ahead is never cancelled.
+        monkeypatch.setattr("pyathena.arrow.reader.ThreadPoolExecutor", _ImmediateExecutor)
         reader = ParquetChunkReader(LocalFileSystem(), paths, 2)
         if corrupt:
             with pytest.raises((OSError, ValueError)):
@@ -97,8 +122,22 @@ class TestParquetChunkReader:
         else:
             next(reader)
             reader.close()
-        assert len(opened) >= 2
+        # The file after the last one received was opened ahead.
+        assert len(opened) == (4 if corrupt else 2)
         assert all(source.closed for source in opened)
+
+    def test_open_failure_opens_no_further_file(self, paths, monkeypatch):
+        """A file that fails to open raises before the next file is opened."""
+        opened = []
+
+        def open_(self, path):
+            opened.append(path)
+            raise OSError(f"cannot open {path}")
+
+        monkeypatch.setattr(ParquetChunkReader, "_open", open_)
+        with pytest.raises(OSError, match="cannot open"):
+            next(ParquetChunkReader(LocalFileSystem(), paths, 2))
+        assert opened == paths[:1]
 
     def test_no_files(self):
         assert list(ParquetChunkReader(LocalFileSystem(), [], 4)) == []

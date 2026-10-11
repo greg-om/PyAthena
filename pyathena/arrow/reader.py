@@ -184,9 +184,10 @@ class ParquetChunkReader(abc.Iterator):  # type: ignore[type-arg]
             ahead: Future[Any] | None = executor.submit(self._open, self._paths[0])
             try:
                 for next_path in [*self._paths[1:], None]:
-                    current = cast("Future[Any]", ahead)
+                    # Open the next file only after this one opened.
+                    source = cast("Future[Any]", ahead).result()
                     ahead = None if next_path is None else executor.submit(self._open, next_path)
-                    yield current.result()
+                    yield source
             finally:
                 if ahead is not None and not ahead.cancel() and ahead.exception() is None:
                     ahead.result().close()
