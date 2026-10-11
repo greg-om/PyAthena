@@ -11,7 +11,9 @@ from unittest.mock import MagicMock, PropertyMock, patch, sentinel
 
 import pandas as pd
 import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
+from fsspec.implementations.local import LocalFileSystem
 from pandas.testing import assert_frame_equal
 
 from pyathena.pandas.converter import DefaultPandasTypeConverter
@@ -243,6 +245,77 @@ class TestAthenaPandasResultSet:
             **execute_kwargs,
             **filesystem_kwargs,
         }
+
+
+def _read_parquet_chunks(tmp_path, tables, chunksize, write_statistics=True, **kwargs):
+    """Write Parquet files and read them in chunks through the result set, without AWS.
+
+    Returns:
+        The chunks, and the whole result read by pandas.read_parquet() with the same
+        options.
+    """
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    paths = []
+    for index, table in enumerate(tables):
+        path = tmp_path / f"{index}.parquet"
+        pq.write_table(table, path, write_statistics=write_statistics)
+        paths.append(str(path))
+    result_set = AthenaPandasResultSet.__new__(AthenaPandasResultSet)  # bypass __init__
+    result_set._fs = LocalFileSystem()
+    result_set._chunksize = chunksize
+    result_set._kwargs = kwargs
+    result_set._unload_location = None
+    result_set._parquet_null_columns = set()
+    with patch.object(AthenaPandasResultSet, "_read_data_manifest", return_value=paths):
+        assert result_set._read_parquet_footers()[0] == sum(t.num_rows for t in tables)
+    chunks = list(result_set._iter_parquet_chunks())
+    whole = pd.concat([pd.read_parquet(path, **kwargs) for path in paths], ignore_index=True)
+    return chunks, whole
+
+
+class TestParquetChunkDtypes:
+    """Tests for the dtypes of UNLOAD results that PandasCursor reads in chunks."""
+
+    def test_null_in_later_file(self, tmp_path):
+        """Top-level integer and boolean columns with NULL anywhere convert alike in every chunk."""
+        chunks, _ = _read_parquet_chunks(
+            tmp_path,
+            [
+                pa.table({"i": pa.array([1, 2], pa.int64()), "b": [True, False]}),
+                pa.table({"i": pa.array([None, 4], pa.int64()), "b": [None, True]}),
+            ],
+            chunksize=1,
+        )
+        whole = pd.read_parquet(tmp_path)
+        assert [len(chunk) for chunk in chunks] == [1, 1, 1, 1]
+        for chunk in chunks:
+            assert chunk.dtypes.tolist() == whole.dtypes.tolist()
+        assert_frame_equal(pd.concat(chunks), whole, check_exact=True)
+
+    @pytest.mark.parametrize("write_statistics", [True, False])
+    def test_large_integers_without_null(self, tmp_path, write_statistics):
+        """Integers without NULL stay exact, with or without Parquet statistics."""
+        chunks, whole = _read_parquet_chunks(
+            tmp_path,
+            [pa.table({"i": pa.array([9007199254740993, 1], pa.int64())})],
+            chunksize=1,
+            write_statistics=write_statistics,
+        )
+        assert [chunk["i"].dtype for chunk in chunks] == ["int64", "int64"]
+        assert [int(chunk["i"].iloc[0]) for chunk in chunks] == [9007199254740993, 1]
+        assert_frame_equal(pd.concat(chunks), whole, check_exact=True)
+
+    def test_nested_values_convert_per_chunk(self, tmp_path):
+        """Nested values convert per chunk; with dtype_backend="pyarrow" they do not."""
+        table = pa.table({"li": pa.array([[1], [None]], pa.list_(pa.int64()))})
+        chunks, _ = _read_parquet_chunks(tmp_path, [table], chunksize=1)
+        assert [chunk["li"].iloc[0].dtype for chunk in chunks] == ["int64", "float64"]
+        chunks, whole = _read_parquet_chunks(
+            tmp_path / "pyarrow", [table], chunksize=1, dtype_backend="pyarrow"
+        )
+        for chunk in chunks:
+            assert chunk.dtypes.tolist() == whole.dtypes.tolist()
+        assert_frame_equal(pd.concat(chunks), whole, check_exact=True)
 
 
 # A CSV result of Athena with each type the PyArrow engine reads, then a row of NULLs.

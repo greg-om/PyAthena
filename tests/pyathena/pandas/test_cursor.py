@@ -869,8 +869,11 @@ class TestPandasCursor:
         """Chunked UNLOAD results match the whole result, including dtypes with NULL."""
         query = """
             SELECT * FROM (
-              VALUES (1, 1, true, 'a'), (2, NULL, NULL, NULL), (3, 3, false, 'c')
-            ) AS t(k, i, b, s)
+              VALUES
+                (1, 1, true, 'a', BIGINT '9007199254740993'),
+                (2, NULL, NULL, NULL, BIGINT '2'),
+                (3, 3, false, 'c', BIGINT '3')
+            ) AS t(k, i, b, s, x)
             """
         whole = pandas_cursor.execute(query, **options).as_pandas()
         chunks = list(pandas_cursor.execute(query, chunksize=chunksize, **options).as_pandas())
@@ -882,6 +885,7 @@ class TestPandasCursor:
         pd.testing.assert_frame_equal(
             combined.sort_values("k").reset_index(drop=True),
             whole.sort_values("k").reset_index(drop=True),
+            check_exact=True,
         )
 
     @pytest.mark.parametrize(

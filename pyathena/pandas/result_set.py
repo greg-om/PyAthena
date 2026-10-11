@@ -1344,12 +1344,14 @@ class AthenaPandasResultSet(AthenaResultSet):
     def _iter_parquet_chunks(self) -> Iterator[DataFrame]:
         """Read the UNLOAD result in DataFrames of ``chunksize`` rows.
 
-        Each chunk is converted as ``pandas.read_parquet()`` converts the whole
-        result, and its index continues the previous chunk's. Integer and boolean
-        columns that hold NULL anywhere in the result become ``float64`` and
-        ``object`` in every chunk, as in the whole result, which pyarrow converts
-        column by column. Without NULL counts in the Parquet statistics, a column is
-        treated as holding NULL.
+        Each chunk is converted as ``pandas.read_parquet()`` converts a table, and its
+        index continues the previous chunk's. Top-level integer and boolean columns
+        that hold NULL anywhere in the result, according to the NULL counts of the
+        Parquet statistics, become ``float64`` and ``object`` in every chunk, as in
+        the whole result. A column without NULL counts, and the values of array, map,
+        and struct columns, are converted as pyarrow converts each chunk, so their
+        dtypes can depend on whether the chunk holds NULL. With ``dtype_backend``,
+        the dtypes do not depend on NULL.
 
         ``_read_parquet_footers()`` must have read the data manifest first.
 
@@ -1394,7 +1396,9 @@ class AthenaPandasResultSet(AthenaResultSet):
         """Read the data manifest and the footers of its Parquet files.
 
         It sets the unload location, and the names of the top-level integer and
-        boolean columns that hold NULL, or have no NULL count, in any file.
+        boolean columns whose NULL counts show NULL in any file. A column without
+        NULL counts is not included, so that its integers are not converted to
+        ``float64`` without NULL.
 
         Returns:
             The number of rows in the files, and the names of the top-level columns of
@@ -1434,9 +1438,9 @@ class AthenaPandasResultSet(AthenaResultSet):
                     for group in range(metadata.num_row_groups):
                         statistics = metadata.row_group(group).column(index).statistics
                         if (
-                            statistics is None
-                            or not statistics.has_null_count
-                            or statistics.null_count > 0
+                            statistics is not None
+                            and statistics.has_null_count
+                            and statistics.null_count > 0
                         ):
                             self._parquet_null_columns.add(field.name)
                             break
