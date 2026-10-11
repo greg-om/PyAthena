@@ -68,6 +68,8 @@ class ParquetChunkReader(abc.Iterator):  # type: ignore[type-arg]
 
         Raises:
             ValueError: If ``chunksize`` is not positive or ``columns`` is empty.
+                Reading raises ``ValueError`` as well when a file has no top-level
+                column of a name in ``columns``.
         """
         if chunksize < 1:
             raise ValueError(f"chunksize must be positive, got {chunksize}.")
@@ -134,6 +136,12 @@ class ParquetChunkReader(abc.Iterator):  # type: ignore[type-arg]
                         parquet_file = pq.ParquetFile(
                             source, pre_buffer=False, buffer_size=self.BUFFER_SIZE
                         )
+                        if self._columns is not None and (
+                            missing := set(self._columns) - set(parquet_file.schema_arrow.names)
+                        ):
+                            # pyarrow would select nested fields by dotted paths, or no
+                            # column, whose tables keep their rows when sliced.
+                            raise ValueError(f"No top-level columns {sorted(missing)}.")
                         for batch in parquet_file.iter_batches(
                             batch_size=self._chunksize, columns=self._columns
                         ):

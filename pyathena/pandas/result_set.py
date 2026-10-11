@@ -1322,8 +1322,9 @@ class AthenaPandasResultSet(AthenaResultSet):
         Chunks are read with ``ParquetChunkReader`` through PyAthena's filesystem when
         ``execute()`` was given at most these ``pandas.read_parquet()`` options:
         ``dtype_backend`` as ``"numpy_nullable"`` or ``"pyarrow"``, and ``columns`` as
-        distinct names, which ``_iter_parquet_chunks()`` also requires to be top-level
-        columns of the result. With other options, the result is read whole, as
+        distinct names without dots, which ``_as_pandas()`` also requires to be
+        top-level columns of the result. A name with a dot can select a nested field in
+        ``pandas.read_parquet()``. With other options, the result is read whole, as
         without ``chunksize``, and pandas validates them.
 
         Returns:
@@ -1337,7 +1338,7 @@ class AthenaPandasResultSet(AthenaResultSet):
         return columns is None or (
             isinstance(columns, (list, tuple))
             and len(columns) > 0
-            and all(isinstance(c, str) for c in columns)
+            and all(isinstance(c, str) and "." not in c for c in columns)
             and len(set(columns)) == len(columns)
         )
 
@@ -1350,8 +1351,9 @@ class AthenaPandasResultSet(AthenaResultSet):
         Parquet statistics, become ``float64`` and ``object`` in every chunk, as in
         the whole result. A column without NULL counts, and the values of array, map,
         and struct columns, are converted as pyarrow converts each chunk, so their
-        dtypes can depend on whether the chunk holds NULL. With ``dtype_backend``,
-        the dtypes do not depend on NULL.
+        dtypes can depend on whether the chunk holds NULL. With ``dtype_backend``, the
+        dtypes of top-level columns do not depend on NULL; with ``"pyarrow"``, those of
+        nested values do not either.
 
         ``_read_parquet_footers()`` must have read the data manifest first.
 
@@ -1497,8 +1499,9 @@ class AthenaPandasResultSet(AthenaResultSet):
 
         This method provides an iterator interface for processing large result sets.
         When the result is read in chunks, because chunksize is specified for a CSV
-        result or for an UNLOAD result read with at most the ``columns`` and
-        ``dtype_backend`` options, or ``auto_optimize_chunksize`` chose a chunk size
+        result or for an UNLOAD result read with at most the ``columns`` (distinct
+        top-level column names without dots) and ``dtype_backend`` options, or
+        ``auto_optimize_chunksize`` chose a chunk size
         for a CSV result, it yields
         DataFrames in chunks for memory-efficient processing. These chunks come from
         the same iterator as the fetch methods, so a chunk that one of them reads is

@@ -195,6 +195,7 @@ class TestAthenaPandasResultSet:
             (10, {"columns": ["a", "a"]}, False),
             (10, {"columns": "a"}, False),
             (10, {"columns": [0]}, False),
+            (10, {"columns": ["s.a"]}, False),
             (10, {"dtype_backend": None}, False),
             (10, {"dtype_backend": "invalid"}, False),
             (10, {"filters": [("a", "=", 1)]}, False),

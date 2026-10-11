@@ -63,6 +63,14 @@ class TestParquetChunkReader:
             f"name-{i}" for i in range(10)
         ]
 
+    @pytest.mark.parametrize("columns", [["missing"], ["id", "missing"], ["name.x"]])
+    def test_columns_not_top_level(self, paths, max_prefetch_size, columns):
+        with (
+            ParquetChunkReader(LocalFileSystem(), paths, 1, columns=columns) as reader,
+            pytest.raises(ValueError, match="No top-level columns"),
+        ):
+            next(reader)
+
     def test_no_files(self):
         assert list(ParquetChunkReader(LocalFileSystem(), [], 4)) == []
 
