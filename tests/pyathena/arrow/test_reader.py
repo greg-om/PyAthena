@@ -135,6 +135,8 @@ class TestParquetChunkReader:
             raise OSError(f"cannot open {path}")
 
         monkeypatch.setattr(ParquetChunkReader, "_open", open_)
+        # Open at once, so that an open submitted too early is not cancelled.
+        monkeypatch.setattr("pyathena.arrow.reader.ThreadPoolExecutor", _ImmediateExecutor)
         with pytest.raises(OSError, match="cannot open"):
             next(ParquetChunkReader(LocalFileSystem(), paths, 2))
         assert opened == paths[:1]
