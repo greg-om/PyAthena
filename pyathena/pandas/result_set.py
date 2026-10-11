@@ -466,6 +466,9 @@ class AthenaPandasResultSet(AthenaResultSet):
         "time",
         "timestamp",
     ]
+    # The block size of a CSV result file read with the background cache; see
+    # _get_csv_open_options().
+    CSV_BLOCK_SIZE: ClassVar[int] = 32 * 2**20
     # The pandas.read_csv() options given to execute() that _read_csv_with_pyarrow() reads.
     _PYARROW_READ_CSV_OPTIONS: ClassVar[frozenset[str]] = frozenset({"dtype", "parse_dates"})
     # The pandas.read_csv() options given to execute() that do not change how pandas reads
@@ -536,7 +539,9 @@ class AthenaPandasResultSet(AthenaResultSet):
             chunksize: Number of rows per chunk. If specified, takes precedence
                       over auto_optimize_chunksize.
             block_size: S3 read block size.
-            cache_type: S3 caching strategy.
+            cache_type: S3 caching strategy. Without ``block_size`` or ``cache_type``,
+                a CSV result file is read in 32 MiB blocks with fsspec's background
+                cache, which reads the next block while pandas parses the current one.
             max_workers: Maximum worker threads for parallel operations.
             auto_optimize_chunksize: Enable automatic chunksize determination
                                    for large files when chunksize is None.
@@ -926,7 +931,9 @@ class AthenaPandasResultSet(AthenaResultSet):
                 elif "storage_options" not in read_csv_kwargs:
                     # With storage_options, pandas opens the file through fsspec.
                     source = self._csv_stream = stack.enter_context(
-                        self._fs.open(self.output_location, mode="rb")
+                        self._fs.open(
+                            self.output_location, mode="rb", **self._get_csv_open_options()
+                        )
                     )
                 if csv_engine == "pyarrow" and self._reads_csv_with_pyarrow():
                     result = _read_csv_with_pyarrow(source, read_csv_kwargs)
@@ -950,6 +957,25 @@ class AthenaPandasResultSet(AthenaResultSet):
         except Exception as e:
             _logger.exception(f"Failed to read {location}.")
             raise OperationalError(*e.args) from e
+
+    def _get_csv_open_options(self) -> dict[str, Any]:
+        """Get the options to open a CSV result file with PyAthena's filesystem.
+
+        Without ``block_size`` or ``cache_type`` from the cursor, the file is read
+        with fsspec's background cache in blocks of ``CSV_BLOCK_SIZE`` bytes: the
+        next block is read while pandas parses the current one, and two blocks are
+        kept. Otherwise the filesystem's settings apply.
+
+        Returns:
+            The keyword arguments for ``S3FileSystem.open()``.
+        """
+        if self._block_size is not None or self._cache_type is not None:
+            return {}
+        return {
+            "block_size": self.CSV_BLOCK_SIZE,
+            "cache_type": "background",
+            "cache_options": {"maxblocks": 2},
+        }
 
     def _reads_csv_with_pyarrow(self) -> bool:
         """Whether ``_read_csv_with_pyarrow()`` reads the CSV result for the PyArrow engine.
@@ -1247,7 +1273,11 @@ class AthenaPandasResultSet(AthenaResultSet):
             if data is not None:
                 source = StringIO(data.decode("utf-8"), newline="")
             elif storage_options is None:
-                source = stack.enter_context(self._fs.open(self.output_location, **text_options))
+                source = stack.enter_context(
+                    self._fs.open(
+                        self.output_location, **text_options, **self._get_csv_open_options()
+                    )
+                )
             else:
                 source = stack.enter_context(
                     filesystem_open(self.output_location, **text_options, **storage_options)

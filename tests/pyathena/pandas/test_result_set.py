@@ -155,6 +155,8 @@ class TestAthenaPandasResultSet:
         result_set._keep_default_na = False
         result_set._na_values = ("",)
         result_set._kwargs = read_csv_kwargs
+        result_set._block_size = None
+        result_set._cache_type = None
         result_set._fs = MagicMock()
         result_set._fs.open.return_value = stream = io.BytesIO(data)
         description = [(name, "string", None, None, 0, 0, "UNKNOWN") for name in names]
@@ -178,7 +180,34 @@ class TestAthenaPandasResultSet:
         assert actual.iloc[:, 0].tolist() == expected_names
         read_csv.assert_called_once()
         assert read_csv.call_args.kwargs["engine"] == "c"
+        result_set._fs.open.assert_called_once_with(
+            "s3://bucket/result.txt", mode="rb", **result_set._get_csv_open_options()
+        )
         assert stream.closed
+
+    @pytest.mark.parametrize(
+        ("block_size", "cache_type", "expected"),
+        [
+            (
+                None,
+                None,
+                {
+                    "block_size": 32 * 2**20,
+                    "cache_type": "background",
+                    "cache_options": {"maxblocks": 2},
+                },
+            ),
+            (5 * 2**20, None, {}),
+            (None, "bytes", {}),
+            (5 * 2**20, "readahead", {}),
+        ],
+    )
+    def test_get_csv_open_options(self, block_size, cache_type, expected):
+        """CSV results are prefetched unless the cursor sets block_size or cache_type."""
+        result_set = AthenaPandasResultSet.__new__(AthenaPandasResultSet)
+        result_set._block_size = block_size
+        result_set._cache_type = cache_type
+        assert result_set._get_csv_open_options() == expected
 
     @pytest.mark.parametrize(
         ("execute_kwargs", "path", "filesystem_kwargs"),
@@ -307,6 +336,8 @@ def _read_csv_result(data, types, engine="c", chunksize=None, **kwargs):
     result_set._kwargs = kwargs
     result_set._time_columns = []
     result_set._csv_stream = None
+    result_set._block_size = None
+    result_set._cache_type = None
     result_set._fs = MagicMock()
     result_set._fs.open.return_value = io.BytesIO(data.encode())
     description = [(name, type_, None, None, 0, 0, "UNKNOWN") for name, type_ in types.items()]
