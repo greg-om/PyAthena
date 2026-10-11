@@ -321,13 +321,17 @@ for chunk in cursor.iter_chunks():
     print(f"Processed chunk with {chunk.height} rows")
 ```
 
-This method uses Polars' `scan_csv()` and `scan_parquet()` with `collect_batches()`,
-which read the result from S3 without writing it to local storage.
+For CSV results, this method uses Polars' `scan_csv()` with `collect_batches()`,
+which reads the result from S3 without writing it to local storage.
 Memory usage depends on the size of each chunk and on how far Polars reads ahead, which `chunksize` does not limit.
-For CSV results, Polars limits the read-ahead by the number of CPU cores, so memory usage does not grow with the result size.
+Polars limits the read-ahead by the number of CPU cores, so memory usage does not grow with the result size.
 If reading a chunk fails, iteration raises `OperationalError` instead of ending early.
 
-The chunked iteration also works with the unload option:
+The chunked iteration also works with the unload option.
+With pyarrow installed, the Parquet files of the result are read one at a time through PyAthena's S3 filesystem,
+and each chunk is converted from pyarrow, so memory usage depends on the size of each chunk rather than on the files.
+With read options given to `execute()`, or without pyarrow, Polars' `scan_parquet()` reads the files with those options;
+it decodes whole row groups and reads ahead, so memory usage can reach the size of the whole result:
 
 ```python
 from pyathena import connect

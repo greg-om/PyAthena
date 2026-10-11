@@ -559,6 +559,31 @@ class TestPolarsCursor:
         for chunk in chunks:
             assert isinstance(chunk, pl.DataFrame)
 
+    @pytest.mark.parametrize(
+        ("polars_cursor", "chunksize", "options", "sizes"),
+        [
+            ({"cursor_kwargs": {"unload": True}}, 1, {}, [1, 1, 1]),
+            ({"cursor_kwargs": {"unload": True}}, 2, {}, [2, 1]),
+            ({"cursor_kwargs": {"unload": True}}, 10, {}, [3]),
+            # Read options given to execute() keep Polars' own scan.
+            ({"cursor_kwargs": {"unload": True}}, 2, {"low_memory": True}, [2, 1]),
+        ],
+        indirect=["polars_cursor"],
+    )
+    def test_unload_chunks(self, polars_cursor, chunksize, options, sizes):
+        """Chunked UNLOAD results match the whole result."""
+        query = """
+            SELECT * FROM (
+              VALUES (1, 1, true, 'a'), (2, NULL, NULL, NULL), (3, 3, false, 'c')
+            ) AS t(k, i, b, s)
+            """
+        whole = polars_cursor.execute(query, **options).as_polars()
+        chunks = list(polars_cursor.execute(query, chunksize=chunksize, **options).iter_chunks())
+        assert [chunk.height for chunk in chunks] == sizes
+        for chunk in chunks:
+            assert chunk.schema == whole.schema
+        assert pl.concat(chunks).sort("k").equals(whole.sort("k"))
+
     def test_iter_chunks_data_consistency(self):
         """Test that chunked and regular reading produce the same data."""
         with contextlib.closing(connect(schema_name=ENV.schema)) as conn:

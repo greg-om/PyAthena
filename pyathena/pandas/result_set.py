@@ -14,6 +14,7 @@ from typing import (
     TYPE_CHECKING,
     Any,
     ClassVar,
+    cast,
 )
 
 from fsspec import open as filesystem_open
@@ -253,8 +254,9 @@ class _JSONConverter:
 class PandasDataFrameIterator(abc.Iterator):  # type: ignore[type-arg]
     """Iterator for chunked DataFrame results from Athena queries.
 
-    This class wraps either a pandas TextFileReader (for chunked reading) or
-    a single DataFrame, providing a unified iterator interface. It applies
+    This class wraps either an iterator of DataFrame chunks, such as a pandas
+    TextFileReader for CSV results or the chunks of an UNLOAD result, or a single
+    DataFrame, providing a unified iterator interface. It applies
     optional date truncation to each DataFrame chunk as it's yielded.
 
     The iterator is used by AthenaPandasResultSet to provide chunked access
@@ -277,14 +279,15 @@ class PandasDataFrameIterator(abc.Iterator):  # type: ignore[type-arg]
 
     def __init__(
         self,
-        reader: TextFileReader | DataFrame,
+        reader: TextFileReader | Iterator[DataFrame] | DataFrame,
         trunc_date: Callable[[DataFrame], DataFrame],
         csv_stream: IOBase | None = None,
     ) -> None:
         """Initialize the iterator.
 
         Args:
-            reader: Either a TextFileReader (for chunked) or a single DataFrame.
+            reader: A TextFileReader or another iterator of DataFrame chunks, or a
+                single DataFrame.
             trunc_date: Function to apply to each chunk, such as date truncation.
             csv_stream: Optional CSV stream owned and closed by this iterator.
         """
@@ -329,12 +332,14 @@ class PandasDataFrameIterator(abc.Iterator):  # type: ignore[type-arg]
 
     def close(self) -> None:
         """Close the iterator and release resources."""
+        from types import GeneratorType
+
         from pandas.io.parsers import TextFileReader
 
         reader = self._reader
         self._reader = iter(())
         try:
-            if isinstance(reader, TextFileReader):
+            if isinstance(reader, (TextFileReader, GeneratorType)):
                 reader.close()
         finally:
             if self._csv_stream is not None:
@@ -466,6 +471,9 @@ class AthenaPandasResultSet(AthenaResultSet):
         "time",
         "timestamp",
     ]
+    # The pandas.read_parquet() options given to execute() with which an UNLOAD result is
+    # read in chunks; see _reads_parquet_in_chunks().
+    _PARQUET_CHUNK_OPTIONS: ClassVar[frozenset[str]] = frozenset({"columns", "dtype_backend"})
     # The pandas.read_csv() options given to execute() that _read_csv_with_pyarrow() reads.
     _PYARROW_READ_CSV_OPTIONS: ClassVar[frozenset[str]] = frozenset({"dtype", "parse_dates"})
     # The pandas.read_csv() options given to execute() that do not change how pandas reads
@@ -570,6 +578,8 @@ class AthenaPandasResultSet(AthenaResultSet):
         self._max_workers = max_workers
         self._auto_optimize_chunksize = auto_optimize_chunksize
         self._data_manifest: list[str] = []
+        # The integer and boolean columns of a chunked UNLOAD result that may hold NULL.
+        self._parquet_null_columns: set[str] = set()
         self._kwargs = kwargs
         self._fs = self._create_s3_file_system()
         self._csv_stream: IOBase | None = None
@@ -1306,7 +1316,128 @@ class AthenaPandasResultSet(AthenaResultSet):
         else:
             raise ProgrammingError("Engine must be `pyarrow`.")
 
-    def _as_pandas(self) -> TextFileReader | DataFrame:
+    def _reads_parquet_in_chunks(self) -> bool:
+        """Whether the UNLOAD result is read in chunks of ``chunksize`` rows.
+
+        Chunks are read with ``ParquetChunkReader`` through PyAthena's filesystem when
+        ``execute()`` was given at most ``dtype_backend`` and ``columns`` as read
+        options. With other ``pandas.read_parquet()`` options, the result is read
+        whole, as without ``chunksize``.
+
+        Returns:
+            True if the UNLOAD result is read in chunks.
+        """
+        return self._chunksize is not None and self._kwargs.keys() <= self._PARQUET_CHUNK_OPTIONS
+
+    def _iter_parquet_chunks(self) -> Iterator[DataFrame]:
+        """Read the UNLOAD result in DataFrames of ``chunksize`` rows.
+
+        Each chunk is converted as ``pandas.read_parquet()`` converts the whole
+        result, and its index continues the previous chunk's. Integer and boolean
+        columns that hold NULL anywhere in the result become ``float64`` and
+        ``object`` in every chunk, as in the whole result, which pyarrow converts
+        column by column. Without NULL counts in the Parquet statistics, a column is
+        treated as holding NULL.
+
+        ``_read_parquet_footers()`` must have read the data manifest first.
+
+        Yields:
+            The DataFrames of the result rows.
+
+        Raises:
+            OperationalError: If reading the Parquet files fails.
+        """
+        import pandas as pd
+        from pandas.io._util import arrow_table_to_pandas
+
+        from pyathena.arrow.reader import ParquetChunkReader
+
+        # Without dtype_backend, pandas chooses the default conversion.
+        conversion = {k: v for k, v in self._kwargs.items() if k == "dtype_backend"}
+        start = 0
+        try:
+            with ParquetChunkReader(
+                self._fs,
+                self._data_manifest,
+                cast(int, self._chunksize),
+                columns=self._kwargs.get("columns"),
+            ) as reader:
+                for table in reader:
+                    df = arrow_table_to_pandas(table, **conversion)
+                    if not conversion:
+                        for column in self._parquet_null_columns & set(df.columns):
+                            dtype = df[column].dtype
+                            if pd.api.types.is_bool_dtype(dtype):
+                                df[column] = df[column].astype(object)
+                            elif pd.api.types.is_integer_dtype(dtype):
+                                df[column] = df[column].astype("float64")
+                    df.index = pd.RangeIndex(start, start + len(df))
+                    start += len(df)
+                    yield df
+        except Exception as e:
+            _logger.exception(f"Failed to read {self._unload_location}.")
+            raise OperationalError(*e.args) from e
+
+    def _read_parquet_footers(self) -> int:
+        """Read the data manifest and the footers of its Parquet files.
+
+        It sets the unload location, and the names of the top-level integer and
+        boolean columns that hold NULL, or have no NULL count, in any file.
+
+        Returns:
+            The number of rows in the files.
+
+        Raises:
+            OperationalError: If reading the footers fails.
+        """
+        import pyarrow as pa
+        from pyarrow import parquet
+
+        self._data_manifest = self._read_data_manifest()
+        if not self._data_manifest:
+            return 0
+        if not self._unload_location:
+            self._unload_location = "/".join(self._data_manifest[0].split("/")[:-1]) + "/"
+        rows = 0
+        try:
+            for path in self._data_manifest:
+                with self._fs.open(path, "rb") as f:
+                    metadata = parquet.read_metadata(f)
+                rows += metadata.num_rows
+                # Statistics are kept per leaf column; a top-level primitive column is
+                # the leaf column whose path is its name.
+                leaves = {
+                    metadata.schema.column(index).path: index
+                    for index in range(metadata.num_columns)
+                }
+                for field in metadata.schema.to_arrow_schema():
+                    if not (pa.types.is_integer(field.type) or pa.types.is_boolean(field.type)):
+                        continue
+                    index = leaves[field.name]
+                    for group in range(metadata.num_row_groups):
+                        statistics = metadata.row_group(group).column(index).statistics
+                        if (
+                            statistics is None
+                            or not statistics.has_null_count
+                            or statistics.null_count > 0
+                        ):
+                            self._parquet_null_columns.add(field.name)
+                            break
+        except Exception as e:
+            _logger.exception(f"Failed to read {self._unload_location}.")
+            raise OperationalError(*e.args) from e
+        return rows
+
+    def _as_pandas(self) -> TextFileReader | DataFrame | Iterator[DataFrame]:
+        if self.is_unload and self._reads_parquet_in_chunks():
+            import pandas as pd
+
+            engine = self._get_parquet_engine()
+            if self._read_parquet_footers() == 0:
+                self._metadata = ()
+                return pd.DataFrame()
+            self._metadata = self._read_parquet_schema(engine)
+            return self._iter_parquet_chunks()
         if self.is_unload:
             engine = self._get_parquet_engine()
             df = self._read_parquet(engine)

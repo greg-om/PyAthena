@@ -850,6 +850,50 @@ class TestPandasCursor:
         ]
 
     @pytest.mark.parametrize(
+        ("pandas_cursor", "chunksize", "options", "sizes"),
+        [
+            ({"cursor_kwargs": {"unload": True}}, 1, {}, [1, 1, 1]),
+            ({"cursor_kwargs": {"unload": True}}, 2, {}, [2, 1]),
+            ({"cursor_kwargs": {"unload": True}}, 10, {}, [3]),
+            (
+                {"cursor_kwargs": {"unload": True}},
+                1,
+                {"dtype_backend": "numpy_nullable"},
+                [1, 1, 1],
+            ),
+            ({"cursor_kwargs": {"unload": True}}, 2, {"columns": ["k", "i"]}, [2, 1]),
+        ],
+        indirect=["pandas_cursor"],
+    )
+    def test_unload_chunks(self, pandas_cursor, chunksize, options, sizes):
+        """Chunked UNLOAD results match the whole result, including dtypes with NULL."""
+        query = """
+            SELECT * FROM (
+              VALUES (1, 1, true, 'a'), (2, NULL, NULL, NULL), (3, 3, false, 'c')
+            ) AS t(k, i, b, s)
+            """
+        whole = pandas_cursor.execute(query, **options).as_pandas()
+        chunks = list(pandas_cursor.execute(query, chunksize=chunksize, **options).as_pandas())
+        assert [len(chunk) for chunk in chunks] == sizes
+        for chunk in chunks:
+            pd.testing.assert_series_equal(chunk.dtypes, whole.dtypes)
+        combined = pd.concat(chunks)
+        assert combined.index.tolist() == list(range(len(combined)))
+        pd.testing.assert_frame_equal(
+            combined.sort_values("k").reset_index(drop=True),
+            whole.sort_values("k").reset_index(drop=True),
+        )
+
+    @pytest.mark.parametrize(
+        "pandas_cursor", [{"cursor_kwargs": {"unload": True}}], indirect=["pandas_cursor"]
+    )
+    def test_unload_chunks_empty(self, pandas_cursor):
+        chunks = pandas_cursor.execute("SELECT * FROM one_row LIMIT 0", chunksize=2).as_pandas()
+        df = pd.concat(list(chunks), ignore_index=True)
+        assert df.shape == (0, 0)
+        assert pandas_cursor.fetchall() == []
+
+    @pytest.mark.parametrize(
         ("pandas_cursor", "parquet_engine"),
         [
             ({"cursor_kwargs": {"unload": True}}, "auto"),
