@@ -911,6 +911,9 @@ class AthenaPandasResultSet(AthenaResultSet):
                 ):
                     # A NULL placeholder can give internal parser blocks different dtypes.
                     read_csv_kwargs.setdefault("low_memory", False)
+                # A reader that keeps the file open is closed early by callers, and
+                # closing a prefetching file waits for the block being read.
+                prefetch = not self._returns_csv_reader(read_csv_kwargs)
                 if data is not None:
                     # The rows are in memory, with nothing to open with storage options.
                     read_csv_kwargs.pop("storage_options", None)
@@ -930,7 +933,7 @@ class AthenaPandasResultSet(AthenaResultSet):
                         self._open_binary_csv_stream(
                             binary_columns,
                             storage_options,
-                            whole=self._reads_csv_whole(read_csv_kwargs),
+                            prefetch=prefetch,
                         )
                     )
                 elif "storage_options" not in read_csv_kwargs:
@@ -939,7 +942,7 @@ class AthenaPandasResultSet(AthenaResultSet):
                         self._fs.open(
                             self.output_location,
                             mode="rb",
-                            **self._get_csv_open_options(self._reads_csv_whole(read_csv_kwargs)),
+                            **self._get_csv_open_options(prefetch),
                         )
                     )
                 if csv_engine == "pyarrow" and self._reads_csv_with_pyarrow():
@@ -966,39 +969,38 @@ class AthenaPandasResultSet(AthenaResultSet):
             raise OperationalError(*e.args) from e
 
     @staticmethod
-    def _reads_csv_whole(read_csv_kwargs: dict[str, Any]) -> bool:
-        """Whether ``pandas.read_csv()`` reads the whole file in one call.
+    def _returns_csv_reader(read_csv_kwargs: dict[str, Any]) -> bool:
+        """Whether ``pandas.read_csv()`` returns a reader instead of a DataFrame.
 
         With ``chunksize`` or ``iterator``, it returns a reader that keeps the file
-        open between chunks.
+        open between reads.
 
         Args:
             read_csv_kwargs: The options for ``pandas.read_csv()``.
 
         Returns:
-            True if the file is read whole.
+            True if ``pandas.read_csv()`` returns a reader.
         """
-        return not (read_csv_kwargs.get("chunksize") or read_csv_kwargs.get("iterator"))
+        return bool(read_csv_kwargs.get("chunksize") or read_csv_kwargs.get("iterator"))
 
-    def _get_csv_open_options(self, whole: bool) -> dict[str, Any]:
+    def _get_csv_open_options(self, prefetch: bool) -> dict[str, Any]:
         """Get the options to open a CSV result file with PyAthena's filesystem.
 
-        A file read whole, without ``block_size`` or ``cache_type`` from the cursor,
+        To prefetch without ``block_size`` or ``cache_type`` from the cursor, the file
         is read with fsspec's background cache in blocks of ``CSV_BLOCK_SIZE`` bytes:
         the next block is read while pandas parses the current one, and two blocks
-        are kept. A file read by a pandas reader, in chunks or as an iterator, keeps
-        the filesystem's settings, so that closing it before the end does not wait
-        for a block being read, which would block the event loop of an asyncio
-        cursor. With ``block_size`` or ``cache_type``, the filesystem's settings
-        apply as well.
+        are kept. Otherwise the filesystem's settings apply. Callers prefetch only a
+        file that ``pandas.read_csv()`` reads to its end in one call: closing a
+        prefetching file early, as the callers of a reader can, waits for the block
+        being read, which would block the event loop of an asyncio cursor.
 
         Args:
-            whole: Whether ``pandas.read_csv()`` reads the whole file in one call.
+            prefetch: Whether to read the next block in the background.
 
         Returns:
             The keyword arguments for ``S3FileSystem.open()``.
         """
-        if not whole or self._block_size is not None or self._cache_type is not None:
+        if not prefetch or self._block_size is not None or self._cache_type is not None:
             return {}
         return {
             "block_size": self.CSV_BLOCK_SIZE,
@@ -1284,7 +1286,7 @@ class AthenaPandasResultSet(AthenaResultSet):
         binary_columns: set[int],
         storage_options: dict[str, Any] | None,
         data: bytes | None = None,
-        whole: bool = False,
+        prefetch: bool = False,
     ) -> TextIOWrapper:
         """Open a stream that preserves binary NULL fields and original CSV newlines.
 
@@ -1293,8 +1295,8 @@ class AthenaPandasResultSet(AthenaResultSet):
             storage_options: The options to open the result file with through fsspec,
                 or None to open it with PyAthena's filesystem.
             data: The CSV text to read in place of the result file.
-            whole: Whether ``pandas.read_csv()`` reads the whole file in one call; see
-                ``_get_csv_open_options()``.
+            prefetch: Whether to read the next block of the result file in the
+                background; see ``_get_csv_open_options()``.
 
         Returns:
             The text stream for ``pandas.read_csv()``.
@@ -1309,7 +1311,7 @@ class AthenaPandasResultSet(AthenaResultSet):
                     self._fs.open(
                         self.output_location,
                         **text_options,
-                        **self._get_csv_open_options(whole),
+                        **self._get_csv_open_options(prefetch),
                     )
                 )
             else:
