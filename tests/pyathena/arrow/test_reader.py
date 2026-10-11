@@ -16,6 +16,13 @@ from pyathena.arrow.reader import ParquetChunkReader
 class TestParquetChunkReader:
     """Tests for reading Parquet files in tables of a fixed number of rows."""
 
+    @pytest.fixture(params=["prefetch", "stream"])
+    def max_prefetch_size(self, request, monkeypatch):
+        """Read the files whole ahead of decoding, or open them for streaming."""
+        if request.param == "stream":
+            monkeypatch.setattr(ParquetChunkReader, "MAX_PREFETCH_SIZE", -1)
+        return request.param
+
     @pytest.fixture
     def paths(self, tmp_path):
         """Three files of 3, 0, and 7 rows; the last has row groups of 2 rows."""
@@ -40,7 +47,7 @@ class TestParquetChunkReader:
         ("chunksize", "expected"),
         [(1, [1] * 10), (4, [4, 4, 2]), (5, [5, 5]), (10, [10]), (100, [10])],
     )
-    def test_chunk_sizes(self, paths, chunksize, expected):
+    def test_chunk_sizes(self, paths, max_prefetch_size, chunksize, expected):
         with ParquetChunkReader(LocalFileSystem(), paths, chunksize) as reader:
             tables = list(reader)
         assert [t.num_rows for t in tables] == expected
@@ -48,7 +55,7 @@ class TestParquetChunkReader:
         assert combined.column("id").to_pylist() == list(range(10))
         assert combined.column("name").to_pylist() == [f"name-{i}" for i in range(10)]
 
-    def test_columns(self, paths):
+    def test_columns(self, paths, max_prefetch_size):
         with ParquetChunkReader(LocalFileSystem(), paths, 4, columns=["name"]) as reader:
             tables = list(reader)
         assert all(t.column_names == ["name"] for t in tables)
@@ -64,7 +71,7 @@ class TestParquetChunkReader:
         with pytest.raises(ValueError, match="chunksize must be positive"):
             ParquetChunkReader(LocalFileSystem(), paths, chunksize)
 
-    def test_close(self, paths, monkeypatch):
+    def test_close(self, paths, max_prefetch_size, monkeypatch):
         fs = LocalFileSystem()
         opened = []
         original_open = fs.open

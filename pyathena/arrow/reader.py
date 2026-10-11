@@ -9,8 +9,9 @@
 
 from __future__ import annotations
 
-from collections import abc
+from collections import abc, deque
 from collections.abc import Generator, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any
 
 from pyathena.util import override
@@ -23,12 +24,17 @@ if TYPE_CHECKING:
 class ParquetChunkReader(abc.Iterator):  # type: ignore[type-arg]
     """Iterator over Parquet files as Arrow tables of a fixed number of rows.
 
-    The files are read one at a time, in the given order, with
+    The files are decoded one at a time, in the given order, with
     ``pyarrow.parquet.ParquetFile.iter_batches()``, without pre-buffering the row
     groups. Memory use therefore depends on the chunk size and the column chunks
-    being decoded, not on the size of the files or their row groups. Every table
+    being decoded, not on the size of the result or its row groups. Every table
     has ``chunksize`` rows except the last, which has the remaining rows; rows
     carry over from one file to the next.
+
+    A file of at most ``MAX_PREFETCH_SIZE`` bytes is read whole with one
+    ``cat_file()`` call, and the next file is read in a background thread while
+    the current one is decoded. Larger files are read in ``BUFFER_SIZE`` pieces
+    through ``open()``.
 
     The files must have the same schema, as the files of one UNLOAD query do.
 
@@ -40,8 +46,10 @@ class ParquetChunkReader(abc.Iterator):  # type: ignore[type-arg]
         ...         process(table)
     """
 
-    #: Bytes that pyarrow reads at once from a column chunk.
+    #: Bytes that pyarrow reads at once from a column chunk of a larger file.
     BUFFER_SIZE: int = 8 * 2**20
+    #: The largest file that is read whole, ahead of decoding.
+    MAX_PREFETCH_SIZE: int = 32 * 2**20
 
     def __init__(
         self,
@@ -109,21 +117,53 @@ class ParquetChunkReader(abc.Iterator):  # type: ignore[type-arg]
 
         batches: list[pa.RecordBatch] = []
         rows = 0
-        for path in self._paths:
-            with self._fs.open(path, "rb") as f:
-                parquet_file = pq.ParquetFile(f, pre_buffer=False, buffer_size=self.BUFFER_SIZE)
-                for batch in parquet_file.iter_batches(
-                    batch_size=self._chunksize, columns=self._columns
-                ):
-                    if batch.num_rows == 0:
-                        continue
-                    batches.append(batch)
-                    rows += batch.num_rows
-                    while rows >= self._chunksize:
-                        table = pa.Table.from_batches(batches)
-                        yield table.slice(0, self._chunksize)
-                        rest = table.slice(self._chunksize)
-                        batches = rest.to_batches()
-                        rows = rest.num_rows
+        paths = iter(self._paths)
+        sources: deque[Future[Any]] = deque()
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            try:
+                if (path := next(paths, None)) is not None:
+                    sources.append(executor.submit(self._open, path))
+                while sources:
+                    source = sources.popleft().result()
+                    # Read the next file while this one is decoded.
+                    if (path := next(paths, None)) is not None:
+                        sources.append(executor.submit(self._open, path))
+                    with source:
+                        parquet_file = pq.ParquetFile(
+                            source, pre_buffer=False, buffer_size=self.BUFFER_SIZE
+                        )
+                        for batch in parquet_file.iter_batches(
+                            batch_size=self._chunksize, columns=self._columns
+                        ):
+                            if batch.num_rows == 0:
+                                continue
+                            batches.append(batch)
+                            rows += batch.num_rows
+                            while rows >= self._chunksize:
+                                table = pa.Table.from_batches(batches)
+                                yield table.slice(0, self._chunksize)
+                                rest = table.slice(self._chunksize)
+                                batches = rest.to_batches()
+                                rows = rest.num_rows
+            finally:
+                for future in sources:
+                    if not future.cancel() and future.exception() is None:
+                        future.result().close()
         if rows:
             yield pa.Table.from_batches(batches)
+
+    def _open(self, path: str) -> Any:
+        """Open a file for ``ParquetFile``.
+
+        Args:
+            path: The path of the file.
+
+        Returns:
+            A buffer of the whole file if it has at most ``MAX_PREFETCH_SIZE``
+            bytes, or else the file opened for reading.
+        """
+        import pyarrow as pa
+
+        if self._fs.size(path) <= self.MAX_PREFETCH_SIZE:
+            return pa.BufferReader(self._fs.cat_file(path))
+        return self._fs.open(path, "rb")
