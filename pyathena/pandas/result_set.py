@@ -1317,17 +1317,29 @@ class AthenaPandasResultSet(AthenaResultSet):
             raise ProgrammingError("Engine must be `pyarrow`.")
 
     def _reads_parquet_in_chunks(self) -> bool:
-        """Whether the UNLOAD result is read in chunks of ``chunksize`` rows.
+        """Whether the options allow reading the UNLOAD result in chunks of ``chunksize`` rows.
 
         Chunks are read with ``ParquetChunkReader`` through PyAthena's filesystem when
-        ``execute()`` was given at most ``dtype_backend`` and ``columns`` as read
-        options. With other ``pandas.read_parquet()`` options, the result is read
-        whole, as without ``chunksize``.
+        ``execute()`` was given at most these ``pandas.read_parquet()`` options:
+        ``dtype_backend`` as ``"numpy_nullable"`` or ``"pyarrow"``, and ``columns`` as
+        distinct names, which ``_iter_parquet_chunks()`` also requires to be top-level
+        columns of the result. With other options, the result is read whole, as
+        without ``chunksize``, and pandas validates them.
 
         Returns:
-            True if the UNLOAD result is read in chunks.
+            True if the options allow reading the UNLOAD result in chunks.
         """
-        return self._chunksize is not None and self._kwargs.keys() <= self._PARQUET_CHUNK_OPTIONS
+        if self._chunksize is None or not self._kwargs.keys() <= self._PARQUET_CHUNK_OPTIONS:
+            return False
+        if self._kwargs.get("dtype_backend", "numpy_nullable") not in ("numpy_nullable", "pyarrow"):
+            return False
+        columns = self._kwargs.get("columns")
+        return columns is None or (
+            isinstance(columns, (list, tuple))
+            and len(columns) > 0
+            and all(isinstance(c, str) for c in columns)
+            and len(set(columns)) == len(columns)
+        )
 
     def _iter_parquet_chunks(self) -> Iterator[DataFrame]:
         """Read the UNLOAD result in DataFrames of ``chunksize`` rows.
@@ -1378,14 +1390,15 @@ class AthenaPandasResultSet(AthenaResultSet):
             _logger.exception(f"Failed to read {self._unload_location}.")
             raise OperationalError(*e.args) from e
 
-    def _read_parquet_footers(self) -> int:
+    def _read_parquet_footers(self) -> tuple[int, list[str]]:
         """Read the data manifest and the footers of its Parquet files.
 
         It sets the unload location, and the names of the top-level integer and
         boolean columns that hold NULL, or have no NULL count, in any file.
 
         Returns:
-            The number of rows in the files.
+            The number of rows in the files, and the names of the top-level columns of
+            the first file.
 
         Raises:
             OperationalError: If reading the footers fails.
@@ -1395,10 +1408,11 @@ class AthenaPandasResultSet(AthenaResultSet):
 
         self._data_manifest = self._read_data_manifest()
         if not self._data_manifest:
-            return 0
+            return 0, []
         if not self._unload_location:
             self._unload_location = "/".join(self._data_manifest[0].split("/")[:-1]) + "/"
         rows = 0
+        names: list[str] = []
         try:
             for path in self._data_manifest:
                 with self._fs.open(path, "rb") as f:
@@ -1410,7 +1424,10 @@ class AthenaPandasResultSet(AthenaResultSet):
                     metadata.schema.column(index).path: index
                     for index in range(metadata.num_columns)
                 }
-                for field in metadata.schema.to_arrow_schema():
+                schema = metadata.schema.to_arrow_schema()
+                if not names:
+                    names = schema.names
+                for field in schema:
                     if not (pa.types.is_integer(field.type) or pa.types.is_boolean(field.type)):
                         continue
                     index = leaves[field.name]
@@ -1426,18 +1443,22 @@ class AthenaPandasResultSet(AthenaResultSet):
         except Exception as e:
             _logger.exception(f"Failed to read {self._unload_location}.")
             raise OperationalError(*e.args) from e
-        return rows
+        return rows, names
 
     def _as_pandas(self) -> TextFileReader | DataFrame | Iterator[DataFrame]:
         if self.is_unload and self._reads_parquet_in_chunks():
             import pandas as pd
 
             engine = self._get_parquet_engine()
-            if self._read_parquet_footers() == 0:
+            rows, names = self._read_parquet_footers()
+            if rows == 0:
                 self._metadata = ()
                 return pd.DataFrame()
-            self._metadata = self._read_parquet_schema(engine)
-            return self._iter_parquet_chunks()
+            if set(self._kwargs.get("columns") or ()) <= set(names):
+                self._metadata = self._read_parquet_schema(engine)
+                return self._iter_parquet_chunks()
+            # Columns that are not top-level columns of the result are read whole,
+            # where pandas selects nested fields or raises for missing columns.
         if self.is_unload:
             engine = self._get_parquet_engine()
             df = self._read_parquet(engine)
@@ -1471,12 +1492,15 @@ class AthenaPandasResultSet(AthenaResultSet):
         """Iterate over result chunks as pandas DataFrames.
 
         This method provides an iterator interface for processing large result sets.
-        When a CSV result is read in chunks, because chunksize is specified or
-        ``auto_optimize_chunksize`` chose a chunk size, it yields DataFrames in chunks
-        for memory-efficient processing. These chunks come from the same iterator as
-        the fetch methods, so a chunk that one of them reads is not available to the
-        other. Otherwise, each call returns a new iterator that yields the entire
-        result as a single DataFrame, and the fetch methods keep their position.
+        When the result is read in chunks, because chunksize is specified for a CSV
+        result or for an UNLOAD result read with at most the ``columns`` and
+        ``dtype_backend`` options, or ``auto_optimize_chunksize`` chose a chunk size
+        for a CSV result, it yields
+        DataFrames in chunks for memory-efficient processing. These chunks come from
+        the same iterator as the fetch methods, so a chunk that one of them reads is
+        not available to the other. Otherwise, each call returns a new iterator that
+        yields the entire result as a single DataFrame, and the fetch methods keep
+        their position.
 
         Returns:
             PandasDataFrameIterator that yields pandas DataFrames for each chunk

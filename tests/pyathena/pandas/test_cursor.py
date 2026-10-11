@@ -14,7 +14,7 @@ import pandas as pd
 import pytest
 from pandas.io.parsers import TextFileReader
 
-from pyathena.error import DatabaseError, ProgrammingError
+from pyathena.error import DatabaseError, OperationalError, ProgrammingError
 from pyathena.filesystem.s3 import S3FileSystem
 from pyathena.model import AthenaQueryExecution
 from pyathena.pandas.converter import DefaultPandasTypeConverter
@@ -883,6 +883,18 @@ class TestPandasCursor:
             combined.sort_values("k").reset_index(drop=True),
             whole.sort_values("k").reset_index(drop=True),
         )
+
+    @pytest.mark.parametrize(
+        "pandas_cursor", [{"cursor_kwargs": {"unload": True}}], indirect=["pandas_cursor"]
+    )
+    @pytest.mark.parametrize("columns", [["missing"], ["k", "missing"]])
+    def test_unload_chunks_unknown_columns(self, pandas_cursor, columns):
+        """Columns that are not in the result raise with chunks as without them."""
+        query = "SELECT * FROM (VALUES (1, 'a')) AS t(k, s)"
+        with pytest.raises(OperationalError):
+            pandas_cursor.execute(query, columns=columns)
+        with pytest.raises(OperationalError):
+            pandas_cursor.execute(query, chunksize=1, columns=columns)
 
     @pytest.mark.parametrize(
         "pandas_cursor", [{"cursor_kwargs": {"unload": True}}], indirect=["pandas_cursor"]

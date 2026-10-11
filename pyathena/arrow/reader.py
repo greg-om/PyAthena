@@ -64,13 +64,15 @@ class ParquetChunkReader(abc.Iterator):  # type: ignore[type-arg]
             fs: The filesystem that opens the files.
             paths: The paths of the files, in reading order.
             chunksize: The number of rows of each table but the last.
-            columns: The names of the columns to read; all columns if None.
+            columns: The names of the top-level columns to read; all columns if None.
 
         Raises:
-            ValueError: If ``chunksize`` is not positive.
+            ValueError: If ``chunksize`` is not positive or ``columns`` is empty.
         """
         if chunksize < 1:
             raise ValueError(f"chunksize must be positive, got {chunksize}.")
+        if columns is not None and not columns:
+            raise ValueError("columns must not be empty.")
         self._fs = fs
         self._paths = list(paths)
         self._chunksize = chunksize

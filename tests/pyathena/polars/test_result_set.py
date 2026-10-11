@@ -10,6 +10,7 @@ from unittest.mock import PropertyMock, patch
 
 import polars as pl
 import pytest
+from fsspec.implementations.local import LocalFileSystem
 
 from pyathena.error import OperationalError
 from pyathena.polars.converter import DefaultPolarsTypeConverter
@@ -63,8 +64,17 @@ class TestAthenaPolarsResultSet:
         ):
             list(result_set._iter_csv_chunks())
 
-    def test_iter_parquet_chunks_raises_when_read_fails_partway(self, tmp_path):
-        """A Parquet read that fails partway through the data raises instead of ending early."""
+    @pytest.mark.parametrize(
+        "read_options",
+        [{}, {"low_memory": True}],
+        ids=["parquet-chunk-reader", "scan-parquet"],
+    )
+    def test_iter_parquet_chunks_raises_when_read_fails_partway(self, tmp_path, read_options):
+        """A Parquet read that fails partway through the data raises instead of ending early.
+
+        Without read options, the files of the data manifest are read with
+        ParquetChunkReader; with them, Polars scans the unload location.
+        """
         pl.DataFrame({"a": range(_ROWS_BEFORE_FAILURE)}).write_parquet(
             tmp_path / "0.parquet", row_group_size=10_000
         )
@@ -72,7 +82,10 @@ class TestAthenaPolarsResultSet:
         # Keep the footer magic but corrupt the metadata so the second file fails to read.
         (tmp_path / "1.parquet").write_bytes(valid[: len(valid) // 2] + b"\x00" * 64 + valid[-8:])
         result_set = _chunked_result_set()
+        result_set._kwargs = dict(read_options)
         result_set._unload_location = f"{tmp_path}/"
+        result_set._data_manifest = [str(tmp_path / "0.parquet"), str(tmp_path / "1.parquet")]
+        chunks: list[pl.DataFrame] = []
         with (
             patch.object(
                 AthenaPolarsResultSet,
@@ -80,9 +93,23 @@ class TestAthenaPolarsResultSet:
                 new_callable=PropertyMock,
                 return_value={},
             ),
-            pytest.raises(OperationalError),
+            patch.object(
+                AthenaPolarsResultSet,
+                "_csv_storage_options",
+                new_callable=PropertyMock,
+                return_value={},
+            ),
+            patch("pyathena.filesystem.s3.S3FileSystem", lambda **_: LocalFileSystem()),
+            patch("polars.scan_parquet", wraps=pl.scan_parquet) as scan_parquet,
+            pytest.raises(OperationalError) as error,
         ):
-            list(result_set._iter_parquet_chunks())
+            # extend() keeps the chunks read before the failure.
+            chunks.extend(result_set._iter_parquet_chunks())
+        # The error comes from the corrupt file, after the valid one was read.
+        assert not isinstance(error.value.__cause__, AttributeError)
+        assert scan_parquet.called is bool(read_options)
+        if not read_options:
+            assert sum(chunk.height for chunk in chunks) == _ROWS_BEFORE_FAILURE
 
     @pytest.mark.parametrize("reader", ["_read_csv", "_iter_csv_chunks"])
     def test_csv_read_kwargs_replace_defaults(self, tmp_path, reader):

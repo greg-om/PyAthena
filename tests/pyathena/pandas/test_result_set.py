@@ -181,6 +181,32 @@ class TestAthenaPandasResultSet:
         assert stream.closed
 
     @pytest.mark.parametrize(
+        ("chunksize", "execute_kwargs", "expected"),
+        [
+            (None, {}, False),
+            (10, {}, True),
+            (10, {"columns": ["a", "b"]}, True),
+            (10, {"columns": ("a",)}, True),
+            (10, {"dtype_backend": "numpy_nullable"}, True),
+            (10, {"dtype_backend": "pyarrow", "columns": ["a"]}, True),
+            (10, {"columns": []}, False),
+            (10, {"columns": ["a", "a"]}, False),
+            (10, {"columns": "a"}, False),
+            (10, {"columns": [0]}, False),
+            (10, {"dtype_backend": None}, False),
+            (10, {"dtype_backend": "invalid"}, False),
+            (10, {"filters": [("a", "=", 1)]}, False),
+            (10, {"storage_options": {}}, False),
+        ],
+    )
+    def test_reads_parquet_in_chunks(self, chunksize, execute_kwargs, expected):
+        """Only chunksize with supported read options reads UNLOAD results in chunks."""
+        result_set = AthenaPandasResultSet.__new__(AthenaPandasResultSet)
+        result_set._chunksize = chunksize
+        result_set._kwargs = execute_kwargs
+        assert result_set._reads_parquet_in_chunks() is expected
+
+    @pytest.mark.parametrize(
         ("execute_kwargs", "path", "filesystem_kwargs"),
         [
             ({}, "bucket/unload/", {"filesystem": _FS}),
