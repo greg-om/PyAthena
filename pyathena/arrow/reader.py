@@ -9,16 +9,17 @@
 
 from __future__ import annotations
 
-from collections import abc, deque
+from collections import abc
 from collections.abc import Generator, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import TYPE_CHECKING, Any
+from contextlib import closing
+from typing import TYPE_CHECKING, Any, cast
 
 from pyathena.util import override
 
 if TYPE_CHECKING:
     from fsspec import AbstractFileSystem
-    from pyarrow import Table
+    from pyarrow import RecordBatch, Table
 
 
 class ParquetChunkReader(abc.Iterator):  # type: ignore[type-arg]
@@ -111,56 +112,84 @@ class ParquetChunkReader(abc.Iterator):  # type: ignore[type-arg]
         self._tables.close()
 
     def _read_tables(self) -> Generator[Table]:
-        """Read the files and yield tables of ``chunksize`` rows.
+        """Cut the record batches of the files into tables of ``chunksize`` rows.
 
         Yields:
             The tables of rows, the last with the remaining rows.
         """
         import pyarrow as pa
+
+        pending: list[RecordBatch] = []
+        rows = 0
+        with closing(self._read_batches()) as batches:
+            for batch in batches:
+                pending.append(batch)
+                rows += batch.num_rows
+                while rows >= self._chunksize:
+                    table = pa.Table.from_batches(pending)
+                    yield table.slice(0, self._chunksize)
+                    rest = table.slice(self._chunksize)
+                    pending, rows = rest.to_batches(), rest.num_rows
+        if rows:
+            yield pa.Table.from_batches(pending)
+
+    def _read_batches(self) -> Generator[RecordBatch]:
+        """Read the record batches of the files, in order, without empty batches.
+
+        Yields:
+            The record batches of at most ``chunksize`` rows.
+        """
+        with closing(self._open_files()) as sources:
+            for source in sources:
+                with source:
+                    yield from self._read_file(source)
+
+    def _read_file(self, source: Any) -> Generator[RecordBatch]:
+        """Read the record batches of one file.
+
+        Args:
+            source: The file, as ``_open()`` opened it.
+
+        Yields:
+            The non-empty record batches of at most ``chunksize`` rows.
+
+        Raises:
+            ValueError: If the file has no top-level column of a name in ``columns``.
+        """
         import pyarrow.parquet as pq
 
-        batches: list[pa.RecordBatch] = []
-        rows = 0
-        paths = iter(self._paths)
-        sources: deque[Future[Any]] = deque()
+        parquet_file = pq.ParquetFile(source, pre_buffer=False, buffer_size=self.BUFFER_SIZE)
+        if self._columns is not None and (
+            missing := set(self._columns) - set(parquet_file.schema_arrow.names)
+        ):
+            # pyarrow would select nested fields by dotted paths, or no column, whose
+            # tables keep their rows when sliced.
+            raise ValueError(f"No top-level columns {sorted(missing)}.")
+        for batch in parquet_file.iter_batches(batch_size=self._chunksize, columns=self._columns):
+            if batch.num_rows:
+                yield batch
+
+    def _open_files(self) -> Generator[Any]:
+        """Open the files in order, each next file in a background thread.
+
+        The receiver closes each file it receives. A file opened ahead and not
+        received, because reading stopped or failed, is closed here.
+
+        Yields:
+            The files, as ``_open()`` opens them.
+        """
+        if not self._paths:
+            return
         with ThreadPoolExecutor(max_workers=1) as executor:
+            ahead: Future[Any] | None = executor.submit(self._open, self._paths[0])
             try:
-                if (path := next(paths, None)) is not None:
-                    sources.append(executor.submit(self._open, path))
-                while sources:
-                    source = sources.popleft().result()
-                    # Read the next file while this one is decoded.
-                    if (path := next(paths, None)) is not None:
-                        sources.append(executor.submit(self._open, path))
-                    with source:
-                        parquet_file = pq.ParquetFile(
-                            source, pre_buffer=False, buffer_size=self.BUFFER_SIZE
-                        )
-                        if self._columns is not None and (
-                            missing := set(self._columns) - set(parquet_file.schema_arrow.names)
-                        ):
-                            # pyarrow would select nested fields by dotted paths, or no
-                            # column, whose tables keep their rows when sliced.
-                            raise ValueError(f"No top-level columns {sorted(missing)}.")
-                        for batch in parquet_file.iter_batches(
-                            batch_size=self._chunksize, columns=self._columns
-                        ):
-                            if batch.num_rows == 0:
-                                continue
-                            batches.append(batch)
-                            rows += batch.num_rows
-                            while rows >= self._chunksize:
-                                table = pa.Table.from_batches(batches)
-                                yield table.slice(0, self._chunksize)
-                                rest = table.slice(self._chunksize)
-                                batches = rest.to_batches()
-                                rows = rest.num_rows
+                for next_path in [*self._paths[1:], None]:
+                    current = cast("Future[Any]", ahead)
+                    ahead = None if next_path is None else executor.submit(self._open, next_path)
+                    yield current.result()
             finally:
-                for future in sources:
-                    if not future.cancel() and future.exception() is None:
-                        future.result().close()
-        if rows:
-            yield pa.Table.from_batches(batches)
+                if ahead is not None and not ahead.cancel() and ahead.exception() is None:
+                    ahead.result().close()
 
     def _open(self, path: str) -> Any:
         """Open a file for ``ParquetFile``.

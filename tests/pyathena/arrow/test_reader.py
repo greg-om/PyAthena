@@ -71,6 +71,35 @@ class TestParquetChunkReader:
         ):
             next(reader)
 
+    @pytest.mark.parametrize("corrupt", [False, True], ids=["close", "error"])
+    def test_releases_files_opened_ahead(self, paths, max_prefetch_size, monkeypatch, corrupt):
+        """Files opened ahead are closed when reading stops early or fails."""
+        if corrupt:
+            # The third file fails while the files after it may be opened ahead.
+            with open(paths[2], "rb") as f:
+                valid = f.read()
+            with open(paths[2], "wb") as f:
+                f.write(valid[: len(valid) // 2] + b"\x00" * 64 + valid[-8:])
+        paths = [*paths, paths[0], paths[0]]
+        opened = []
+        original_open = ParquetChunkReader._open
+
+        def open_(self, path):
+            source = original_open(self, path)
+            opened.append(source)
+            return source
+
+        monkeypatch.setattr(ParquetChunkReader, "_open", open_)
+        reader = ParquetChunkReader(LocalFileSystem(), paths, 2)
+        if corrupt:
+            with pytest.raises((OSError, ValueError)):
+                list(reader)
+        else:
+            next(reader)
+            reader.close()
+        assert len(opened) >= 2
+        assert all(source.closed for source in opened)
+
     def test_no_files(self):
         assert list(ParquetChunkReader(LocalFileSystem(), [], 4)) == []
 
