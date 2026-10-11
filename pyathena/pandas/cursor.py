@@ -103,10 +103,10 @@ class PandasCursor(WithFetch):
             chunksize: Number of rows per chunk for memory-efficient processing.
                       If specified, takes precedence over auto_optimize_chunksize.
             block_size: S3 read block size.
-            cache_type: S3 caching strategy. Without ``block_size`` or ``cache_type``,
-                a CSV result file read without ``chunksize`` is read in 32 MiB blocks
-                with fsspec's background cache, which reads the next block while pandas
-                parses the current one.
+            cache_type: S3 caching strategy. Without ``block_size`` or ``cache_type``, a CSV result
+                file that ``pandas.read_csv()`` reads in one call, without ``chunksize`` or
+                ``iterator``, is read in 32 MiB blocks with fsspec's background cache, which reads
+                the next block while pandas parses the current one.
             s3_max_workers: Maximum worker threads per S3 file reader.
             result_reuse_enable: Enable query result reuse.
             result_reuse_minutes: Result reuse duration in minutes.

@@ -181,35 +181,35 @@ class TestAthenaPandasResultSet:
         read_csv.assert_called_once()
         assert read_csv.call_args.kwargs["engine"] == "c"
         result_set._fs.open.assert_called_once_with(
-            "s3://bucket/result.txt", mode="rb", **result_set._get_csv_open_options(None)
+            "s3://bucket/result.txt", mode="rb", **result_set._get_csv_open_options(True)
         )
         assert stream.closed
 
     @pytest.mark.parametrize(
-        ("block_size", "cache_type", "chunksize", "expected"),
+        ("block_size", "cache_type", "whole", "expected"),
         [
             (
                 None,
                 None,
-                None,
+                True,
                 {
                     "block_size": 32 * 2**20,
                     "cache_type": "background",
                     "cache_options": {"maxblocks": 2},
                 },
             ),
-            (None, None, 1_000, {}),
-            (5 * 2**20, None, None, {}),
-            (None, "bytes", None, {}),
-            (5 * 2**20, "readahead", None, {}),
+            (None, None, False, {}),
+            (5 * 2**20, None, True, {}),
+            (None, "bytes", True, {}),
+            (5 * 2**20, "readahead", True, {}),
         ],
     )
-    def test_get_csv_open_options(self, block_size, cache_type, chunksize, expected):
+    def test_get_csv_open_options(self, block_size, cache_type, whole, expected):
         """Whole CSV results are prefetched unless the cursor sets block_size or cache_type."""
         result_set = AthenaPandasResultSet.__new__(AthenaPandasResultSet)
         result_set._block_size = block_size
         result_set._cache_type = cache_type
-        assert result_set._get_csv_open_options(chunksize) == expected
+        assert result_set._get_csv_open_options(whole) == expected
 
     @pytest.mark.parametrize(
         ("execute_kwargs", "path", "filesystem_kwargs"),
@@ -250,31 +250,42 @@ class TestAthenaPandasResultSet:
         }
 
 
-@pytest.mark.parametrize("chunksize", [None, 1])
-def test_read_csv_prefetches_whole_files_only(chunksize):
-    """Only a CSV result read without chunks is opened with the background cache."""
+_READ_MODES = [
+    pytest.param(None, {}, True, id="whole"),
+    pytest.param(1, {}, False, id="chunksize"),
+    pytest.param(None, {"iterator": True}, False, id="iterator"),
+]
+
+
+@pytest.mark.parametrize(("chunksize", "kwargs", "whole"), _READ_MODES)
+def test_read_csv_prefetches_whole_files_only(chunksize, kwargs, whole):
+    """Only a CSV result read in one pandas.read_csv() call uses the background cache."""
     with patch.object(
         AthenaPandasResultSet, "_get_csv_open_options", autospec=True, return_value={}
     ) as open_options:
-        result, _ = _read_csv_result('"v"\n"a"\n"b"\n', {"v": "varchar"}, chunksize=chunksize)
-        if chunksize:
-            assert len(list(result)) == 2
-    open_options.assert_called_once_with(ANY, chunksize)
+        result, _ = _read_csv_result(
+            '"v"\n"a"\n"b"\n', {"v": "varchar"}, chunksize=chunksize, **kwargs
+        )
+        if not whole:
+            result.close()
+    open_options.assert_called_once_with(ANY, whole)
 
 
-@pytest.mark.parametrize("chunksize", [None, 1])
-def test_read_csv_binary_stream_chunksize(chunksize):
-    """The text stream for binary columns is opened with the chunk size of the read."""
+@pytest.mark.parametrize(("chunksize", "kwargs", "whole"), _READ_MODES)
+def test_read_csv_binary_stream_whole(chunksize, kwargs, whole):
+    """The text stream for binary columns is opened for the same kind of read."""
     with patch.object(
         AthenaPandasResultSet,
         "_open_binary_csv_stream",
         autospec=True,
-        side_effect=lambda *args, **kwargs: io.StringIO('"b"\n"00 ff"\n'),
+        side_effect=lambda *args, **_: io.StringIO('"b"\n"00 ff"\n'),
     ) as open_stream:
-        result, _ = _read_csv_result('"b"\n"00 ff"\n', {"b": "varbinary"}, chunksize=chunksize)
-        if chunksize:
-            list(result)
-    assert open_stream.call_args.kwargs == {"chunksize": chunksize}
+        result, _ = _read_csv_result(
+            '"b"\n"00 ff"\n', {"b": "varbinary"}, chunksize=chunksize, **kwargs
+        )
+        if not whole:
+            result.close()
+    assert open_stream.call_args.kwargs == {"whole": whole}
 
 
 # A CSV result of Athena with each type the PyArrow engine reads, then a row of NULLs.
