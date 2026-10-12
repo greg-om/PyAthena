@@ -5,11 +5,12 @@
 #
 # SPDX-License-Identifier: MIT
 
-"""Reader of Parquet files in chunks of a fixed number of rows."""
+"""Readers of the result files of the Arrow cursor."""
 
 from __future__ import annotations
 
-from collections import abc
+import io
+from collections import abc, deque
 from collections.abc import Generator, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import closing
@@ -19,7 +20,7 @@ from pyathena.util import override
 
 if TYPE_CHECKING:
     from fsspec import AbstractFileSystem
-    from pyarrow import RecordBatch, Table
+    from pyarrow import NativeFile, RecordBatch, Table
 
 
 class ParquetChunkReader(abc.Iterator):  # type: ignore[type-arg]
@@ -219,3 +220,124 @@ class ParquetChunkReader(abc.Iterator):  # type: ignore[type-arg]
         if self._fs.size(path) <= self.MAX_PREFETCH_SIZE:
             return pa.BufferReader(self._fs.cat_file(path))
         return self._fs.open(path, "rb", cache_type=self._cache_type)
+
+
+class ReadAheadStream(io.RawIOBase):
+    """Sequential stream over a random-access file that reads ranges ahead in parallel.
+
+    The file is read in parts of ``part_size`` bytes with ``read_at()``, and up
+    to ``max_parts`` parts are read in a thread pool ahead of the consumer, so
+    the transfer is not limited to one request at a time. Parts are returned in
+    order, and at most ``max_parts`` parts plus the one being consumed are held
+    in memory. A read that returns fewer bytes than requested raises
+    ``OSError``, and an error from ``read_at()`` is raised by the read that
+    reaches its part; every later read raises the same error.
+
+    Closing the stream cancels the queued reads, waits for the running ones,
+    and closes the file.
+
+    Example:
+        >>> stream = ReadAheadStream(fs.open_input_file(path), 8 * 2**20, 16)
+        >>> with pyarrow.PythonFile(stream, mode="r") as f:
+        ...     table = pyarrow.csv.read_csv(f)
+    """
+
+    def __init__(self, file: NativeFile, part_size: int, max_parts: int) -> None:
+        """Initialize the stream without reading the file.
+
+        Args:
+            file: The file to read, whose ``read_at()`` may be called from
+                several threads at once, as pyarrow's random-access files allow.
+            part_size: Bytes requested by one ``read_at()`` call.
+            max_parts: The most parts read ahead of the consumer at once.
+        """
+        super().__init__()
+        self._file = file
+        self._part_size = part_size
+        self._max_parts = max_parts
+        self._executor = ThreadPoolExecutor(max_workers=max_parts)
+        self._parts: deque[tuple[int, Future[bytes]]] = deque()
+        self._next_offset = 0
+        self._position = 0
+        self._buffer = memoryview(b"")
+        self._error: BaseException | None = None
+        # Last, so that close() works if it fails.
+        self._size: int = file.size()
+
+    @override
+    def readable(self) -> bool:
+        return True
+
+    @override
+    def tell(self) -> int:
+        return self._position
+
+    @override
+    def readinto(self, buffer: Any) -> int:  # type: ignore[override]
+        """Fill ``buffer`` from the parts read ahead.
+
+        Args:
+            buffer: A writable buffer.
+
+        Returns:
+            The number of bytes read, less than the size of ``buffer`` only at
+            the end of the file.
+        """
+        view = memoryview(buffer).cast("B")
+        filled = 0
+        while filled < len(view):
+            if not self._buffer and not self._next_part():
+                break
+            size = min(len(view) - filled, len(self._buffer))
+            view[filled : filled + size] = self._buffer[:size]
+            self._buffer = self._buffer[size:]
+            filled += size
+        self._position += filled
+        return filled
+
+    @override
+    def close(self) -> None:
+        if self.closed:
+            return
+        try:
+            self._executor.shutdown(wait=True, cancel_futures=True)
+            self._parts.clear()
+            self._buffer = memoryview(b"")
+        finally:
+            self._file.close()
+            super().close()
+
+    def _next_part(self) -> bool:
+        """Wait for the next part and make it the buffer being consumed.
+
+        Returns:
+            False at the end of the file.
+
+        Raises:
+            OSError: If the part has fewer bytes than requested.
+        """
+        if self._error is not None:
+            raise self._error
+        self._read_ahead()
+        if not self._parts:
+            return False
+        expected, part = self._parts.popleft()
+        try:
+            data = part.result()
+            if len(data) != expected:
+                raise OSError(f"Read {len(data)} bytes of a range of {expected} bytes.")
+        except BaseException as e:
+            # The part is gone, so a later read must not continue past it.
+            self._error = e
+            raise
+        self._buffer = memoryview(data)
+        self._read_ahead()
+        return True
+
+    def _read_ahead(self) -> None:
+        """Start reading parts until ``max_parts`` are in flight or the file is read."""
+        while len(self._parts) < self._max_parts and self._next_offset < self._size:
+            size = min(self._part_size, self._size - self._next_offset)
+            part = self._executor.submit(self._file.read_at, size, self._next_offset)
+            self._parts.append((size, part))
+            self._next_offset += size

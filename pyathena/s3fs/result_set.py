@@ -11,13 +11,14 @@ from __future__ import annotations
 
 import logging
 from io import TextIOWrapper
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from fsspec import AbstractFileSystem
 
 from pyathena.converter import Converter
 from pyathena.error import OperationalError, ProgrammingError
 from pyathena.filesystem.s3 import S3FileSystem
+from pyathena.filesystem.s3_async import AioS3FileSystem
 from pyathena.model import AthenaQueryExecution
 from pyathena.result_set import AthenaResultSet
 from pyathena.s3fs.reader import AthenaCSVReader, CSVReader
@@ -62,6 +63,9 @@ class AthenaS3FSResultSet(AthenaResultSet):
 
     DEFAULT_FETCH_SIZE: int = 1000
     DEFAULT_BLOCK_SIZE = 1024 * 1024 * 128
+    # The block size of a CSV result file read with the background cache; see
+    # _get_csv_open_options().
+    CSV_BLOCK_SIZE: ClassVar[int] = 32 * 2**20
 
     def __init__(
         self,
@@ -86,7 +90,9 @@ class AthenaS3FSResultSet(AthenaResultSet):
                 default ``fetchmany()`` size.
             retry_config: The retry configuration for API calls.
             block_size: The default block size in bytes for the filesystem. If not set,
-                ``DEFAULT_BLOCK_SIZE`` is used.
+                ``DEFAULT_BLOCK_SIZE`` is used, and PyAthena's ``S3FileSystem`` or
+                ``AioS3FileSystem`` reads the CSV result file in 32 MiB blocks with fsspec's
+                background cache, which reads the next block while rows are converted.
             csv_reader: The CSV reader class for the results. If None,
                 ``AthenaCSVReader`` is used. Custom readers must satisfy the
                 :class:`~pyathena.s3fs.reader.CSVReader` protocol.
@@ -112,7 +118,7 @@ class AthenaS3FSResultSet(AthenaResultSet):
         pre_fetched_rows = list(self._rows)
         self._rows.clear()
         self._arraysize = arraysize
-        self._block_size = block_size if block_size else self.DEFAULT_BLOCK_SIZE
+        self._block_size = block_size
         self._csv_reader_class: CSVReaderType = csv_reader or AthenaCSVReader
         self._filesystem_class: type[AbstractFileSystem] = filesystem_class or S3FileSystem
         self._fs = self._create_s3_file_system()
@@ -137,9 +143,31 @@ class AthenaS3FSResultSet(AthenaResultSet):
         # released with the result set.
         return self._filesystem_class(
             connection=self.connection,
-            default_block_size=self._block_size,
+            default_block_size=self._block_size or self.DEFAULT_BLOCK_SIZE,
             skip_instance_cache=True,
         )
+
+    def _get_csv_open_options(self) -> dict[str, Any]:
+        """Get the options to open the CSV result file with the filesystem.
+
+        Without ``block_size`` from the cursor, PyAthena's ``S3FileSystem`` or
+        ``AioS3FileSystem`` reads the file with fsspec's background cache in blocks
+        of ``CSV_BLOCK_SIZE`` bytes: the next block is read while rows are
+        converted, and two blocks are kept. Otherwise, and for another
+        ``filesystem_class``, including a subclass, the filesystem's settings
+        apply. Closing a partly read file waits for the block being read;
+        the asyncio cursors close result sets in a thread.
+
+        Returns:
+            The keyword arguments for the filesystem's ``_open()``.
+        """
+        if self._block_size or type(self._fs) not in (S3FileSystem, AioS3FileSystem):
+            return {}
+        return {
+            "block_size": self.CSV_BLOCK_SIZE,
+            "cache_type": "background",
+            "cache_options": {"maxblocks": 2},
+        }
 
     def _init_csv_reader(self) -> None:
         """Initialize CSV reader for the output file."""
@@ -165,20 +193,27 @@ class AthenaS3FSResultSet(AthenaResultSet):
         bucket, key = parse_output_location(self.output_location)
         path = f"{bucket}/{key}"
 
+        csv_file = None
         try:
-            csv_file = self._fs._open(path, mode="rb")
+            csv_file = self._fs._open(path, mode="rb", **self._get_csv_open_options())
             text_wrapper = TextIOWrapper(csv_file, encoding="utf-8")
 
             if self.output_location.endswith(".txt"):
                 # Tab-separated format (no header row)
-                self._csv_reader = self._csv_reader_class(text_wrapper, delimiter="\t")
+                csv_reader = self._csv_reader_class(text_wrapper, delimiter="\t")
             else:
                 # Standard CSV format (has header row, skip it)
-                self._csv_reader = self._csv_reader_class(text_wrapper, delimiter=",")
-                next(self._csv_reader)
+                csv_reader = self._csv_reader_class(text_wrapper, delimiter=",")
+                next(csv_reader)
+            self._csv_reader = csv_reader
 
         except Exception as e:
             _logger.exception(f"Failed to open {path}.")
+            if csv_file is not None:
+                try:
+                    csv_file.close()
+                except Exception:
+                    _logger.exception(f"Failed to close {path}.")
             raise OperationalError(*e.args) from e
 
     @override
@@ -198,6 +233,9 @@ class AthenaS3FSResultSet(AthenaResultSet):
             try:
                 row = next(self._csv_reader)
             except StopIteration:
+                # Release the file and its read-ahead at the end of the results.
+                self._csv_reader.close()
+                self._csv_reader = None
                 break
 
             if col_hints:

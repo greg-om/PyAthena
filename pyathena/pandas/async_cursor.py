@@ -109,8 +109,7 @@ class AsyncPandasCursor(AsyncCursor):
             result_reuse_minutes: Maximum age of a reused query result in minutes.
             block_size: Default block size of the S3 filesystem that reads the results.
             cache_type: Default cache type of the S3 filesystem that reads the results. Without
-                ``block_size`` or ``cache_type``, a CSV result file that ``pandas.read_csv()`` reads
-                in one call, without ``chunksize`` or ``iterator``, is read in 32 MiB blocks with
+                ``block_size`` or ``cache_type``, a CSV result file is read in 32 MiB blocks with
                 fsspec's background cache, which reads the next block while pandas parses the
                 current one.
                 Without ``cache_type``, PyAthena's filesystem reads a Parquet file of a chunked

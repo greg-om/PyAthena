@@ -115,3 +115,13 @@ class TestAthenaArrowResultSet:
         options = fs.__reduce__()[1][0]
         assert options["access_key"] == expected_access_key
         assert options["role_arn"] == ""
+
+    def test_open_csv_closes_file_when_stream_fails(self):
+        """The input file is closed if the read-ahead stream cannot be created."""
+        result_set = AthenaArrowResultSet.__new__(AthenaArrowResultSet)  # bypass __init__
+        result_set._fs = MagicMock()
+        file = result_set._fs.open_input_file.return_value
+        file.size.side_effect = OSError("HEAD failed")
+        with pytest.raises(OSError, match="HEAD failed"):
+            result_set._open_csv("bucket/key.csv")
+        file.close.assert_called_once_with()

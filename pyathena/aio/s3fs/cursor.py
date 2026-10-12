@@ -9,12 +9,12 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from collections.abc import Callable
 from typing import Any
 
 from pyathena.aio.common import WithAsyncFetch
+from pyathena.aio.util import create_in_thread
 from pyathena.common import CursorIterator
 from pyathena.error import OperationalError
 from pyathena.filesystem.s3_async import AioS3FileSystem
@@ -150,7 +150,8 @@ class AioS3FSCursor(WithAsyncFetch):
                 :class:`~pyathena.options.ExecuteOptions` instance. Individual
                 keyword arguments take precedence over ``options`` fields.
             **kwargs: Supported S3FS result-set overrides. Unknown names raise TypeError.
-                ``block_size`` sets the read block size for this query, and
+                ``block_size`` sets the read block size for this query (without it, the
+                CSV result file is read in 32 MiB blocks with fsspec's background cache), and
                 ``csv_reader`` overrides the cursor's value.
 
         Returns:
@@ -181,7 +182,7 @@ class AioS3FSCursor(WithAsyncFetch):
 
         query_execution = await self._poll(self.query_id)
         if query_execution.state == AthenaQueryExecution.STATE_SUCCEEDED:
-            self.result_set = await asyncio.to_thread(
+            self.result_set = await create_in_thread(
                 AthenaS3FSResultSet,
                 connection=self._connection,
                 converter=self._converter,

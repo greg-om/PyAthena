@@ -87,9 +87,9 @@ _USER_FS = sentinel.user_fs
 
 
 _READ_MODES = [
-    pytest.param(None, {}, True, id="dataframe"),
-    pytest.param(1, {}, False, id="chunksize"),
-    pytest.param(None, {"iterator": True}, False, id="iterator"),
+    pytest.param(None, {}, id="dataframe"),
+    pytest.param(1, {}, id="chunksize"),
+    pytest.param(None, {"iterator": True}, id="iterator"),
 ]
 
 
@@ -194,7 +194,7 @@ class TestAthenaPandasResultSet:
         read_csv.assert_called_once()
         assert read_csv.call_args.kwargs["engine"] == "c"
         result_set._fs.open.assert_called_once_with(
-            "s3://bucket/result.txt", mode="rb", **result_set._get_csv_open_options(True)
+            "s3://bucket/result.txt", mode="rb", **result_set._get_csv_open_options()
         )
         assert stream.closed
 
@@ -226,30 +226,28 @@ class TestAthenaPandasResultSet:
         assert result_set._reads_parquet_in_chunks() is expected
 
     @pytest.mark.parametrize(
-        ("block_size", "cache_type", "prefetch", "expected"),
+        ("block_size", "cache_type", "expected"),
         [
             (
                 None,
                 None,
-                True,
                 {
                     "block_size": 32 * 2**20,
                     "cache_type": "background",
                     "cache_options": {"maxblocks": 2},
                 },
             ),
-            (None, None, False, {}),
-            (5 * 2**20, None, True, {}),
-            (None, "bytes", True, {}),
-            (5 * 2**20, "readahead", True, {}),
+            (5 * 2**20, None, {}),
+            (None, "bytes", {}),
+            (5 * 2**20, "readahead", {}),
         ],
     )
-    def test_get_csv_open_options(self, block_size, cache_type, prefetch, expected):
-        """Whole CSV results are prefetched unless the cursor sets block_size or cache_type."""
+    def test_get_csv_open_options(self, block_size, cache_type, expected):
+        """CSV results are prefetched unless the cursor sets block_size or cache_type."""
         result_set = AthenaPandasResultSet.__new__(AthenaPandasResultSet)
         result_set._block_size = block_size
         result_set._cache_type = cache_type
-        assert result_set._get_csv_open_options(prefetch) == expected
+        assert result_set._get_csv_open_options() == expected
 
     @pytest.mark.parametrize(
         ("execute_kwargs", "path", "filesystem_kwargs"),
@@ -348,34 +346,28 @@ class TestAthenaPandasResultSet:
         with pytest.raises(OperationalError, match="chunksize must be positive"):
             _read_unload_result(tmp_path, [pa.table({"i": [1]})], chunksize=0)
 
-    @pytest.mark.parametrize(("chunksize", "kwargs", "prefetch"), _READ_MODES)
-    def test_read_csv_prefetches_without_reader(self, chunksize, kwargs, prefetch):
-        """Only a CSV result read in one pandas.read_csv() call uses the background cache."""
-        with patch.object(
-            AthenaPandasResultSet, "_get_csv_open_options", autospec=True, return_value={}
-        ) as open_options:
-            result, _ = _read_csv_result(
-                '"v"\n"a"\n"b"\n', {"v": "varchar"}, chunksize=chunksize, **kwargs
-            )
-            if not prefetch:
-                result.close()
-        open_options.assert_called_once_with(ANY, prefetch)
-
-    @pytest.mark.parametrize(("chunksize", "kwargs", "prefetch"), _READ_MODES)
-    def test_read_csv_binary_stream_prefetch(self, chunksize, kwargs, prefetch):
-        """The text stream for binary columns is opened for the same kind of read."""
+    @pytest.mark.parametrize(
+        ("data", "types"),
+        [
+            pytest.param('"v"\n"a"\n"b"\n', {"v": "varchar"}, id="text"),
+            pytest.param('"b"\n"00 ff"\n', {"b": "varbinary"}, id="binary"),
+        ],
+    )
+    @pytest.mark.parametrize(("chunksize", "kwargs"), _READ_MODES)
+    def test_read_csv_open_options(self, data, types, chunksize, kwargs):
+        """Every kind of CSV read opens the result file with the same options."""
+        fs = MagicMock()
         with patch.object(
             AthenaPandasResultSet,
-            "_open_binary_csv_stream",
+            "_get_csv_open_options",
             autospec=True,
-            side_effect=lambda *args, **_: io.StringIO('"b"\n"00 ff"\n'),
-        ) as open_stream:
-            result, _ = _read_csv_result(
-                '"b"\n"00 ff"\n', {"b": "varbinary"}, chunksize=chunksize, **kwargs
-            )
-            if not prefetch:
+            return_value={"cache_type": "sentinel"},
+        ) as open_options:
+            result, _ = _read_csv_result(data, types, chunksize=chunksize, fs=fs, **kwargs)
+            if chunksize or kwargs:
                 result.close()
-        assert open_stream.call_args.kwargs == {"prefetch": prefetch}
+        open_options.assert_called_once_with(ANY)
+        assert fs.open.call_args.kwargs["cache_type"] == "sentinel"
 
     @pytest.mark.filterwarnings("error::pandas.errors.DtypeWarning")
     @pytest.mark.parametrize(
@@ -715,7 +707,7 @@ def _read_unload_result(tmp_path, tables, chunksize, write_statistics=True, **kw
     return chunks, whole
 
 
-def _read_csv_result(data, types, engine="c", chunksize=None, **kwargs):
+def _read_csv_result(data, types, engine="c", chunksize=None, fs=None, **kwargs):
     """Read an in-memory CSV through the result set and the real pandas parser.
 
     ``types`` maps column names to Athena types, or lists (name, type) pairs for
@@ -734,8 +726,11 @@ def _read_csv_result(data, types, engine="c", chunksize=None, **kwargs):
     result_set._csv_stream = None
     result_set._block_size = None
     result_set._cache_type = None
-    result_set._fs = MagicMock()
-    result_set._fs.open.return_value = io.BytesIO(data.encode())
+    result_set._fs = fs or MagicMock()
+    # Binary columns are read through a text stream.
+    result_set._fs.open.side_effect = lambda path, mode="rb", **_: (
+        io.StringIO(data, newline="") if "t" in mode else io.BytesIO(data.encode())
+    )
     pairs = types.items() if isinstance(types, dict) else types
     description = [(name, type_, None, None, 0, 0, "UNKNOWN") for name, type_ in pairs]
     with (
