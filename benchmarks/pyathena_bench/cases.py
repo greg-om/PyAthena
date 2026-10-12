@@ -95,6 +95,8 @@ def matrix(settings: Settings, suite: str, shape: str) -> list[Case]:
     if suite not in SUITES or shape not in SHAPES:
         raise ValueError("Unknown suite or shape")
     if suite == "filesystem":
+        if shape != "flat":
+            return []
         return [
             Case(
                 FILESYSTEM_FAMILY,
@@ -109,7 +111,6 @@ def matrix(settings: Settings, suite: str, shape: str) -> list[Case]:
             for api in ("sync", "aio")
             for workers in settings.filesystem_max_workers
             for pool in settings.filesystem_pool_connections
-            if shape == "flat"
         ]
     if shape == "json" and suite != "single":
         return []

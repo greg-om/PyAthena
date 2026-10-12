@@ -45,11 +45,15 @@ class RecordingFileSystem:
         return io.BytesIO()
 
     def _copy_object_with_multipart_upload(self, source, destination, **kwargs):
-        self.threads.append(threading.get_ident())
-        self.copies.append((source, destination, kwargs))
-        if self.asynchronous_copy:
-            return asyncio.sleep(0)
-        return None
+        if not self.asynchronous_copy:
+            self.copies.append((source, destination, kwargs))
+            return None
+
+        async def copy():
+            # Recorded only when the coroutine runs.
+            self.copies.append((source, destination, kwargs))
+
+        return copy()
 
 
 @pytest.mark.parametrize(

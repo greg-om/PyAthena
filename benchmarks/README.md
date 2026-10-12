@@ -237,7 +237,7 @@ uv run --no-sync python -m pyathena_bench run \
   --suite filesystem --scale large
 ```
 
-`jobs` reads the scales of the filesystem suite from `[filesystem] sizes`; expand it in its own `jobs` command and combine the job files with `queue --jobs`.
+`jobs` reads the scales of the filesystem suite from `[filesystem] sizes`; a `jobs` command that also selects another suite accepts only scale names defined in both tables, so expand the filesystem suite in its own command when its scales differ and combine the job files with `queue --jobs`.
 
 ## Measurement semantics
 
