@@ -317,7 +317,7 @@ class TestQueue:
         def runner(item, workdir, out, resume, stop, checkpoint):
             runs.append(item["id"])
             out.mkdir(parents=True)
-            (out / "summary.csv").write_text("x")
+            (out / "trials.jsonl").write_text(json.dumps(ok_trial(0)) + "\n")
             return 0 if item["id"] == "light" else 1
 
         assert work(
@@ -341,7 +341,8 @@ class TestQueue:
         )
         assert sorted(runs) == ["heavy", "light"]
         assert [path.parent.name for path in settled] == ["heavy"]
-        assert queue.key("results", "light", "attempt-1", "summary.csv") in s3.objects
+        assert queue.key("results", "light", "attempt-1", "trials.jsonl") in s3.objects
+        assert queue.key("results", "light", "attempt-1", "job-summary.csv") in s3.objects
         assert not live_slots(queue)
         summary = status(queue)
         assert summary["done"] == 2
@@ -699,6 +700,13 @@ def recording_runner(calls, code=0, trials=None):
 
 
 class TestLease:
+    def test_downloads_stay_below_the_destination(self, tmp_path):
+        _, queue = queue_with([], tmp_path)
+        queue.put(queue.key("results", "a", "attempt-1", "..", "..", "escape.json"), {})
+        with pytest.raises(ValueError, match="outside"):
+            queue.download_tree(tmp_path / "w" / "attempt-1", "results", "a", "attempt-1")
+        assert not (tmp_path / "w" / "escape.json").exists()
+
     def test_only_one_worker_takes_over_an_expired_lease(self, tmp_path):
         _, queue = queue_with([], tmp_path)
         key = queue.key("claims", "a")
@@ -1135,6 +1143,52 @@ class TestWork:
         # No further trials start while the query may still run.
         assert [call[0] for call in calls] == ["a"]
         assert not queue.names("done")
+
+    def test_a_claim_lost_only_locally_returns_to_the_fleet(self, tmp_path):
+        _, queue = queue_with([job("a")], tmp_path)
+        renew = queue.renew
+        failing = threading.Event()
+        failing.set()
+
+        def unavailable(lease, seconds, **changes):
+            # S3 is unreachable during the first attempt, until its claim expires locally.
+            if failing.is_set() and changes.get("state") is None:
+                raise ClientError({"Error": {"Code": "SlowDown"}}, "PutObject")
+            return renew(lease, seconds, **changes)
+
+        queue.renew = unavailable
+        calls = []
+
+        def runner(item, workdir, out, resume, stop, checkpoint):
+            calls.append(out.name)
+            if len(calls) == 1:
+                assert stop.wait(5)
+                failing.clear()
+                return 130
+            return 0
+
+        assert work(queue, tmp_path / "w", api_slots=1, poll_seconds=0, runner=runner,
+                    settle=no_queries, lease_seconds=0.3) == ["a"]  # fmt: skip
+        # The first attempt released its claim, so the job ran again instead of
+        # staying claimed by a worker that had given it up.
+        assert calls == ["attempt-1", "attempt-2"]
+        assert json.loads(queue.read("done", "a"))["attempt"] == 2
+
+    def test_a_failed_summary_upload_releases_the_claim(self, tmp_path):
+        s3, queue = queue_with([job("a")], tmp_path)
+        original = s3.upload_file
+
+        def failing(filename, bucket, key):
+            if key.endswith("job-summary.csv"):
+                raise ClientError({"Error": {"Code": "InternalError"}}, "PutObject")
+            return original(filename, bucket, key)
+
+        s3.upload_file = failing
+        runner = recording_runner([], trials={"a": [ok_trial(0)]})
+        with pytest.raises(ClientError):
+            work(queue, tmp_path / "w", api_slots=1, runner=runner, settle=no_queries)
+        assert not queue.names("done")
+        assert queue.read_lease(queue.key("claims", "a")).body["state"] == "released"
 
 
 class TestWorkerCommand:

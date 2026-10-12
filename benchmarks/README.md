@@ -429,7 +429,7 @@ A lost API slot does not stop the job; the `done` marker lists it under `lost_sl
 Each attempt of a job writes to `results/<job>/attempt-<n>/`; between trials, its run writes each trial's start and record below `checkpoint/` there, so a lost host loses only its running trial, and the worker uploads the attempt's files when it ends.
 A trial whose start checkpoint could not be written, which the run logs, is not quiesced by the next attempt; its queries write to their own trial prefix and are cancelled by `cleanup`.
 After a job, the worker uploads the attempt's output directory and its log to `logs/`, renews its claim conditionally to confirm that it still owns the job, writes `job-summary.csv` and `job-summary.md` from every attempt into its attempt directory, and then creates `done/<job>` with the exit code, attempt, host, times, and the summary's attempt directory under `summary`.
-A failed trial stops only its own job; `status` lists jobs with a non-zero exit code, the claims of running jobs, and the slots in use, each with its host, attempt, and whether its lease has expired.
+A failed trial stops only its own job; `status` lists jobs with a non-zero exit code or a report error, the claims of running jobs, and the slots in use, each with its host, attempt, and whether its lease has expired.
 After a failed job, the worker stops the job's reported queries and every queued or running query in the workgroup that writes under the job's trial output prefixes, which also covers queries whose IDs were never reported before a trial process died.
 It waits until they stop before claiming another job; this scans the workgroup's query history.
 If it cannot confirm that, it records the errors in the `done` marker and exits.

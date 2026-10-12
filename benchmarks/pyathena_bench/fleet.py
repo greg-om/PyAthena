@@ -587,11 +587,17 @@ class Queue:
 
         Returns:
             Relative paths of the downloaded files.
+
+        Raises:
+            ValueError: If an object name would be written outside ``directory``.
         """
         source = self.key(*parts) + "/"
         names = sorted(self.names("/".join(parts)))
+        root = directory.resolve()
         for name in names:
-            path = directory / name
+            path = (directory / name).resolve()
+            if not path.is_relative_to(root):
+                raise ValueError(f"Object {source + name} is outside {directory}")
             path.parent.mkdir(parents=True, exist_ok=True)
             self.s3.download_file(self.bucket, source + name, str(path))
         return names
@@ -987,27 +993,40 @@ def run_attempt(
             # A failed or stopped run can leave queries running.
             errors = safe_settle(output)
         upload_attempt()
-    lost = Outcome("lost", tuple(errors))
+
+    def abandon() -> Outcome:
+        # A claim lost only by its local expiry, for example while a renewal that
+        # S3 accepted stalled, may still be this worker's; releasing it, which
+        # works only then, returns the job to the fleet.
+        queue.end_lease(claim, "released")
+        return Outcome("lost", tuple(errors))
+
     # The conditional renewal proves that this worker still owns the job, so a
     # former owner never records it, and leaves at least --lease-seconds for
     # the few seconds of publication.
     if watch.claim_lost.is_set() or not queue.renew(claim, lease_seconds):
-        return lost
+        return abandon()
     report_error = None
     try:
         report(job_dir)
-        # The job's summary goes below this attempt, which the done marker names,
-        # so a former owner's late upload cannot replace the recorded summary.
-        for name in ("summary.csv", "summary.md"):
-            queue.s3.upload_file(
-                str(job_dir / name), queue.bucket, queue.key(*remote, f"job-{name}")
-            )
     except Exception as exc:
-        # A job without trials, or with unreadable records, still gets its done marker.
+        # A job without trials, or with unreadable records, gets a failed done marker.
         report_error = f"{type(exc).__name__}: {exc}"
+    if report_error is None:
+        try:
+            # The job's summary goes below this attempt, which the done marker names,
+            # so a former owner's late upload cannot replace the recorded summary.
+            for name in ("summary.csv", "summary.md"):
+                queue.s3.upload_file(
+                    str(job_dir / name), queue.bucket, queue.key(*remote, f"job-{name}")
+                )
+        except Exception:
+            # Another worker publishes the job again from the uploaded attempts.
+            queue.end_lease(claim, "released")
+            raise
     if time.time() >= claim.body["expires"]:
         # Publication outlasted the renewed claim, which another worker may own now.
-        return lost
+        return abandon()
     recorded = queue.put_lease(
         queue.key("done", job["id"]),
         {
@@ -1023,7 +1042,7 @@ def run_attempt(
         },
         IfNoneMatch="*",
     )
-    return lost if recorded is None else Outcome("done", tuple(errors))
+    return abandon() if recorded is None else Outcome("done", tuple(errors))
 
 
 def work(
@@ -1320,7 +1339,8 @@ def status(queue: Queue) -> dict[str, Any]:
         queue: Queue to inspect.
 
     Returns:
-        Counts of jobs, claims, and completions, with failed job details, the
+        Counts of jobs, claims, and completions, with the details of failed
+        jobs (a non-zero exit code or a report error), the
         claims of unfinished jobs, and the API slots in use, each lease with
         its host, attempt, state, and whether it has expired.
     """
@@ -1331,7 +1351,7 @@ def status(queue: Queue) -> dict[str, Any]:
     failed = {}
     for name in sorted(done):
         record = json.loads(queue.read("done", name))
-        if record["exit_code"] != 0:
+        if record["exit_code"] != 0 or record.get("report_error"):
             failed[name] = record
     at = time.time()
 
