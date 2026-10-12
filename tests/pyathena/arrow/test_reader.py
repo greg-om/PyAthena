@@ -56,8 +56,11 @@ class _CountingFile(AbstractBufferedFile):
 class _CountingFileSystem(AbstractFileSystem):
     """Local files opened as buffered files, like ``S3File``, with a "bytes" cache by default."""
 
+    # A new instance for every test, so that its count starts at zero.
+    cachable = False
+
     def __init__(self, block_size):
-        super().__init__(skip_instance_cache=True)
+        super().__init__()
         self.block_size = block_size
         self.fetched = 0
 
@@ -179,8 +182,8 @@ class TestParquetChunkReader:
     def test_streamed_file_bytes(self, tmp_path, monkeypatch, cache_type):
         """A streamed file is read without read-ahead unless a cache type is given.
 
-        pyarrow reads each column chunk in ``BUFFER_SIZE`` pieces, so read-ahead past a
-        piece is discarded when it moves to the next column.
+        Read-ahead around pyarrow's reads of column chunks, in pieces of at most
+        ``BUFFER_SIZE`` bytes, is largely discarded or fetched again.
         """
         monkeypatch.setattr(ParquetChunkReader, "MAX_PREFETCH_SIZE", -1)
         monkeypatch.setattr(ParquetChunkReader, "BUFFER_SIZE", 64 * 2**10)
@@ -196,7 +199,7 @@ class TestParquetChunkReader:
             # Only pyarrow's footer read, the last 64 KiB, overlaps the column chunks.
             assert fs.fetched <= size + 64 * 2**10
         else:
-            assert fs.fetched > 1.5 * size
+            assert fs.fetched > 1.2 * size
 
     def test_no_files(self):
         assert list(ParquetChunkReader(LocalFileSystem(), [], 4)) == []

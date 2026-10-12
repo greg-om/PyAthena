@@ -35,10 +35,11 @@ class ParquetChunkReader(abc.Iterator):  # type: ignore[type-arg]
     A file of at most ``MAX_PREFETCH_SIZE`` bytes is read whole with one
     ``cat_file()`` call, and the next file is read in a background thread while
     the current one is decoded. Larger files are read in ``BUFFER_SIZE`` pieces
-    through ``open()``, by default without the filesystem's read-ahead cache: pyarrow
-    reads each column chunk in its own pieces, so read-ahead bytes beyond a piece
-    are discarded when it moves to another column. Pre-buffering, which would read
-    the pieces together, would hold a whole row group in memory.
+    through ``open()``, by default without the filesystem's read-ahead cache:
+    pyarrow reads the column chunks in pieces of at most ``BUFFER_SIZE`` bytes, in
+    the order it decodes them, and read-ahead around those reads is largely
+    discarded or fetched again. Pre-buffering, which would read the pieces
+    together, would hold a whole row group in memory.
 
     The files must have the same schema, as the files of one UNLOAD query do.
 
