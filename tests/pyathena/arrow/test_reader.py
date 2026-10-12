@@ -5,6 +5,7 @@
 #
 # SPDX-License-Identifier: MIT
 
+import threading
 from concurrent.futures import Future
 
 import pyarrow as pa
@@ -14,6 +15,7 @@ import pytest
 from fsspec.implementations.local import LocalFileSystem
 
 from pyathena.arrow.reader import ParquetChunkReader, ReadAheadStream
+from tests.pyathena.util import EVENT_TIMEOUT
 
 
 class _ImmediateExecutor:
@@ -175,10 +177,11 @@ class TestParquetChunkReader:
 class _RecordingFile:
     """A random-access file over bytes that records its reads."""
 
-    def __init__(self, data, short=False, error_at=None):
+    def __init__(self, data, short=False, error_at=None, gate=None):
         self._data = data
         self._short = short
         self._error_at = error_at
+        self._gate = gate
         self.reads = []
         self.closed = False
 
@@ -187,6 +190,8 @@ class _RecordingFile:
 
     def read_at(self, nbytes, offset):
         self.reads.append((offset, nbytes))
+        if self._gate is not None and offset > 0:
+            assert self._gate.wait(EVENT_TIMEOUT)
         if offset == self._error_at:
             raise OSError("read failed")
         return self._data[offset : offset + nbytes - (1 if self._short else 0)]
@@ -257,6 +262,23 @@ class TestReadAheadStream:
         assert stream.closed
         assert len(file.reads) <= 3
         stream.close()
+
+    def test_close_waits_for_running_reads(self):
+        """Closing waits for the reads in flight before closing the file."""
+        gate = threading.Event()
+        file = _RecordingFile(bytes(100), gate=gate)
+        stream = ReadAheadStream(file, part_size=10, max_parts=2)
+        assert stream.read(10) == bytes(10)
+        closer = threading.Thread(target=stream.close)
+        closer.start()
+        closer.join(0.2)
+        # The reads of the next parts are still blocked, so close() has not returned.
+        assert closer.is_alive()
+        assert not file.closed
+        gate.set()
+        closer.join(EVENT_TIMEOUT)
+        assert not closer.is_alive()
+        assert file.closed
 
     def test_csv(self):
         """pyarrow reads a CSV through the stream with its own block size."""

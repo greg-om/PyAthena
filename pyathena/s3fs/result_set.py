@@ -18,6 +18,7 @@ from fsspec import AbstractFileSystem
 from pyathena.converter import Converter
 from pyathena.error import OperationalError, ProgrammingError
 from pyathena.filesystem.s3 import S3FileSystem
+from pyathena.filesystem.s3_async import AioS3FileSystem
 from pyathena.model import AthenaQueryExecution
 from pyathena.result_set import AthenaResultSet
 from pyathena.s3fs.reader import AthenaCSVReader, CSVReader
@@ -89,9 +90,9 @@ class AthenaS3FSResultSet(AthenaResultSet):
                 default ``fetchmany()`` size.
             retry_config: The retry configuration for API calls.
             block_size: The default block size in bytes for the filesystem. If not set,
-                ``DEFAULT_BLOCK_SIZE`` is used, and PyAthena's ``S3FileSystem`` reads the
-                CSV result file in 32 MiB blocks with fsspec's background cache, which reads
-                the next block while rows are converted.
+                ``DEFAULT_BLOCK_SIZE`` is used, and PyAthena's ``S3FileSystem`` or
+                ``AioS3FileSystem`` reads the CSV result file in 32 MiB blocks with fsspec's
+                background cache, which reads the next block while rows are converted.
             csv_reader: The CSV reader class for the results. If None,
                 ``AthenaCSVReader`` is used. Custom readers must satisfy the
                 :class:`~pyathena.s3fs.reader.CSVReader` protocol.
@@ -149,17 +150,18 @@ class AthenaS3FSResultSet(AthenaResultSet):
     def _get_csv_open_options(self) -> dict[str, Any]:
         """Get the options to open the CSV result file with the filesystem.
 
-        Without ``block_size`` from the cursor, PyAthena's ``S3FileSystem`` reads
-        the file with fsspec's background cache in blocks of ``CSV_BLOCK_SIZE``
-        bytes: the next block is read while rows are converted, and two blocks are
-        kept. Otherwise, and for another ``filesystem_class``, the filesystem's
-        settings apply. Closing a partly read file waits for the block being read;
+        Without ``block_size`` from the cursor, PyAthena's ``S3FileSystem`` or
+        ``AioS3FileSystem`` reads the file with fsspec's background cache in blocks
+        of ``CSV_BLOCK_SIZE`` bytes: the next block is read while rows are
+        converted, and two blocks are kept. Otherwise, and for another
+        ``filesystem_class``, including a subclass, the filesystem's settings
+        apply. Closing a partly read file waits for the block being read;
         the asyncio cursors close result sets in a thread.
 
         Returns:
             The keyword arguments for the filesystem's ``_open()``.
         """
-        if self._block_size or not isinstance(self._fs, S3FileSystem):
+        if self._block_size or type(self._fs) not in (S3FileSystem, AioS3FileSystem):
             return {}
         return {
             "block_size": self.CSV_BLOCK_SIZE,

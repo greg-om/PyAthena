@@ -14,6 +14,7 @@ import pytest
 
 from pyathena.error import OperationalError
 from pyathena.filesystem.s3 import S3FileSystem
+from pyathena.filesystem.s3_async import AioS3FileSystem
 from pyathena.model import AthenaQueryExecution
 from pyathena.s3fs.converter import DefaultS3FSTypeConverter
 from pyathena.s3fs.reader import AthenaCSVReader, EmptyStringAsNullCSVReader
@@ -76,6 +77,17 @@ def _result_set(data, csv_reader, suffix=".csv", column_types=None, type_hints=N
     return result_set, stream
 
 
+class _UserS3FileSystem(S3FileSystem):
+    """A user's subclass, whose own cache settings apply."""
+
+
+_PREFETCH_OPTIONS = {
+    "block_size": 32 * 2**20,
+    "cache_type": "background",
+    "cache_options": {"maxblocks": 2},
+}
+
+
 class _FailingCSVReader(_TupleCSVReader):
     """A reader that fails to read the header row."""
 
@@ -85,27 +97,20 @@ class _FailingCSVReader(_TupleCSVReader):
 
 class TestAthenaS3FSResultSet:
     @pytest.mark.parametrize(
-        ("block_size", "filesystem", "expected"),
+        ("block_size", "filesystem_class", "expected"),
         [
-            (
-                None,
-                MagicMock(spec=S3FileSystem),
-                {
-                    "block_size": 32 * 2**20,
-                    "cache_type": "background",
-                    "cache_options": {"maxblocks": 2},
-                },
-            ),
-            (5 * 2**20, MagicMock(spec=S3FileSystem), {}),
-            (None, MagicMock(), {}),
+            (None, S3FileSystem, _PREFETCH_OPTIONS),
+            (None, AioS3FileSystem, _PREFETCH_OPTIONS),
+            (5 * 2**20, S3FileSystem, {}),
+            (None, _UserS3FileSystem, {}),
         ],
-        ids=["default", "block_size", "other_filesystem"],
+        ids=["default", "aio", "block_size", "subclass"],
     )
-    def test_get_csv_open_options(self, block_size, filesystem, expected):
-        """PyAthena's filesystem prefetches the CSV result unless block_size is given."""
+    def test_get_csv_open_options(self, block_size, filesystem_class, expected):
+        """PyAthena's filesystems prefetch the CSV result unless block_size is given."""
         result_set = AthenaS3FSResultSet.__new__(AthenaS3FSResultSet)
         result_set._block_size = block_size
-        result_set._fs = filesystem
+        result_set._fs = filesystem_class.__new__(filesystem_class)
         assert result_set._get_csv_open_options() == expected
 
     def test_reader_closes_at_end_of_results(self):

@@ -341,16 +341,18 @@ _READ_MODES = [
 @pytest.mark.parametrize(("chunksize", "kwargs"), _READ_MODES)
 def test_read_csv_open_options(data, types, chunksize, kwargs):
     """Every kind of CSV read opens the result file with the same options."""
+    fs = MagicMock()
     with patch.object(
         AthenaPandasResultSet,
         "_get_csv_open_options",
         autospec=True,
-        return_value={"cache_type": "background"},
+        return_value={"cache_type": "sentinel"},
     ) as open_options:
-        result, _ = _read_csv_result(data, types, chunksize=chunksize, **kwargs)
+        result, _ = _read_csv_result(data, types, chunksize=chunksize, fs=fs, **kwargs)
         if chunksize or kwargs:
             result.close()
     open_options.assert_called_once_with(ANY)
+    assert fs.open.call_args.kwargs["cache_type"] == "sentinel"
 
 
 # A CSV result of Athena with each type the PyArrow engine reads, then a row of NULLs.
@@ -454,7 +456,7 @@ def _read_unload_result(tmp_path, tables, chunksize, write_statistics=True, **kw
     return chunks, whole
 
 
-def _read_csv_result(data, types, engine="c", chunksize=None, **kwargs):
+def _read_csv_result(data, types, engine="c", chunksize=None, fs=None, **kwargs):
     """Read an in-memory CSV through the result set and the real pandas parser."""
     result_set = AthenaPandasResultSet.__new__(AthenaPandasResultSet)
     result_set._converter = DefaultPandasTypeConverter()
@@ -469,7 +471,7 @@ def _read_csv_result(data, types, engine="c", chunksize=None, **kwargs):
     result_set._csv_stream = None
     result_set._block_size = None
     result_set._cache_type = None
-    result_set._fs = MagicMock()
+    result_set._fs = fs or MagicMock()
     # Binary columns are read through a text stream.
     result_set._fs.open.side_effect = lambda path, mode="rb", **_: (
         io.StringIO(data, newline="") if "t" in mode else io.BytesIO(data.encode())
