@@ -7,6 +7,7 @@
 
 import csv
 import io
+from collections import defaultdict
 from unittest.mock import ANY, MagicMock, PropertyMock, patch, sentinel
 
 import pandas as pd
@@ -526,8 +527,11 @@ def _read_csv_result(data, types, engine="c", chunksize=None, **kwargs):
     ("engine", "kwargs", "access"),
     [
         pytest.param("c", {}, "whole", id="c"),
+        pytest.param("c", {"low_memory": True}, "whole", id="low-memory"),
+        pytest.param("c", {"low_memory": False}, "whole", id="no-low-memory"),
         pytest.param("auto", {}, "whole", id="auto"),
         pytest.param("pyarrow", {}, "whole", id="pyarrow-fallback"),
+        pytest.param("python", {}, "whole", id="python"),
         pytest.param("c", {"chunksize": 400005}, "iteration", id="iteration"),
         pytest.param("c", {"chunksize": 400010}, "get_chunk", id="get-chunk"),
         pytest.param("c", {"index_col": "j"}, "whole", id="index"),
@@ -546,8 +550,10 @@ def test_read_csv_json_null_without_dtype_warning(json_value, expected, engine, 
     else:
         df = result
     values = df.index if kwargs.get("index_col") == "j" else df["j"]
-    assert options["engine"] == "c"
-    assert options["low_memory"] is False
+    assert options["engine"] == ("python" if engine == "python" else "c")
+    assert options.get("low_memory") == kwargs.get("low_memory")
+    assert options["dtype"]["j"] is object
+    assert "j" not in options["converters"]
     assert len(df) == 400010
     assert values.dtype == object
     assert type(values[0]) is type(expected)
@@ -555,31 +561,86 @@ def test_read_csv_json_null_without_dtype_warning(json_value, expected, engine, 
     assert values[-10:].tolist() == [None] * 10
 
 
-def test_read_csv_json_explicit_low_memory_true():
-    """An explicit low_memory=True keeps pandas' internal block parsing and warning."""
-    data = "n,j\n" + "1,9007199254740993\n" * 400000 + "2,\n" * 10
-    with pytest.warns(pd.errors.DtypeWarning, match="have mixed types"):
-        df, options = _read_csv_result(data, {"n": "integer", "j": "json"}, low_memory=True)
-    assert options["low_memory"] is True
-    assert df["j"].iloc[0] == 9007199254740993
-    assert df["j"].iloc[-10:].tolist() == [None] * 10
+@pytest.mark.filterwarnings("error::pandas.errors.DtypeWarning")
+@pytest.mark.parametrize("kwargs", [{}, {"low_memory": True}])
+def test_read_csv_json_numbers_in_a_parser_block_without_null(kwargs):
+    """JSON integers keep their type when their parser block has a float but no NULL."""
+    data = "n,j\n1,1.5\n" + "1,7\n" * 400000 + "2,\n" * 10
+    df, _ = _read_csv_result(data, {"n": "integer", "j": "json"}, **kwargs)
+    values = df["j"]
+    assert values.dtype == object
+    assert values[0] == 1.5
+    assert type(values[1]) is int
+    assert (values[1:400001] == 7).all()
+    assert values[-10:].tolist() == [None] * 10
 
 
 @pytest.mark.filterwarnings("error::pandas.errors.DtypeWarning")
+@pytest.mark.parametrize("engine", ["c", "python"])
 @pytest.mark.parametrize("low_memory", [None, True, False])
-def test_read_csv_json_without_null(low_memory):
-    """JSON without NULL keeps its inferred dtype with default or explicit low_memory."""
+@pytest.mark.parametrize(
+    ("text", "dtype", "values"),
+    [
+        pytest.param("2\n3,4", "int64", [2, 4], id="integers"),
+        pytest.param("2\n3,4.5", "float64", [2.0, 4.5], id="numbers"),
+        pytest.param("true\n3,false", "bool", [True, False], id="booleans"),
+        pytest.param('"""a"""\n3,"""b"""', "str", ["a", "b"], id="strings"),
+        pytest.param('"{""a"": 1}"\n3,[1]', object, [{"a": 1}, [1]], id="containers"),
+    ],
+)
+def test_read_csv_json_without_null(engine, low_memory, text, dtype, values):
+    """JSON without NULL gets the dtype that pandas infers for a converter's values."""
     kwargs = {} if low_memory is None else {"low_memory": low_memory}
-    df, options = _read_csv_result("n,j\n1,2\n3,4\n", {"n": "integer", "j": "json"}, **kwargs)
-    assert options["low_memory"] is (False if low_memory is None else low_memory)
-    assert df["j"].dtype == "int64"
-    assert df["j"].tolist() == [2, 4]
+    if engine == "python" and low_memory is not None:
+        pytest.skip("low_memory is a C engine option")
+    df, options = _read_csv_result(
+        f"n,j\n1,{text}\n", {"n": "integer", "j": "json"}, engine=engine, **kwargs
+    )
+    assert options.get("low_memory") == low_memory
+    assert df["j"].dtype == dtype
+    assert df["j"].tolist() == values
+
+
+def test_read_csv_json_multi_index_level():
+    """A json column in a MultiIndex is converted."""
+    df, _ = _read_csv_result(
+        "n,j\n1,true\n2,false\n3,\n", {"n": "integer", "j": "json"}, index_col=["n", "j"]
+    )
+    level = df.index.get_level_values("j")
+    assert level[:2].tolist() == [True, False]
+    assert pd.isna(level[2])
+
+
+@pytest.mark.parametrize("engine", ["c", "python"])
+@pytest.mark.parametrize(
+    ("dtype", "expected"),
+    [
+        pytest.param({"n": "int32"}, {"n": "int32", "j": object}, id="mapping"),
+        pytest.param(
+            defaultdict(lambda: "str", {"n": "int32"}),
+            {"n": "int32", "j": object, "other": "str"},
+            id="defaultdict",
+        ),
+        pytest.param("str", {"n": "str", "j": object}, id="scalar"),
+    ],
+)
+def test_read_csv_json_with_dtype(engine, dtype, expected):
+    """A dtype given to execute() still applies to the other columns."""
+    df, options = _read_csv_result(
+        "n,j\n1,2\n3,\n", {"n": "integer", "j": "json"}, engine=engine, dtype=dtype
+    )
+    assert {key: options["dtype"][key] for key in expected} == expected
+    if isinstance(dtype, dict):
+        assert "j" not in dtype
+    assert df["n"].dtype == expected["n"]
+    assert df["j"].tolist() == [2, None]
 
 
 @pytest.mark.parametrize(
     ("types", "engine", "kwargs"),
     [
         pytest.param({"n": "integer", "j": "integer"}, "c", {}, id="no-json"),
+        pytest.param({"n": "integer", "j": "json"}, "c", {}, id="json"),
         pytest.param({"n": "integer", "j": "json"}, "c", {"usecols": ["n"]}, id="json-excluded"),
         pytest.param(
             {"n": "integer", "j": "json"}, "c", {"converters": {}}, id="custom-converters"
@@ -594,12 +655,23 @@ def test_read_csv_json_without_null(low_memory):
         pytest.param({"n": "integer", "j": "integer"}, "pyarrow", {}, id="pyarrow"),
     ],
 )
-def test_read_csv_without_json_c_converter_keeps_low_memory_default(types, engine, kwargs):
-    """Other columns, converters, and engines do not get a low_memory option."""
+def test_read_csv_keeps_low_memory_default(types, engine, kwargs):
+    """No column type, converter, or engine sets a low_memory option."""
     df, options = _read_csv_result("n,j\n" + "1,2\n" * 30, types, engine=engine, **kwargs)
     assert options["engine"] == engine
     assert "low_memory" not in options
     assert len(df) == 30
+
+
+@pytest.mark.parametrize("converters", [{}, {"j": int}])
+def test_read_csv_json_custom_converters(converters):
+    """Converters given to execute() replace the json conversion."""
+    df, options = _read_csv_result(
+        "n,j\n1,2\n", {"n": "integer", "j": "json"}, converters=converters
+    )
+    assert options["converters"] is converters
+    assert "j" not in (options["dtype"] or {})
+    assert df["j"].tolist() == [2]
 
 
 def _string_series(values, infer_string):

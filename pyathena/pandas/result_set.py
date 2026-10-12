@@ -5,7 +5,7 @@ from __future__ import annotations
 import csv
 import importlib
 import logging
-from collections import abc
+from collections import abc, defaultdict
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import ExitStack
 from functools import partial
@@ -190,16 +190,16 @@ def _read_csv_with_pyarrow(source: str | IOBase, read_csv_kwargs: dict[str, Any]
 
 
 class _JSONConverter:
-    """A json converter for ``pandas.read_csv()`` that keeps NULL from making values floats.
+    """A json converter for the text of a json column that ``pandas.read_csv()`` read.
 
-    pandas infers a dtype from the values that a converter returns, so JSON numbers
-    with NULL become float64. This converter returns ``NULL`` in place of None, which
-    keeps the column object, and ``restore()`` puts None back after reading.
+    pandas applies a converter to each internal parser block and infers a dtype from
+    the values that it returns in that block, so JSON numbers in a block without NULL
+    would become numbers of that block's dtype while a block with NULL kept objects.
+    The json columns are read as text instead, and ``convert()`` converts each
+    DataFrame or chunk as a whole after reading.
     """
 
-    NULL: ClassVar[object] = object()
-
-    __slots__ = ("_converter", "_has_null")
+    __slots__ = ("_converter",)
 
     def __init__(self, converter: Callable[[str | None], Any]) -> None:
         """Wrap a json conversion function.
@@ -208,54 +208,47 @@ class _JSONConverter:
             converter: The conversion function, which returns None for NULL.
         """
         self._converter = converter
-        self._has_null = False
 
-    def __call__(self, value: str | None) -> Any:
-        """Convert a CSV value.
-
-        Args:
-            value: The value as text.
-
-        Returns:
-            The converted value, or ``NULL`` in place of None.
-        """
-        converted = self._converter(value)
-        if converted is None:
-            self._has_null = True
-            return self.NULL
-        return converted
-
-    def restore(self, df: DataFrame, name: Any) -> None:
-        """Put None back in place of ``NULL`` in a DataFrame that ``read_csv()`` returned.
-
-        Only does anything if this converter returned ``NULL`` since the last call,
-        so call it for each DataFrame or chunk right after reading it.
+    def convert(self, df: DataFrame, name: Any) -> None:
+        """Convert the json text of a column in a DataFrame that ``read_csv()`` returned.
 
         Args:
-            df: The DataFrame or chunk.
-            name: The name of the column that this converter converted, which can
-                also be an index level.
+            df: The DataFrame or chunk, updated in place.
+            name: The label of the json column, which can also be an index level.
         """
-        if not self._has_null:
-            return
-        self._has_null = False
-
         import pandas as pd
 
         index = df.index
         if name in df.columns:
-            df[name] = pd.Series(self._restore_values(df[name]), index=index, dtype=object)
+            values = self._convert_values(df[name])
+            df[name] = pd.Series(values.to_numpy(), index=index, dtype=values.dtype)
         elif isinstance(index, pd.MultiIndex) and name in index.names:
             levels = [index.get_level_values(i) for i in range(index.nlevels)]
             i = index.names.index(name)
-            levels[i] = pd.Index(self._restore_values(levels[i]), dtype=object, name=name)
+            levels[i] = pd.Index(self._convert_values(levels[i]), name=name)
             df.index = pd.MultiIndex.from_arrays(levels, names=index.names)
         elif index.name == name:
-            df.index = pd.Index(self._restore_values(index), dtype=object, name=name)
+            df.index = pd.Index(self._convert_values(index), name=name)
 
-    @classmethod
-    def _restore_values(cls, values: Series | Index) -> list[Any]:
-        return [None if v is cls.NULL else v for v in values.to_numpy()]
+    def _convert_values(self, values: Series | Index) -> Series:
+        """Convert json text values.
+
+        Args:
+            values: The text values, with NaN for NULL.
+
+        Returns:
+            The converted values: objects with None if there is NULL, as a NULL would
+            otherwise make JSON numbers floats, or else of the dtype that pandas infers.
+        """
+        import pandas as pd
+
+        # A value that is not text is NULL, which the converter gets as an empty string,
+        # as pandas passes NULL to a converter.
+        converted = pd.Series(
+            [self._converter(v if isinstance(v, str) else "") for v in values.to_numpy()],
+            dtype=object,
+        )
+        return converted if converted.isna().any() else converted.infer_objects()
 
 
 class PandasDataFrameIterator(abc.Iterator):  # type: ignore[type-arg]
@@ -594,8 +587,8 @@ class AthenaPandasResultSet(AthenaResultSet):
         self._kwargs = kwargs
         self._fs = self._create_s3_file_system()
         self._csv_stream: IOBase | None = None
-        # The converters that pandas.read_csv() applies, keyed by column name.
-        self._csv_converters: dict[Any, Callable[[str | None], Any]] = {}
+        # The converters of the json columns that _read_csv() reads as text, keyed by label.
+        self._csv_json_converters: dict[Any, _JSONConverter] = {}
 
         # Cache time column names for efficient _trunc_date processing. _read_csv()
         # replaces them with the labels of the columns that it reads.
@@ -804,30 +797,37 @@ class AthenaPandasResultSet(AthenaResultSet):
     def _finish_csv_frame(self, df: DataFrame) -> DataFrame:
         """Finish a DataFrame read from the CSV result file.
 
-        Puts None back in the json columns and truncates the time columns.
+        Converts the json columns and truncates the time columns.
 
         Args:
             df: The DataFrame or chunk that ``pandas.read_csv()`` returned.
 
         Returns:
             The same DataFrame.
+
+        Raises:
+            OperationalError: If converting a json column fails.
         """
-        for name, converter in self._csv_converters.items():
-            if isinstance(converter, _JSONConverter):
-                converter.restore(df, name)
+        try:
+            for name, converter in self._csv_json_converters.items():
+                converter.convert(df, name)
+        except Exception as e:
+            _logger.exception("Failed to convert the json columns.")
+            raise OperationalError(*e.args) from e
         return self._trunc_date(df)
 
-    def _get_csv_converter(self, type_: str) -> Callable[[str | None], Any]:
-        """Get the converter that ``pandas.read_csv()`` applies to a column type.
+    def _get_csv_converter(self, type_: str) -> Callable[[str | None], Any] | _JSONConverter:
+        """Get the converter for a column type of the CSV result file.
 
-        json columns get a ``_JSONConverter``, so that NULL does not make pandas infer
-        a numeric dtype, and ``_finish_csv_frame()`` puts None back.
+        json columns get a ``_JSONConverter``, which ``_read_json_columns_as_text()``
+        takes out of the converters for ``pandas.read_csv()``, and which converts the
+        columns after reading.
 
         Args:
             type_: The Athena type of the column.
 
         Returns:
-            The conversion function.
+            The conversion function, or the ``_JSONConverter`` of a json column.
         """
         converter = self._converter.get(type_)
         if type_ == "json":
@@ -915,13 +915,7 @@ class AthenaPandasResultSet(AthenaResultSet):
                 if labels is not None:
                     # After _configure_binary_csv_read(), which checks for the header row.
                     self._read_csv_header_as_labels(read_csv_kwargs, csv_engine)
-                self._csv_converters = read_csv_kwargs.get("converters") or {}
-                if csv_engine == "c" and any(
-                    isinstance(converter, _JSONConverter)
-                    for converter in self._csv_converters.values()
-                ):
-                    # A NULL placeholder can give internal parser blocks different dtypes.
-                    read_csv_kwargs.setdefault("low_memory", False)
+                self._read_json_columns_as_text(read_csv_kwargs)
                 # A reader that keeps the file open is closed early by callers, and
                 # closing a prefetching file waits for the block being read.
                 prefetch = not self._returns_csv_reader(read_csv_kwargs)
@@ -978,6 +972,42 @@ class AthenaPandasResultSet(AthenaResultSet):
         except Exception as e:
             _logger.exception(f"Failed to read {location}.")
             raise OperationalError(*e.args) from e
+
+    def _read_json_columns_as_text(self, read_csv_kwargs: dict[str, Any]) -> None:
+        """Read the json columns as text, which ``_finish_csv_frame()`` converts.
+
+        Moves the ``_JSONConverter`` converters out of the converters for
+        ``pandas.read_csv()`` and reads their columns as objects.
+
+        Args:
+            read_csv_kwargs: The options for ``pandas.read_csv()``, updated in place.
+        """
+        converters = read_csv_kwargs.get("converters") or {}
+        self._csv_json_converters = {
+            label: converter
+            for label, converter in converters.items()
+            if isinstance(converter, _JSONConverter)
+        }
+        if not self._csv_json_converters:
+            return
+        read_csv_kwargs["converters"] = {
+            label: converter
+            for label, converter in converters.items()
+            if label not in self._csv_json_converters
+        }
+        dtype = read_csv_kwargs.get("dtype")
+        if isinstance(dtype, defaultdict):
+            dtype = defaultdict(dtype.default_factory, dtype)
+        elif isinstance(dtype, abc.Mapping):
+            dtype = dict(dtype)
+        elif dtype is not None:
+            # One dtype for every column, which a json converter overrode.
+            column_dtype = dtype
+            dtype = defaultdict(lambda: column_dtype)
+        else:
+            dtype = {}
+        dtype.update(dict.fromkeys(self._csv_json_converters, object))
+        read_csv_kwargs["dtype"] = dtype
 
     @staticmethod
     def _returns_csv_reader(read_csv_kwargs: dict[str, Any]) -> bool:

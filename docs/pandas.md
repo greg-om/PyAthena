@@ -562,13 +562,10 @@ Common performance options:
 - `dtype`: Explicit column data types
 - `parse_dates`: Columns to parse as dates
 
-When the C engine's converter mapping includes PyAthena's JSON converter, `low_memory` defaults to `False`.
-This avoids pandas' `DtypeWarning` when JSON numbers or booleans and NULLs occur in different internal parser blocks.
-The setting applies to the entire CSV read, including other columns whose dtypes pandas infers.
-Parsing each result or chunk at once can use more memory; `chunksize` still limits the rows read per chunk.
-An explicit `low_memory=True` or `low_memory=False` passed to `execute()` takes precedence.
-With `low_memory=True`, the warning can return.
-Without PyAthena's JSON converter, the C engine keeps pandas' default `low_memory=True`.
+PandasCursor reads a `json` column as text and applies the converter mapping's `json` function to each result or chunk after pandas parses it, so the column's dtype does not depend on `low_memory` or pandas' internal parser blocks.
+A `json` column with NULL in the result or chunk holds objects, with `None` for NULL; otherwise it has the dtype that pandas infers from the converted values.
+The function receives an empty string for every value that pandas reads as missing under the `na_values`, `keep_default_na`, and `na_filter` options.
+Converters passed to `execute()` replace the converter mapping and are applied by pandas.
 
 With `engine="pyarrow"`, PandasCursor uses the PyArrow engine only when the result is not a tab-separated `.txt` file, pyarrow is installed, no chunksize is set (explicitly or by `auto_optimize_chunksize`), `quoting` is the default, the result has no columns that need a converter (`boolean`, `decimal`, `varbinary`, `json`, `time with time zone`, and `timestamp with time zone` with the default converter), and the result file is at least `AthenaPandasResultSet.PYARROW_MIN_FILE_SIZE_BYTES` bytes.
 Otherwise, it falls back to the C engine.
