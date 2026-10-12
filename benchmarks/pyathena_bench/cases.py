@@ -49,8 +49,9 @@ def matrix(settings: Settings, suite: str, shape: str) -> list[Case]:
     """Return every case of a suite and result shape, including unsupported ones.
 
     The ``json`` shape adds a ``json`` column to the flat projection and covers
-    only the native pandas and Wrangler reads of CSV results: Parquet cannot
-    hold the ``json`` type.
+    only the native pandas and Wrangler reads of CSV results in the single-query
+    suite: Parquet cannot hold the ``json`` type, and the initialization suite
+    prepares UNLOAD fixtures too.
 
     Args:
         settings: Configuration with the arraysizes, chunk sizes, and concurrency.
@@ -65,6 +66,8 @@ def matrix(settings: Settings, suite: str, shape: str) -> list[Case]:
     """
     if suite not in {"single", "concurrent", "init"} or shape not in SHAPES:
         raise ValueError("Unknown suite or shape")
+    if shape == "json" and suite != "single":
+        return []
     cases: list[Case] = []
     arraysizes = settings.arraysizes if suite == "single" else [1000]
     for family in FAMILIES:

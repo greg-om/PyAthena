@@ -30,7 +30,7 @@ The Athena timings describe queries against these smaller snapshots, not a scan 
 
 The flat workload projects scalar fields from `file`, `details`, and `http` alongside the top-level scalar columns.
 The nested workload preserves those structures.
-The json workload adds `CAST(details AS JSON) AS details_json` to the flat projection; it covers only native pandas and Wrangler reads of CSV results, because Parquet cannot hold the `json` type.
+The json workload adds `CAST(details AS JSON) AS details_json` to the flat projection; it covers only native pandas and Wrangler reads of CSV results in the single-query suite, because Parquet cannot hold the `json` type.
 No workload converts every library's output into a common Python object representation.
 
 ## Dependencies and local checks
@@ -423,7 +423,7 @@ Every output directory contains `environment.json`, a copy of the input manifest
 Environment metadata includes Git SHA, dirty state, Python and dependency versions, lockfile hash, CPU count, RAM, and settings.
 SDK events preserve query IDs, SQL, output locations, Athena statistics, and failed operations without storing result rows.
 Successful measurements generate `summary.csv` and `summary.md`; failed trials and unsupported cases remain visible.
-After each successful UNLOAD or CTAS trial, `run` lists the trial's output location and records the number and sizes of the Parquet files in `output_files`; the summary shows the most files and the largest file.
+After each successful UNLOAD or CTAS trial, `run` lists the trial's output location and records the number and sizes of the Parquet files in `output_files`; the summary shows the most files and the largest file, and notes a trial whose listing failed.
 Regenerate reports after interruption with:
 
 ```bash

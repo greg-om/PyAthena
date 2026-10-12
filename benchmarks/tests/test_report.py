@@ -130,3 +130,7 @@ class TestReport:
         assert (row["max_output_files"], row["max_output_file_bytes"]) == (31, 4)
         assert "| 31 | 4 |" in (tmp_path / "summary.md").read_text()
         assert summarize([base])[0]["max_output_files"] is None
+        failed_listing = {**base, "output_files_error": "ClientError: denied"}
+        row = summarize([trials[0], failed_listing])[0]
+        assert (row["successful_trials"], row["max_output_files"]) == (2, 30)
+        assert row["notes"] == "Output files not listed: ClientError: denied"

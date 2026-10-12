@@ -73,6 +73,9 @@ def test_json_shape_covers_pandas_and_wrangler_csv_reads():
     }
     assert all(c.unsupported is None for c in cases)
     assert {c.chunksize for c in cases} == {None, 10000, 100000}
+    # The initialization suite would also prepare an UNLOAD fixture, which json rejects.
+    assert matrix(Settings(), "init", "json") == []
+    assert matrix(Settings(), "concurrent", "json") == []
 
 
 def test_concurrency_and_init_matrices_are_bounded():
