@@ -35,7 +35,10 @@ class ParquetChunkReader(abc.Iterator):  # type: ignore[type-arg]
     A file of at most ``MAX_PREFETCH_SIZE`` bytes is read whole with one
     ``cat_file()`` call, and the next file is read in a background thread while
     the current one is decoded. Larger files are read in ``BUFFER_SIZE`` pieces
-    through ``open()``.
+    through ``open()``, by default without the filesystem's read-ahead cache: pyarrow
+    reads each column chunk in its own pieces, so read-ahead bytes beyond a piece
+    are discarded when it moves to another column. Pre-buffering, which would read
+    the pieces together, would hold a whole row group in memory.
 
     The files must have the same schema, as the files of one UNLOAD query do.
 
@@ -58,6 +61,7 @@ class ParquetChunkReader(abc.Iterator):  # type: ignore[type-arg]
         paths: Sequence[str],
         chunksize: int,
         columns: Sequence[str] | None = None,
+        cache_type: str | None = None,
     ) -> None:
         """Create a reader of the given files.
 
@@ -66,6 +70,9 @@ class ParquetChunkReader(abc.Iterator):  # type: ignore[type-arg]
             paths: The paths of the files, in reading order.
             chunksize: The number of rows of each table but the last.
             columns: The names of the top-level columns to read; all columns if None.
+            cache_type: The fsspec cache type that opens a file larger than
+                ``MAX_PREFETCH_SIZE``. If None, ``"none"``, which reads only the
+                bytes that pyarrow requests.
 
         Raises:
             ValueError: If ``chunksize`` is not positive or ``columns`` is empty.
@@ -80,6 +87,7 @@ class ParquetChunkReader(abc.Iterator):  # type: ignore[type-arg]
         self._paths = list(paths)
         self._chunksize = chunksize
         self._columns = list(columns) if columns is not None else None
+        self._cache_type = cache_type or "none"
         self._tables = self._read_tables()
 
     @override
@@ -202,10 +210,10 @@ class ParquetChunkReader(abc.Iterator):  # type: ignore[type-arg]
 
         Returns:
             A buffer of the whole file if it has at most ``MAX_PREFETCH_SIZE``
-            bytes, or else the file opened for reading.
+            bytes, or else the file opened for reading with the cache type.
         """
         import pyarrow as pa
 
         if self._fs.size(path) <= self.MAX_PREFETCH_SIZE:
             return pa.BufferReader(self._fs.cat_file(path))
-        return self._fs.open(path, "rb")
+        return self._fs.open(path, "rb", cache_type=self._cache_type)

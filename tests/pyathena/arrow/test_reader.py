@@ -5,12 +5,15 @@
 #
 # SPDX-License-Identifier: MIT
 
+import os
 from concurrent.futures import Future
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+from fsspec import AbstractFileSystem
 from fsspec.implementations.local import LocalFileSystem
+from fsspec.spec import AbstractBufferedFile
 
 from pyathena.arrow.reader import ParquetChunkReader
 
@@ -34,6 +37,37 @@ class _ImmediateExecutor:
         except Exception as e:
             future.set_exception(e)
         return future
+
+
+class _CountingFile(AbstractBufferedFile):
+    """A local file read through fsspec's caches, counting the bytes it fetches."""
+
+    def __init__(self, fs, path, **kwargs):
+        with open(path, "rb") as f:
+            self.data = f.read()
+        super().__init__(fs, path, size=len(self.data), **kwargs)
+
+    def _fetch_range(self, start, end):
+        data = self.data[start:end]
+        self.fs.fetched += len(data)
+        return data
+
+
+class _CountingFileSystem(AbstractFileSystem):
+    """Local files opened as buffered files, like ``S3File``, with a "bytes" cache by default."""
+
+    def __init__(self, block_size):
+        super().__init__(skip_instance_cache=True)
+        self.block_size = block_size
+        self.fetched = 0
+
+    def size(self, path):
+        return os.path.getsize(path)
+
+    def _open(self, path, mode="rb", block_size=None, cache_type="bytes", **kwargs):
+        return _CountingFile(
+            self, path, block_size=block_size or self.block_size, cache_type=cache_type, **kwargs
+        )
 
 
 class TestParquetChunkReader:
@@ -140,6 +174,29 @@ class TestParquetChunkReader:
         with pytest.raises(OSError, match="cannot open"):
             next(ParquetChunkReader(LocalFileSystem(), paths, 2))
         assert opened == paths[:1]
+
+    @pytest.mark.parametrize("cache_type", [None, "bytes"], ids=["default", "bytes"])
+    def test_streamed_file_bytes(self, tmp_path, monkeypatch, cache_type):
+        """A streamed file is read without read-ahead unless a cache type is given.
+
+        pyarrow reads each column chunk in ``BUFFER_SIZE`` pieces, so read-ahead past a
+        piece is discarded when it moves to the next column.
+        """
+        monkeypatch.setattr(ParquetChunkReader, "MAX_PREFETCH_SIZE", -1)
+        monkeypatch.setattr(ParquetChunkReader, "BUFFER_SIZE", 64 * 2**10)
+        path = tmp_path / "wide.parquet"
+        # Incompressible column chunks of about 256 KiB, larger than BUFFER_SIZE.
+        columns = {f"c{i}": pa.array([os.urandom(1024) for _ in range(256)]) for i in range(3)}
+        pq.write_table(pa.table(columns), path, compression="none")
+        size = path.stat().st_size
+        fs = _CountingFileSystem(block_size=32 * 2**10)
+        with ParquetChunkReader(fs, [str(path)], 64, cache_type=cache_type) as reader:
+            assert sum(table.num_rows for table in reader) == 256
+        if cache_type is None:
+            # Only pyarrow's footer read, the last 64 KiB, overlaps the column chunks.
+            assert fs.fetched <= size + 64 * 2**10
+        else:
+            assert fs.fetched > 1.5 * size
 
     def test_no_files(self):
         assert list(ParquetChunkReader(LocalFileSystem(), [], 4)) == []
