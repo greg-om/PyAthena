@@ -1287,3 +1287,29 @@ class TestReviewRepairsFollowUp:
 
         assert work(queue, tmp_path / "w", api_slots=1, runner=runner, settle=no_queries,
                     renew_seconds=0.01) == ["a"]  # fmt: skip
+
+
+def test_cleanup_errors_survive_a_claim_lost_during_cleanup(tmp_path):
+    s3, queue = queue_with([job("a"), job("b")], tmp_path)
+    ran = []
+
+    def settle(output):
+        # The failed job's queries do not stop, and the claim is lost meanwhile.
+        s3.put_object(
+            Key=queue.key("claims", "a"),
+            Body=json.dumps(
+                {"host": "other", "job": "a", "attempt": 2, "state": "running",
+                 "renewed": time.time(), "expires": time.time() + 600}
+            ).encode(),
+        )  # fmt: skip
+        return ["q1: still RUNNING"]
+
+    def runner(item, workdir, out, resume, stop):
+        ran.append(item["id"])
+        return 1
+
+    with pytest.raises(RuntimeError, match="q1: still RUNNING"):
+        work(queue, tmp_path / "w", api_slots=1, runner=runner, settle=settle)
+    # No further trials start while the query may still run.
+    assert ran == ["a"]
+    assert not queue.names("done")

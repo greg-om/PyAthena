@@ -1053,7 +1053,7 @@ def run_attempt(
             or not queue.renew(claim, lease_seconds)
         ):
             # The claim was taken over or expired; its new owner records the job.
-            return Outcome("lost")
+            return Outcome("lost", tuple(errors))
         if report_error is None:
             # The job's summary goes below this attempt, which the done marker names,
             # so a former owner's late upload cannot replace the recorded summary.
@@ -1063,7 +1063,7 @@ def run_attempt(
                 )
         if time.time() >= claim.body["expires"]:
             # Publication outlasted the renewed claim, which another worker may own now.
-            return Outcome("lost")
+            return Outcome("lost", tuple(errors))
         # The first done marker of a job is never replaced.
         recorded = queue.put_lease(
             queue.key("done", job["id"]),
@@ -1081,7 +1081,7 @@ def run_attempt(
             IfNoneMatch="*",
         )
         if recorded is None:
-            return Outcome("lost")
+            return Outcome("lost", tuple(errors))
     return Outcome("done", tuple(errors))
 
 
