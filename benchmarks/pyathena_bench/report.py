@@ -152,7 +152,7 @@ def collect_trials(directory: Path) -> list[dict[str, Any]]:
     A started trial without a final record is reported as incomplete. A failed
     or incomplete trial is dropped when another attempt recorded the same
     repetition as successful, so a resumed job reports the trials of an
-    uninterrupted run.
+    uninterrupted run; so is a second successful record of a repetition.
 
     Args:
         directory: Output directory of a run, or a job directory with attempts.
@@ -172,12 +172,20 @@ def collect_trials(directory: Path) -> list[dict[str, Any]]:
     succeeded = {
         (t["scale"], t["case_id"], t.get("repetition")) for t in trials if t["status"] == "ok"
     }
-    return [
-        t
-        for t in trials
-        if t["status"] in {"ok", "unsupported"}
-        or (t["scale"], t["case_id"], t.get("repetition")) not in succeeded
-    ]
+    merged = []
+    kept: set[tuple[Any, ...]] = set()
+    for trial in trials:
+        key = (trial["scale"], trial["case_id"], trial.get("repetition"))
+        if trial["status"] == "ok":
+            # Two attempts can both record a repetition when a takeover resumed
+            # from a checkpoint older than the interrupted attempt's last upload.
+            if len(sources) > 1 and key in kept:
+                continue
+            kept.add(key)
+        elif trial["status"] != "unsupported" and key in succeeded:
+            continue
+        merged.append(trial)
+    return merged
 
 
 def report(directory: Path) -> None:

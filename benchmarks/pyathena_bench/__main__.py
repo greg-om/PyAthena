@@ -230,8 +230,8 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "worker":
             if args.api_slots < 1:
                 raise ValueError("--api-slots must be positive")
-            if args.lease_seconds < 120:
-                raise ValueError("--lease-seconds must be at least 120")
+            if args.lease_seconds < 300:
+                raise ValueError("--lease-seconds must be at least 300")
             autoscaling = client(session_, "autoscaling")
             if args.terminate_host:
                 suspend_rebalance(autoscaling)

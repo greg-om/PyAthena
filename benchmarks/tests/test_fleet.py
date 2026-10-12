@@ -643,19 +643,27 @@ class TestLeases:
             assert taken.body["attempt"] == (1 if operation == "create" else 2)
             assert queue.read_lease(key).etag == taken.etag
 
-    def test_live_claims_are_left_and_expired_ones_return_to_the_fleet(self, tmp_path):
+    def test_live_claims_are_left_and_expired_ones_return_to_the_fleet(self, tmp_path, monkeypatch):
         _, queue = queue_with([job("live"), job("expired")], tmp_path)
-        queue.acquire(queue.key("claims", "live"), {"host": "busy"}, 600)
+        busy = queue.acquire(queue.key("claims", "live"), {"host": "busy"}, 600)
         queue.acquire(queue.key("claims", "expired"), {"host": "dead"}, -1)
         runs = []
+        waits = []
 
         def runner(item, workdir, out, resume, stop):
             runs.append((item["id"], out.name, resume))
             return 0
 
+        def sleep(seconds):
+            # The busy worker renews its claim while this worker waits to exit.
+            waits.append(seconds)
+            assert queue.renew(busy, 600)
+
+        monkeypatch.setattr("pyathena_bench.fleet.time.sleep", sleep)
         ran = work(
             queue, tmp_path / "w", api_slots=1, poll_seconds=0, runner=runner, settle=no_queries
         )
+        assert len(waits) == 1
         assert ran == ["expired"]
         assert runs == [("expired", "attempt-2", [])]
         running = status(queue)["running"]
@@ -888,12 +896,25 @@ class TestLeaseOwnership:
         lease = queue.acquire(key, {"host": "h", "job": "a"}, 600)
         stale = Lease(key, dict(lease.body), lease.etag)
         assert queue.renew(lease, 600)
-        assert queue.mark_interrupted(stale)
+        assert queue.end_lease(stale, "interrupted")
         assert queue.read_lease(key).body["state"] == "interrupted"
+        # A stale copy of a slot is released the same way.
+        slot = queue.acquire(queue.key("slots", "0"), {"host": "h", "job": "a"}, 600)
+        copy = Lease(slot.key, dict(slot.body), slot.etag)
+        assert queue.renew(slot, 600)
+        assert queue.release_lease(copy)
+        assert live_slots(queue) == []
 
-    def test_a_lost_claim_stops_the_attempt_without_recording_the_job(self, tmp_path):
+    def test_a_lost_claim_stops_the_attempt_without_recording_the_job(self, tmp_path, monkeypatch):
         s3, queue = queue_with([job("a")], tmp_path)
         stopped = []
+
+        def sleep(seconds):
+            # The new owner renews the claim while this worker waits to exit.
+            other = queue.read_lease(queue.key("claims", "a"))
+            assert queue.renew(other, 600)
+
+        monkeypatch.setattr("pyathena_bench.fleet.time.sleep", sleep)
 
         def runner(item, workdir, out, resume, stop):
             # Another worker took over the claim, for example after this host stalled.
@@ -980,3 +1001,70 @@ def test_a_resumed_run_without_remaining_trials_succeeds(tmp_path, monkeypatch):
     assert main([*argv, *paths, "--resume", str(tmp_path / "attempt-1")]) == 0
     with pytest.raises(ValueError, match="No trials"):
         main([*argv, "--manifest", str(manifest), "--out", str(tmp_path / "attempt-3")])
+
+
+class TestLeaseExpiry:
+    def test_watch_stops_the_job_when_renewals_fail_until_the_claim_expires(self, tmp_path):
+        _, queue = queue_with([], tmp_path)
+        claim = queue.acquire(queue.key("claims", "a"), {"host": "h"}, 0.2)
+
+        def unavailable(lease, seconds, **changes):
+            raise ClientError({"Error": {"Code": "SlowDown"}}, "PutObject")
+
+        queue.renew = unavailable
+        with JobWatch(queue, [claim], 600, 0.01, lambda: None, lambda: False) as watch:
+            assert watch.stop_requested.wait(5)
+        assert not watch.interrupted.is_set()
+
+    def test_losing_a_slot_does_not_stop_the_job(self, tmp_path):
+        s3, queue = queue_with([job("heavy", heavy=True)], tmp_path)
+
+        def runner(item, workdir, out, resume, stop):
+            # Another worker took over the slot, for example after this host stalled.
+            s3.put_object(
+                Key=queue.key("slots", "0"),
+                Body=json.dumps(
+                    {"host": "other", "state": "running", "expires": time.time() + 600}
+                ).encode(),
+            )
+            time.sleep(0.2)
+            assert not stop.is_set()
+            return 0
+
+        assert work(
+            queue, tmp_path / "w", api_slots=1, poll_seconds=0, runner=runner, settle=no_queries,
+            renew_seconds=0.01,
+        ) == ["heavy"]  # fmt: skip
+        assert json.loads(queue.read("done", "heavy"))["lost_slots"] == [queue.key("slots", "0")]
+        # The other worker's slot is kept.
+        assert json.loads(s3.objects[queue.key("slots", "0")])["host"] == "other"
+
+    def test_a_fresh_claim_that_is_never_renewed_is_taken_over_after_it_expires(self, tmp_path):
+        _, queue = queue_with([job("a")], tmp_path)
+        # Its worker died right after renewing it.
+        queue.acquire(queue.key("claims", "a"), {"host": "dead"}, 0.5)
+        runs = []
+        ran = work(
+            queue,
+            tmp_path / "w",
+            api_slots=1,
+            poll_seconds=0.2,
+            runner=lambda item, workdir, out, *a: runs.append(out.name) or 0,
+            settle=no_queries,
+        )
+        assert ran == ["a"]
+        assert runs == ["attempt-2"]
+
+    def test_an_existing_done_marker_is_not_replaced(self, tmp_path):
+        s3, queue = queue_with([job("a")], tmp_path)
+
+        def runner(item, workdir, out, resume, stop):
+            # The claim's new owner finished the job while this worker stalled.
+            queue.put_if_absent(queue.key("done", "a"), {"exit_code": 0, "host": "other"})
+            out.mkdir(parents=True)
+            (out / "trials.jsonl").write_text(json.dumps(ok_trial(0)) + "\n")
+            return 0
+
+        assert work(queue, tmp_path / "w", api_slots=1, runner=runner, settle=no_queries) == []
+        assert json.loads(queue.read("done", "a"))["host"] == "other"
+        assert queue.key("results", "a", "summary.csv") not in s3.objects

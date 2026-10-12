@@ -141,3 +141,26 @@ def test_report_merges_attempts_and_drops_superseded_failures(tmp_path):
     with (tmp_path / "summary.csv").open() as stream:
         row = next(csv.DictReader(stream))
     assert (row["successful_trials"], row["failed_trials"]) == ("3", "0")
+
+
+def test_report_counts_a_repetition_recorded_by_two_attempts_once(tmp_path):
+    record = {
+        "case_id": "case",
+        "scale": "small",
+        "repetition": 0,
+        "warmup": False,
+        "status": "ok",
+        "queries": [{"total_seconds": 1}],
+        "successful_queries_per_second": 1,
+        "rss_peak_bytes": 1,
+        "max_threads": 1,
+    }
+    for attempt in (1, 2):
+        directory = tmp_path / f"attempt-{attempt}"
+        directory.mkdir()
+        (directory / "trials.jsonl").write_text(
+            json.dumps({**record, "trial": f"t{attempt}"}) + "\n"
+        )
+    report(tmp_path)
+    with (tmp_path / "summary.csv").open() as stream:
+        assert next(csv.DictReader(stream))["successful_trials"] == "1"

@@ -398,10 +398,11 @@ uv run --env-file ../.env --locked aws ssm send-command --targets "Key=tag:aws:a
 ```
 
 A worker claims a job by creating `claims/<job>` with an S3 conditional write, so exactly one host runs each job.
-A claim, like each API slot under `slots/`, is a lease that its worker renews every tenth of `--lease-seconds` (600 by default) while the job runs.
+A claim, like each API slot under `slots/`, is a lease that its worker renews every tenth of `--lease-seconds` (600 by default, at least 300) while the job runs.
 When a worker dies, its claim and slots expire, and another worker takes them over with a conditional write, so the job and the slots return to the fleet without manual steps.
 A worker releases a slot by overwriting its lease as released, never by deleting it, so a slot that another worker took over stays held.
-A worker whose lease was taken over, or whose renewals failed until the lease expired, stops the attempt and records nothing for the job; the new owner continues it.
+A worker whose claim was taken over, or whose renewals failed until the claim expired, stops the attempt and records nothing for the job; the new owner continues it, and the first `done` marker of a job is never replaced.
+A lost API slot does not stop the job; the `done` marker lists it under `lost_slots`.
 Each attempt of a job writes to `results/<job>/attempt-<n>/`, and the worker uploads changed trial records every five seconds, so a lost host loses its running trial and at most the records of the last seconds.
 A trial whose start was not uploaded before its host died is not quiesced by the next attempt; its queries write to their own trial prefix and are cancelled by `cleanup`.
 After a job, the worker uploads the attempt's output directory and its log to `logs/`, writes `results/<job>/summary.csv` and `summary.md` from every attempt, and writes `done/<job>` with the exit code, attempt, host, and times.
@@ -411,14 +412,14 @@ It waits until they stop before claiming another job; this scans the workgroup's
 If it cannot confirm that, it records the errors in the `done` marker and exits.
 
 Each worker checks instance metadata for a Spot interruption notice (`spot/instance-action`), which EC2 publishes about two minutes before it reclaims an instance.
-On a notice, the worker interrupts the running trial with SIGINT, which cancels the trial's reported queries, releases its claim as `interrupted`, uploads the attempt, releases its slots, and exits without terminating the host.
+On a notice, the worker interrupts the running trial with SIGINT, which cancels the trial's reported queries, uploads the attempt, releases its claim as `interrupted` and its slots, and exits without terminating the host.
 A separate thread watches for the notice, so slow S3 requests do not delay it.
 The group replaces the reclaimed instance, and the new host's worker takes over the interrupted claim as the next attempt: it downloads the earlier attempts, quiesces their trials as after a failed job, and runs only the repetitions that they did not record as successful, through `run --resume`.
 The job's summary merges the attempts and leaves out a failed or incomplete trial whose repetition succeeded in a later attempt, so it reports the trials of an uninterrupted run.
 Rebalance recommendations are not acted on; an interruption does not always follow them, and the notice leaves enough time to stop a trial.
 
-Workers exit when no job is left to claim: every job is done or claimed by a live lease.
-A claim that has missed renewals belongs to a worker that has probably died, so workers keep waiting until it expires and one of them takes it over.
+Workers exit when no job is left to claim and every other unfinished job's claim has been renewed since they found nothing to claim, which takes up to a renewal interval.
+A claim whose worker died is never renewed, so workers keep waiting until it expires and one of them takes it over; `status` marks a claim that has missed renewals as `stale`.
 With `--terminate-host`, a worker first suspends the group's `AZRebalance` process, which would otherwise let the group launch a host in one zone and terminate a busy host in another when Spot capacity or retired hosts leave the zones uneven; the process stays suspended until the stack is deleted.
 A worker with `--terminate-host` that returns normally records its jobs, instance type, Availability Zone, and purchase option under `hosts/<instance-id>.json` and terminates its host through the group with a lower desired capacity, so no replacement starts and finished hosts stop costing money while others still run.
 This includes a worker that stopped after unconfirmed queries, whose errors are already in the `done` marker.
