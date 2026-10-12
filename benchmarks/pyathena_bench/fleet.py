@@ -860,7 +860,7 @@ class JobWatch:
 
 def pending_jobs(
     queue: Queue, jobs: list[dict[str, Any]]
-) -> tuple[list[dict[str, Any]], dict[str, float | None]]:
+) -> tuple[list[dict[str, Any]], dict[str, Lease]]:
     """Return the jobs that are neither done nor held by a live claim.
 
     Args:
@@ -869,21 +869,20 @@ def pending_jobs(
 
     Returns:
         Jobs without a ``done`` marker whose claim is absent, expired, or
-        released, in queue order, and the last renewal time of every other
-        unfinished job's claim.
+        released, in queue order, and the claims of the other unfinished jobs.
     """
     done = queue.names("done")
     claimed = queue.names("claims")
     at = time.time()
     pending = []
-    running: dict[str, float | None] = {}
+    running: dict[str, Lease] = {}
     for job in jobs:
         if job["id"] in done:
             continue
         if job["id"] in claimed:
             lease = queue.read_lease(queue.key("claims", job["id"]))
             if lease is not None and not lease.takeable(at):
-                running[job["id"]] = lease.body.get("renewed")
+                running[job["id"]] = lease
                 continue
         pending.append(job)
     return pending, running
@@ -1009,13 +1008,23 @@ def run_attempt(
         except Exception as exc:
             # A job without trials, or with unreadable records, still gets its done marker.
             report_error = f"{type(exc).__name__}: {exc}"
-        if claim.key in watch.lost or (
-            watch.stop_requested.is_set() and not watch.interrupted.is_set()
+        watch.stop()
+        # Renewing the claim conditionally proves that this worker still owns the
+        # job and leaves at least --lease-seconds for the few seconds of publication.
+        if (
+            claim.key in watch.lost
+            or (watch.stop_requested.is_set() and not watch.interrupted.is_set())
+            or not queue.renew(claim, lease_seconds)
         ):
-            # The claim was taken over or expired while the job was settled or reported.
+            # The claim was taken over or expired; its new owner records the job.
             return Outcome("lost")
-        # The first done marker wins, so a worker that lost the claim unnoticed
-        # cannot replace the outcome that the claim's new owner recorded.
+        if report_error is None:
+            # Summaries go first, so a recorded job always has them.
+            for name in ("summary.csv", "summary.md"):
+                queue.s3.upload_file(
+                    str(job_dir / name), queue.bucket, queue.key("results", job["id"], name)
+                )
+        # The first done marker of a job is never replaced.
         recorded = queue.put_lease(
             queue.key("done", job["id"]),
             {
@@ -1032,11 +1041,6 @@ def run_attempt(
         )
         if recorded is None:
             return Outcome("lost")
-        if report_error is None:
-            for name in ("summary.csv", "summary.md"):
-                queue.s3.upload_file(
-                    str(job_dir / name), queue.bucket, queue.key("results", job["id"], name)
-                )
     return Outcome("done", tuple(errors))
 
 
@@ -1117,12 +1121,16 @@ def work(
         if pending:
             waiting = {}
         else:
-            for job_id, renewed in running.items():
-                waiting.setdefault(job_id, renewed)
-            # Exit once every other claim has been renewed since; a claim whose
-            # worker died is never renewed, and is taken over when it expires.
+            at = time.time()
+            for job_id, lease in running.items():
+                waiting.setdefault(job_id, lease.body.get("renewed"))
+            # Exit once every other claim has been renewed since and is still
+            # fresh; a claim whose worker died stops being renewed and is taken
+            # over when it expires.
             if all(
-                renewed is None or renewed != waiting[job_id] for job_id, renewed in running.items()
+                lease.body.get("renewed") is None
+                or (lease.body["renewed"] != waiting[job_id] and not lease.stale(at))
+                for job_id, lease in running.items()
             ):
                 return completed
         started = False

@@ -1004,17 +1004,24 @@ def test_a_resumed_run_without_remaining_trials_succeeds(tmp_path, monkeypatch):
 
 
 class TestLeaseExpiry:
-    def test_watch_stops_the_job_when_renewals_fail_until_the_claim_expires(self, tmp_path):
+    def test_watch_stops_the_job_when_a_stalled_renewal_outlasts_the_claim(self, tmp_path):
         _, queue = queue_with([], tmp_path)
         claim = queue.acquire(queue.key("claims", "a"), {"host": "h"}, 0.2)
+        stalled = threading.Event()
+        released = threading.Event()
 
-        def unavailable(lease, seconds, **changes):
-            raise ClientError({"Error": {"Code": "SlowDown"}}, "PutObject")
+        def stall(lease, seconds, **changes):
+            stalled.set()
+            assert released.wait(5)
+            return False
 
-        queue.renew = unavailable
+        queue.renew = stall
         with JobWatch(queue, [claim], 600, 0.01, lambda: None, lambda: False) as watch:
+            assert stalled.wait(5)
+            # The claim expires while its renewal is still blocked in S3.
             assert watch.stop_requested.wait(5)
-        assert not watch.interrupted.is_set()
+            assert not watch.interrupted.is_set()
+            released.set()
 
     def test_losing_a_slot_does_not_stop_the_job(self, tmp_path):
         s3, queue = queue_with([job("heavy", heavy=True)], tmp_path)
@@ -1055,16 +1062,62 @@ class TestLeaseExpiry:
         assert ran == ["a"]
         assert runs == ["attempt-2"]
 
-    def test_an_existing_done_marker_is_not_replaced(self, tmp_path):
+    def test_a_former_owner_records_nothing_after_a_takeover(self, tmp_path, monkeypatch):
         s3, queue = queue_with([job("a")], tmp_path)
 
         def runner(item, workdir, out, resume, stop):
-            # The claim's new owner finished the job while this worker stalled.
-            queue.put_if_absent(queue.key("done", "a"), {"exit_code": 0, "host": "other"})
+            # This host stalled; the claim expired and another worker took it over,
+            # before this worker's watch noticed.
+            s3.put_object(
+                Key=queue.key("claims", "a"),
+                Body=json.dumps(
+                    {"host": "other", "job": "a", "attempt": 2, "state": "running",
+                     "renewed": time.time(), "expires": time.time() + 600}
+                ).encode(),
+            )  # fmt: skip
             out.mkdir(parents=True)
             (out / "trials.jsonl").write_text(json.dumps(ok_trial(0)) + "\n")
             return 0
 
+        def sleep(seconds):
+            other = queue.read_lease(queue.key("claims", "a"))
+            assert queue.renew(other, 600)
+
+        monkeypatch.setattr("pyathena_bench.fleet.time.sleep", sleep)
         assert work(queue, tmp_path / "w", api_slots=1, runner=runner, settle=no_queries) == []
-        assert json.loads(queue.read("done", "a"))["host"] == "other"
+        assert not queue.names("done")
         assert queue.key("results", "a", "summary.csv") not in s3.objects
+
+
+def test_a_claim_renewed_once_then_stale_does_not_let_the_worker_exit(tmp_path, monkeypatch):
+    s3, queue = queue_with([job("a")], tmp_path)
+    queue.acquire(queue.key("claims", "a"), {"host": "x", "job": "a"}, 600)
+    sleeps = []
+    real_sleep = time.sleep
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        if len(sleeps) == 1:
+            # Its worker renewed the claim once and then died long ago.
+            at = time.time()
+            s3.put_object(
+                Key=queue.key("claims", "a"),
+                Body=json.dumps(
+                    {"host": "x", "job": "a", "attempt": 1, "state": "running",
+                     "renewed": at - 199.7, "expires": at + 0.3}
+                ).encode(),
+            )  # fmt: skip
+        real_sleep(0.2)
+
+    monkeypatch.setattr("pyathena_bench.fleet.time.sleep", sleep)
+    runs = []
+    ran = work(
+        queue,
+        tmp_path / "w",
+        api_slots=1,
+        poll_seconds=0,
+        runner=lambda item, workdir, out, *a: runs.append(out.name) or 0,
+        settle=no_queries,
+    )
+    assert ran == ["a"]
+    assert runs == ["attempt-2"]
