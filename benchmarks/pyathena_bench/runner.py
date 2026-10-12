@@ -35,6 +35,7 @@ from pyathena_bench.adapters import BACKEND_VERSIONS, Adapter, run_adapter
 from pyathena_bench.aws import cancel_queries, session, validate_inputs, validate_manifest
 from pyathena_bench.cases import Case
 from pyathena_bench.config import Settings, select_sql, write_json
+from pyathena_bench.report import read_records
 
 
 class Observer:
@@ -325,9 +326,49 @@ def environment(settings: Settings) -> dict[str, Any]:
     }
 
 
+def completed_trials(directories: list[Path]) -> set[tuple[str, str, int | None]]:
+    """Collect the trials that earlier attempts of a job recorded as finished.
+
+    Args:
+        directories: Output directories of earlier attempts.
+
+    Returns:
+        ``(scale, case_id, repetition)`` for successful trials, and
+        ``(scale, case_id, None)`` for cases recorded as unsupported.
+    """
+    completed: set[tuple[str, str, int | None]] = set()
+    for directory in directories:
+        for trial in read_records(directory / "trials.jsonl"):
+            if trial["status"] == "ok":
+                completed.add((trial["scale"], trial["case_id"], trial["repetition"]))
+            elif trial["status"] == "unsupported":
+                completed.add((trial["scale"], trial["case_id"], None))
+    return completed
+
+
 def run(
-    settings: Settings, manifest: dict[str, Any], cases: list[Case], scales: list[str], output: Path
+    settings: Settings,
+    manifest: dict[str, Any],
+    cases: list[Case],
+    scales: list[str],
+    output: Path,
+    completed: set[tuple[str, str, int | None]] | None = None,
 ) -> bool:
+    """Run every trial of the selected cases into a new output directory.
+
+    Args:
+        settings: Configuration.
+        manifest: Prepared manifest.
+        cases: Cases to run.
+        scales: Scales to run.
+        output: New output directory.
+        completed: Trials from :func:`completed_trials` to skip, so that a
+            resumed job runs only the missing repetitions.
+
+    Returns:
+        True if every trial succeeded.
+    """
+    completed = completed or set()
     resources = validate_manifest(settings, manifest)
     validate_inputs(settings, manifest, scales)
     output.mkdir(parents=True, exist_ok=False)
@@ -337,6 +378,8 @@ def run(
     for scale in scales:
         for case in cases:
             if case.unsupported:
+                if (scale, case.id, None) in completed:
+                    continue
                 append_json(
                     output / "trials.jsonl",
                     {
@@ -349,8 +392,9 @@ def run(
                 )
                 continue
             for repetition in range(-settings.warmups, settings.repetitions):
+                if (scale, case.id, repetition) in completed:
+                    continue
                 trial = uuid.uuid4().hex
-                prefix = f"runs/{manifest['run_id']}/trials/{trial}/"
                 payload = {
                     "settings": asdict(settings),
                     "case": asdict(case),
@@ -360,7 +404,7 @@ def run(
                     "repetition": repetition,
                     "warmup": repetition < 0,
                     "database": resources["ScratchDatabase"],
-                    "output": f"s3://{resources['Bucket']}/{prefix}",
+                    "output": f"{resources['Results']}runs/{manifest['run_id']}/trials/{trial}/",
                     "temp_table": f"b_{manifest['run_id']}_{trial}",
                     "sql": select_sql(
                         resources["ScratchDatabase"], manifest["scales"][scale]["table"], case.shape

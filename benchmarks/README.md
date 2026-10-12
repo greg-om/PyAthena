@@ -95,15 +95,21 @@ The defaults are Amazon Linux 2023 x86_64, `r7i.2xlarge` (8 vCPUs, 64 GiB), and 
 Set `Architecture=arm64` with an `r7g` or `r8g` instance type to run on AWS Graviton; the template rejects an instance type that does not match the architecture.
 Measurements depend on the CPU architecture; `environment.json` records it, and runs on different architectures are not directly comparable.
 Instance size and disk size are parameters, so a later run can deliberately test another memory budget.
-`Purchase=spot` launches Spot Instances of the same instance type instead of On-Demand Instances.
-The Auto Scaling group spreads the hosts over three Availability Zones with the price-capacity-optimized allocation strategy and never mixes instance types, so every host stays identical.
-The template uses the first three zones that `Fn::GetAZs` returns, so deployment fails when it returns fewer than three, which happens when the account's default VPC has default subnets in only one or two zones.
-The group replaces an interrupted Spot Instance, but the job that ran on it keeps its claim; see the retry procedure in [Running on a fleet](#running-on-a-fleet).
+The hosts are Spot Instances of one instance type by default; `Purchase=on-demand` launches On-Demand Instances of that type instead.
+The Auto Scaling group spreads the hosts over `Zones` Availability Zones (4 by default, or 3) with the price-capacity-optimized allocation strategy and never mixes instance types, so every host stays identical.
+The template uses the first `Zones` zones that `Fn::GetAZs` returns, so deployment fails when it returns fewer, which depends on the zones in which the account's default VPC has default subnets; `us-west-2` has four.
+The group replaces an interrupted Spot Instance, and the replacement continues the interrupted job; see [Running on a fleet](#running-on-a-fleet).
 `environment.json` does not record the instance type or purchase option; a worker started with `--terminate-host` records both under `hosts/` in its queue, and the recovered `instances.json` lists the hosts that still exist.
 The AMI parameter resolves the current AL2023 image at deployment; record the resulting AMI when comparing environments.
 Source bucket access is read-only and restricted to the configured prefix.
-The instances can write only to the scratch bucket and database, and can query the specified existing workgroup.
+The instances can write only to the scratch bucket and database and to the results location below, and can query the specified existing workgroup.
 The supplied template assumes ordinary IAM access and SSE-S3 source objects; Lake Formation restrictions or a customer-managed KMS key require corresponding grants before execution.
+
+The fleet queues, reports, and Athena trial outputs go to the stack's results location, the `Results` stack output.
+With `ResultsBucket` set to an existing bucket, the results location is `s3://<ResultsBucket>/<ResultsPrefix>/<stack name>/`, and the instance role can write only below it; with `ResultsBucket` empty, the default, it is the scratch bucket.
+Input snapshots, initialization fixtures, and scratch tables stay in the scratch bucket and database either way.
+This repository's CI test bucket, which `AWS_ATHENA_S3_STAGING_DIR` names in CI, expires every object a day after it is written (`cloudformation/github_actions_oidc.yaml`).
+As the results location, it removes leftovers by itself, but reports must be recovered within that day.
 
 The deployment identity needs permission to create these resources and pass the instance role.
 Use an immutable, remotely accessible commit that contains this directory and the root `uv.lock`.
@@ -270,6 +276,7 @@ uv run --no-sync python -m pyathena_bench run \
 ```
 
 There is no automatic continuation of a partially recorded trial; rerun the selected comparison with the same manifest.
+`run --resume` names the output directories of earlier attempts and skips the trials that they recorded as successful, which a fleet worker uses to continue an interrupted job.
 Large API row cases may exceed the default one-hour timeout: 10 million rows require at least 10,000 pages with arraysize 1000, or 100,000 pages with arraysize 100.
 Choose the timeout using a smaller-scale pilot before the full run.
 Do not run two orchestrators concurrently on the same dedicated host.
@@ -295,16 +302,21 @@ With `--split-pages`, a job whose single trial needs at least that many pages be
 `queue --jobs` accepts several job files, rejects duplicate job IDs, and orders the combined jobs as `jobs` orders one selection.
 
 Deploy a new stack with the fleet size under its own name; changing `FleetSize` on an existing stack does not wait for the added hosts to finish bootstrap.
+`QueueName` names the queue that every host consumes: after bootstrap, each host starts a worker that waits until a queue of that name is published, including the hosts that the group launches later to replace interrupted Spot Instances.
+`ApiSlots` sets their `--api-slots`.
+`ResultsBucket` selects the results location; the commands below use this repository's CI test bucket, whose objects expire after a day.
 Then open a session on one of its hosts:
 
 ```bash
 BENCHMARK_STACK=pyathena-benchmark-fleet
+BENCHMARK_RESULTS_BUCKET="<ci-test-bucket>"
 uv run --env-file ../.env --locked aws cloudformation deploy \
   --stack-name "$BENCHMARK_STACK" \
   --template-file cloudformation/benchmark.yaml \
   --capabilities CAPABILITY_IAM \
   --tags Purpose=pyathena-benchmark \
-  --parameter-overrides GitCommit="$BENCHMARK_COMMIT" FleetSize=20
+  --parameter-overrides GitCommit="$BENCHMARK_COMMIT" FleetSize=12 Architecture=arm64 InstanceType=r7g.2xlarge \
+  ResultsBucket="$BENCHMARK_RESULTS_BUCKET" QueueName=large-1 ApiSlots=10
 BENCHMARK_GROUP=$(uv run --env-file ../.env --locked aws cloudformation describe-stacks --stack-name "$BENCHMARK_STACK" \
   --query 'Stacks[0].Outputs[?OutputKey==`AutoScalingGroup`].OutputValue | [0]' --output text)
 BENCHMARK_INSTANCE=$(uv run --env-file ../.env --locked aws autoscaling describe-auto-scaling-groups \
@@ -366,38 +378,92 @@ uv run --no-sync python -m pyathena_bench --config results/fleet.toml queue \
 The manifest for this selection must be prepared with `--scale medium large xlarge`.
 It is published as `large-1` in place of the previous example, so the worker and status commands below apply unchanged.
 
-`queue` reserves the name with a conditional write, stores the configuration, manifest, and jobs under `fleet/<name>/` in the scratch bucket, and writes the `queue.json` marker last.
-Workers refuse a queue without the marker.
+`queue` reserves the name with a conditional write, stores the configuration, manifest, and jobs under `fleet/<name>/` in the results location, and writes the `queue.json` marker last.
+Workers refuse a queue without the marker, or wait for it with `--wait`.
 A failed `queue` releases the reservation, so the same name can be published again; a `queue` process killed while publishing leaves `fleet/<name>/reservation.json`, which must be deleted before reusing the name.
-Every worker runs its jobs with that stored configuration.
-Start a worker on every host from the local machine:
+Every worker runs its jobs with that stored configuration and manifest, so recovery and cleanup do not depend on the host where they were prepared.
+The workers that the stack started begin as soon as `large-1` is published; follow them from the local machine:
 
 ```bash
-uv run --env-file ../.env --locked aws ssm send-command --targets "Key=tag:aws:autoscaling:groupName,Values=$BENCHMARK_GROUP" \
-  --document-name AWS-RunShellScript \
-  --parameters 'commands=["sudo -iu ec2-user bash -lc \"cd /opt/pyathena/benchmarks && mkdir -p results && (nohup uv run --no-sync python -m pyathena_bench worker --stack $(cat /opt/pyathena/benchmarks/stack-id.txt) --name large-1 --terminate-host > results/worker-large-1.log 2>&1 &)\""]'
 uv run --env-file ../.env --locked python -m pyathena_bench status \
   --stack "$BENCHMARK_STACK" --name large-1
 ```
 
+For a queue with another name, start a worker on every host with SSM; a second worker on a host whose worker still runs would overlap trials:
+
+```bash
+uv run --env-file ../.env --locked aws ssm send-command --targets "Key=tag:aws:autoscaling:groupName,Values=$BENCHMARK_GROUP" \
+  --document-name AWS-RunShellScript \
+  --parameters 'commands=["sudo -iu ec2-user bash -lc \"cd /opt/pyathena/benchmarks && mkdir -p results && (nohup uv run --no-sync python -m pyathena_bench worker --stack $(cat /opt/pyathena/benchmarks/stack-id.txt) --name large-2 --terminate-host > results/worker-large-2.log 2>&1 &)\""]'
+```
+
 A worker claims a job by creating `claims/<job>` with an S3 conditional write, so exactly one host runs each job.
-After a job, the worker uploads its output directory to `results/<job>/` and its log to `logs/`, then writes `done/<job>` with the exit code, host, and times.
-A failed trial stops only its own job; `status` lists jobs with a non-zero exit code.
+A claim, like each API slot under `slots/`, is a lease that its worker renews every tenth of `--lease-seconds` (600 by default) while the job runs.
+When a worker dies, its claim and slots expire, and another worker takes them over with a conditional write, so the job and the slots return to the fleet without manual steps.
+Each attempt of a job writes to `results/<job>/attempt-<n>/`, and the worker uploads its trial records at every renewal, so a lost host loses at most the trials of the last minutes.
+After a job, the worker uploads the attempt's output directory and its log to `logs/`, writes `results/<job>/summary.csv` and `summary.md` from every attempt, and writes `done/<job>` with the exit code, attempt, host, and times.
+A failed trial stops only its own job; `status` lists jobs with a non-zero exit code, the claims of running jobs, and the slots in use, each with its host, attempt, and whether its lease has expired.
 After a failed job, the worker stops the job's reported queries and every queued or running query in the workgroup that writes under the job's trial output prefixes, which also covers queries whose IDs were never reported before a trial process died.
 It waits until they stop before claiming another job; this scans the workgroup's query history.
 If it cannot confirm that, it records the errors in the `done` marker and exits.
-A worker that dies leaves a claim without a `done` marker, and it can also leave an API slot under `slots/`, which lowers the fleet's API-heavy capacity.
-`status` lists slots in use; delete a slot object only after confirming that the host named in it no longer runs a job.
-Workers exit when every job has been claimed.
-With `--terminate-host`, a worker that returns normally records its jobs, instance type, Availability Zone, and purchase option under `hosts/<instance-id>.json` and terminates its host through the Auto Scaling group with a lower desired capacity, so no replacement starts and finished hosts stop costing money while others still run.
-Before terminating, it suspends the group's `AZRebalance` process: hosts retiring unevenly across zones would otherwise let the group launch a host in one zone and terminate a busy host in another.
-The process stays suspended until the stack is deleted.
+
+Each worker checks instance metadata for a Spot interruption notice (`spot/instance-action`), which EC2 publishes about two minutes before it reclaims an instance.
+On a notice, the worker interrupts the running trial with SIGINT, which cancels the trial's reported queries, uploads the attempt, releases its claim as `interrupted` and its slots, and exits without terminating the host.
+The group replaces the reclaimed instance, and the new host's worker takes over the interrupted claim as the next attempt: it downloads the earlier attempts, quiesces their trials as after a failed job, and runs only the repetitions that they did not record as successful, through `run --resume`.
+The job's summary merges the attempts and leaves out a failed or incomplete trial whose repetition succeeded in a later attempt, so it reports the trials of an uninterrupted run.
+Rebalance recommendations are not acted on; they often precede no interruption, and the notice leaves enough time to stop a trial.
+
+Workers exit when no job is left to claim: every job is done or claimed by a live lease.
+With `--terminate-host`, a worker first suspends the group's `AZRebalance` process, which would otherwise let the group launch a host in one zone and terminate a busy host in another when Spot capacity or retired hosts leave the zones uneven; the process stays suspended until the stack is deleted.
+A worker with `--terminate-host` that returns normally records its jobs, instance type, Availability Zone, and purchase option under `hosts/<instance-id>.json` and terminates its host through the group with a lower desired capacity, so no replacement starts and finished hosts stop costing money while others still run.
 This includes a worker that stopped after unconfirmed queries, whose errors are already in the `done` marker.
-A worker that raises an error, for example for a missing queue, keeps its host.
-To keep a host, create `/opt/pyathena/benchmarks/results/keep-host` before its worker finishes; keep the host where the manifests were prepared, so that its local `results/` can be recovered.
-Start a worker on a replacement host for an interrupted Spot Instance by targeting that instance ID instead of the group; a second worker on a host that already runs one would overlap trials.
-To retry jobs, wait until all workers have exited, run `cleanup --trials-only --execute` for the manifest, and publish the selected jobs under a new queue name with the same manifest.
-Download `fleet/<name>/` with `aws s3 sync` before cleanup and stack deletion, as described below.
+A worker that raises an error, for example for a job wider than `--api-slots`, keeps its host.
+To keep a host after its worker finishes, tag it with `KeepHost=true` (`aws ec2 create-tags --resources <instance-id> --tags Key=KeepHost,Value=true`); the worker reads the tag from instance metadata.
+A job whose last worker exited without finishing it, for example after a host error, stays claimed until its lease expires; then a worker started for the same queue takes it over.
+To retry failed jobs, wait until all workers have exited, run `cleanup --trials-only --execute` for the manifest, and publish the selected jobs under a new queue name with the same manifest.
+
+### Pilot with a simulated interruption
+
+Before a fleet run, rehearse an interruption on one host.
+Deploy with `FleetSize=1` and `QueueName=pilot-1`, prepare a small snapshot, and publish a job with several repetitions; the host's worker starts it:
+
+```bash
+BENCHMARK_STACK=pyathena-benchmark-pilot
+uv run --env-file ../.env --locked aws cloudformation deploy \
+  --stack-name "$BENCHMARK_STACK" \
+  --template-file cloudformation/benchmark.yaml \
+  --capabilities CAPABILITY_IAM \
+  --tags Purpose=pyathena-benchmark \
+  --parameter-overrides GitCommit="$BENCHMARK_COMMIT" Architecture=arm64 InstanceType=r7g.2xlarge \
+  ResultsBucket="$BENCHMARK_RESULTS_BUCKET" QueueName=pilot-1
+# In a session on the host, as ec2-user in /opt/pyathena/benchmarks:
+uv run --no-sync python -m pyathena_bench prepare \
+  --stack "$(cat stack-id.txt)" --manifest results/input-pilot.json --scale small
+uv run --no-sync python -m pyathena_bench jobs --suite single --scale small --family pandas --api sync \
+  --transport csv --output-kind native --warmups 0 --repetitions 6 > results/jobs-pilot.json
+uv run --no-sync python -m pyathena_bench queue \
+  --stack "$(cat stack-id.txt)" --name pilot-1 --jobs results/jobs-pilot.json --manifest results/input-pilot.json
+```
+
+When `status` shows the job claimed and `results/<job>/attempt-1/trials.jsonl` has a trial, create the file `/opt/pyathena/benchmarks/interruption-notice`, which a worker treats as an interruption notice.
+Check that the claim is `interrupted`, then terminate the host without lowering the desired capacity, as EC2 does when it reclaims a Spot Instance:
+
+```bash
+BENCHMARK_GROUP=$(uv run --env-file ../.env --locked aws cloudformation describe-stacks --stack-name "$BENCHMARK_STACK" \
+  --query 'Stacks[0].Outputs[?OutputKey==`AutoScalingGroup`].OutputValue | [0]' --output text)
+BENCHMARK_INSTANCE=$(uv run --env-file ../.env --locked aws autoscaling describe-auto-scaling-groups \
+  --auto-scaling-group-names "$BENCHMARK_GROUP" --query 'AutoScalingGroups[0].Instances[0].InstanceId' --output text)
+uv run --env-file ../.env --locked aws ssm send-command --instance-ids "$BENCHMARK_INSTANCE" \
+  --document-name AWS-RunShellScript \
+  --parameters 'commands=["sudo -u ec2-user touch /opt/pyathena/benchmarks/interruption-notice"]'
+uv run --env-file ../.env --locked python -m pyathena_bench status --stack "$BENCHMARK_STACK" --name pilot-1
+uv run --env-file ../.env --locked aws autoscaling terminate-instance-in-auto-scaling-group \
+  --instance-id "$BENCHMARK_INSTANCE" --no-should-decrement-desired-capacity
+```
+
+The group launches a replacement whose worker continues the job as `attempt-2` and then retires the host.
+The pilot passes when `done/<job>` records `attempt` 2 and exit code 0, `results/<job>/summary.csv` reports six successful trials and no failures, `hosts/` records the replacement with lifecycle `spot`, and the group's desired capacity drops to zero.
+AWS Fault Injection Service (`aws:ec2:send-spot-instance-interruptions`) sends a real notice instead, but needs its own IAM role and experiment template.
 
 ## Reports and recovery
 
@@ -412,6 +478,7 @@ uv run --no-sync python -m pyathena_bench report results/single-small
 ```
 
 Report recovery ignores an incomplete final JSONL record with a warning and marks started trials without a final record as incomplete.
+For a fleet job directory, `report results/recovered/fleet/<name>/results/<job>` merges the trials of its `attempt-<n>` subdirectories.
 Malformed records elsewhere remain errors.
 
 Small sample sizes make tail percentiles descriptive rather than reliable population estimates.
@@ -421,10 +488,11 @@ Results are gitignored and are not uploaded by CI.
 ## Recovering reports and deleting the environment
 
 Stop the benchmark process before cleanup or stack deletion.
-Recover all local manifests and reports first, including failed-run evidence.
-Use the stack's generated bucket as a temporary transfer location; it is separate from `pyathena-benchmark`, which holds the input data.
+Recover the fleet queues and reports first, including failed-run evidence; with an expiring results bucket, do so within a day of the run.
+Each queue holds its manifest, configuration, and jobs, so no host needs to be kept for recovery.
+Local files on a remaining host, such as a manifest that was never queued, can go through the stack's generated bucket; it is separate from `pyathena-benchmark`, which holds the input data.
 
-On EC2:
+On EC2, only for such local files:
 
 ```bash
 BENCHMARK_BUCKET=$(aws cloudformation describe-stacks --stack-name "$BENCHMARK_STACK_ID" \
@@ -439,29 +507,32 @@ BENCHMARK_BUCKET=$(uv run --env-file ../.env --locked aws cloudformation describ
   --query 'Stacks[0].Outputs[?OutputKey==`Bucket`].OutputValue | [0]' --output text)
 mkdir -p results/recovered
 uv run --env-file ../.env --locked aws s3 sync "s3://$BENCHMARK_BUCKET/reports/" results/recovered/
+BENCHMARK_RESULTS=$(uv run --env-file ../.env --locked aws cloudformation describe-stacks --stack-name "$BENCHMARK_STACK" \
+  --query 'Stacks[0].Outputs[?OutputKey==`Results`].OutputValue | [0]' --output text)
 uv run --env-file ../.env --locked aws cloudformation describe-stacks --stack-name "$BENCHMARK_STACK" > results/recovered/stack.json
-uv run --env-file ../.env --locked aws s3 sync "s3://$BENCHMARK_BUCKET/fleet/" results/recovered/fleet/
+uv run --env-file ../.env --locked aws s3 sync "${BENCHMARK_RESULTS}fleet/" results/recovered/fleet/
 uv run --env-file ../.env --locked aws ec2 describe-instances \
   --filters "Name=tag:aws:autoscaling:groupName,Values=$BENCHMARK_GROUP" > results/recovered/instances.json
 ```
 
 Verify the downloaded files before proceeding.
-For every preparation manifest, preview and then clean that run using its original configuration:
+For every preparation manifest, preview and then clean that run using its original configuration; a queued manifest is `results/recovered/fleet/<name>/manifest.json`:
 
 ```bash
 uv run --env-file ../.env --locked python -m pyathena_bench cleanup \
-  --manifest results/recovered/input.json
+  --manifest results/recovered/fleet/large-1/manifest.json
 uv run --env-file ../.env --locked python -m pyathena_bench cleanup \
-  --manifest results/recovered/input.json --execute
+  --manifest results/recovered/fleet/large-1/manifest.json --execute
 ```
 
-Cleanup checks the live stack identity, cancels and waits for matching active queries, removes run-prefixed scratch tables, aborts matching multipart uploads, and removes the run's S3 prefix.
+Cleanup checks the live stack identity, cancels and waits for matching active queries, removes run-prefixed scratch tables, aborts matching multipart uploads, and removes the run's prefix `runs/<run_id>/` in the scratch bucket and in the results location.
 History discovery uses [batches of up to 50 query IDs](https://docs.aws.amazon.com/athena/latest/APIReference/API_BatchGetQueryExecution.html); completed queries need no cancellation calls.
 Unavailable recorded query metadata produces a warning and falls back to scanning live history; errors inspecting that history stop cleanup before deletion.
 The transfer copy under `reports/` remains until the final stack teardown.
 For multiple manifests, repeat cleanup for each; never clean while another process is still submitting queries.
 
 Confirm the scratch database is empty and the only remaining S3 objects are the recovered reports and fleet queues.
+In a separate results bucket, the fleet queues under `fleet/` remain until they expire, or until they are removed with `aws s3 rm "${BENCHMARK_RESULTS}fleet/" --recursive`.
 An unexpected table or object is a reason to inspect the corresponding run before deleting anything further.
 
 ```bash

@@ -144,14 +144,44 @@ def read_records(path: Path) -> list[dict[str, Any]]:
     return records
 
 
+def collect_trials(directory: Path) -> list[dict[str, Any]]:
+    """Read the trials of an output directory and of its attempt subdirectories.
+
+    A fleet job keeps each attempt in an ``attempt-<n>`` subdirectory; their
+    trials are merged.
+    A started trial without a final record is reported as incomplete. A failed
+    or incomplete trial is dropped when another attempt recorded the same
+    repetition as successful, so a resumed job reports the trials of an
+    uninterrupted run.
+
+    Args:
+        directory: Output directory of a run, or a job directory with attempts.
+
+    Returns:
+        Trial records.
+    """
+    sources = [directory, *sorted(p for p in directory.glob("attempt-*") if p.is_dir())]
+    trials = [t for source in sources for t in read_records(source / "trials.jsonl")]
+    recorded = {trial.get("trial") for trial in trials}
+    trials.extend(
+        {**event, "status": "incomplete", "error": "Trial started without a final record"}
+        for source in sources
+        for event in read_records(source / "events.jsonl")
+        if event["event"] == "trial_start" and event["trial"] not in recorded
+    )
+    succeeded = {
+        (t["scale"], t["case_id"], t.get("repetition")) for t in trials if t["status"] == "ok"
+    }
+    return [
+        t
+        for t in trials
+        if t["status"] in {"ok", "unsupported"}
+        or (t["scale"], t["case_id"], t.get("repetition")) not in succeeded
+    ]
+
+
 def report(directory: Path) -> None:
-    trials = read_records(directory / "trials.jsonl")
-    completed = {trial.get("trial") for trial in trials}
-    for event in read_records(directory / "events.jsonl"):
-        if event["event"] == "trial_start" and event["trial"] not in completed:
-            trials.append(
-                {**event, "status": "incomplete", "error": "Trial started without a final record"}
-            )
+    trials = collect_trials(directory)
     rows = summarize(trials)
     if not rows:
         raise ValueError("No trials to report")

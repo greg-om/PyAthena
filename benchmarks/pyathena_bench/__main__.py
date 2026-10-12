@@ -23,6 +23,7 @@ from pyathena_bench.aws import (
     prepare,
     prepare_fixtures,
     session,
+    split_location,
     stack_resources,
     validate_manifest,
 )
@@ -31,15 +32,18 @@ from pyathena_bench.config import Settings, read_json
 from pyathena_bench.fleet import (
     Filters,
     Queue,
+    SpotInterruptionError,
     expand_jobs,
+    interruption_notice,
     merge_jobs,
     retire_host,
     status,
     submit,
+    suspend_rebalance,
     work,
 )
 from pyathena_bench.report import report
-from pyathena_bench.runner import run
+from pyathena_bench.runner import completed_trials, run
 
 
 def parser() -> argparse.ArgumentParser:
@@ -85,6 +89,13 @@ def parser() -> argparse.ArgumentParser:
         if name == "run":
             command.add_argument("--manifest", type=Path, required=True)
             command.add_argument("--out", type=Path, required=True)
+            command.add_argument(
+                "--resume",
+                type=Path,
+                nargs="+",
+                default=[],
+                help="Output directories of earlier attempts whose finished trials are skipped",
+            )
     enqueue = commands.add_parser(
         "queue", help="Publish jobs and a prepared manifest for fleet workers"
     )
@@ -107,7 +118,17 @@ def parser() -> argparse.ArgumentParser:
     consume.add_argument(
         "--terminate-host",
         action="store_true",
-        help="Terminate this host through its Auto Scaling group after every job is claimed",
+        help="Suspend zone rebalancing at start, and terminate this host through its Auto "
+        "Scaling group when no job is left to claim",
+    )
+    consume.add_argument(
+        "--wait", action="store_true", help="Wait for the queue to be published instead of failing"
+    )
+    consume.add_argument(
+        "--lease-seconds",
+        type=float,
+        default=600.0,
+        help="Seconds after which a dead worker's claim and API slots return to the fleet",
     )
     progress = commands.add_parser("status", help="Summarize a fleet queue")
     progress.add_argument("--stack", required=True)
@@ -157,10 +178,12 @@ def main(argv: list[str] | None = None) -> int:
                         if args.trials_only
                         else f"b_{manifest['run_id']}_*"
                     ),
-                    "s3_prefix": f"s3://{resources['Bucket']}/runs/{manifest['run_id']}/"
-                    + ("trials/" if args.trials_only else ""),
+                    "s3_prefixes": [
+                        f"{root}runs/{manifest['run_id']}/"
+                        + ("trials/" if args.trials_only else "")
+                        for root in sorted({f"s3://{resources['Bucket']}/", resources["Results"]})
+                    ],
                     "preserve_inputs_and_fixtures": args.trials_only,
-                    "query_output_prefix": f"s3://{resources['Bucket']}/runs/{manifest['run_id']}/",
                 },
                 indent=2,
             )
@@ -170,20 +193,39 @@ def main(argv: list[str] | None = None) -> int:
             cleanup(settings, manifest, args.manifest, trials_only=args.trials_only)
     elif args.command in {"queue", "worker", "status"}:
         session_ = session(settings)
-        queue = Queue(
-            client(session_, "s3"), stack_resources(session_, args.stack)["Bucket"], args.name
-        )
+        bucket, base = split_location(stack_resources(session_, args.stack)["Results"])
+        queue = Queue(client(session_, "s3"), bucket, args.name, base)
         if args.command == "queue":
             validate_manifest(settings, read_json(args.manifest))
             submit(queue, merge_jobs(read_json(p) for p in args.jobs), args.config, args.manifest)
         elif args.command == "worker":
             if args.api_slots < 1:
                 raise ValueError("--api-slots must be positive")
-            ran = work(queue, args.workdir or Path("results/fleet") / args.name, args.api_slots)
+            if args.lease_seconds < 120:
+                raise ValueError("--lease-seconds must be at least 120")
+            autoscaling = client(session_, "autoscaling")
+            if args.terminate_host:
+                suspend_rebalance(autoscaling)
+            try:
+                ran = work(
+                    queue,
+                    args.workdir or Path("results/fleet") / args.name,
+                    args.api_slots,
+                    lease_seconds=args.lease_seconds,
+                    renew_seconds=args.lease_seconds / 10,
+                    notice=interruption_notice,
+                    wait=args.wait,
+                )
+            except SpotInterruptionError as interrupted:
+                # The host is being reclaimed; its group launches a replacement.
+                sys.stdout.write(
+                    json.dumps({"ran": interrupted.ran, "interrupted": True}, indent=2) + "\n"
+                )
+                return 0
             sys.stdout.write(json.dumps({"ran": ran}, indent=2) + "\n")
             if args.terminate_host:
                 # Only a normal return retires the host; an error keeps it for inspection.
-                retire_host(queue, client(session_, "autoscaling"), ran)
+                retire_host(queue, autoscaling, ran)
         else:
             sys.stdout.write(json.dumps(status(queue), indent=2) + "\n")
     elif args.command == "jobs":
@@ -248,7 +290,9 @@ def main(argv: list[str] | None = None) -> int:
             manifest = read_json(args.manifest)
             if args.suite == "init":
                 prepare_fixtures(settings, manifest, args.manifest, scales, args.shape)
-            success = run(settings, manifest, cases, scales, args.out)
+            success = run(
+                settings, manifest, cases, scales, args.out, completed_trials(args.resume)
+            )
             report(args.out)
             return 0 if success else 1
     return 0

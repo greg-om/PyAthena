@@ -23,7 +23,8 @@ def test_template_has_no_retained_storage_or_inbound_ports():
     assert launch["MetadataOptions"]["HttpTokens"] == "required"
     assert "VersioningConfiguration" not in resources["Bucket"]["Properties"]
     statements = resources["Role"]["Properties"]["Policies"][0]["PolicyDocument"]["Statement"]
-    for statement in statements:
+    # Conditional results-bucket statements are checked separately.
+    for statement in (s for s in statements if "Fn::If" not in s):
         if "SourceBucket" in str(statement["Resource"]):
             assert statement["Action"] in {"s3:ListBucket", "s3:GetBucketLocation", "s3:GetObject"}
         if "SourceDatabase" in str(statement["Resource"]):
@@ -72,23 +73,34 @@ def test_architecture_selects_the_image_and_rules_match_instance_families():
     assert all(t.startswith(("r7g.", "r8g.")) for t in families["arm64"])
 
 
-def test_purchase_option_keeps_one_instance_type_across_three_zones():
+def test_spot_by_default_keeps_one_instance_type_across_three_or_four_zones():
     template, errors = decode(
         str(Path(__file__).resolve().parents[1] / "cloudformation/benchmark.yaml")
     )
     assert not errors
     resources = template["Resources"]
-    assert template["Parameters"]["Purchase"]["Default"] == "on-demand"
+    assert template["Parameters"]["Purchase"]["Default"] == "spot"
+    assert template["Parameters"]["Zones"]["Default"] == 4
     policy = resources["Fleet"]["Properties"]["MixedInstancesPolicy"]
     assert "Overrides" not in policy["LaunchTemplate"]
     distribution = policy["InstancesDistribution"]
     assert distribution["OnDemandBaseCapacity"] == 0
     assert distribution["OnDemandPercentageAboveBaseCapacity"] == {"Fn::If": ["IsSpot", 0, 100]}
     assert distribution["SpotAllocationStrategy"] == "price-capacity-optimized"
-    subnets = resources["Fleet"]["Properties"]["VPCZoneIdentifier"]
-    names = [s["Ref"] for s in subnets]
-    zones = [resources[n]["Properties"]["AvailabilityZone"]["Fn::Select"][0] for n in names]
-    assert sorted(zones) == [0, 1, 2]
+    condition, four, three = resources["Fleet"]["Properties"]["VPCZoneIdentifier"]["Fn::If"]
+    assert condition == "UseFourZones"
+    for subnets, expected in ((four, [0, 1, 2, 3]), (three, [0, 1, 2])):
+        names = [s["Ref"] for s in subnets]
+        zones = [resources[n]["Properties"]["AvailabilityZone"]["Fn::Select"][0] for n in names]
+        assert sorted(zones) == expected
+    assert resources["Subnet4"]["Condition"] == "UseFourZones"
+    assert resources["RouteAssociation4"]["Condition"] == "UseFourZones"
+    # Hosts launch after every zone's route exists, including the conditional fourth one.
+    assert {"RouteAssociation", "RouteAssociation2", "RouteAssociation3"} <= set(
+        resources["Fleet"]["DependsOn"]
+    )
+    [tag] = resources["Fleet"]["Properties"]["Tags"]
+    assert tag["Value"]["Fn::If"][:2] == ["UseFourZones", {"Ref": "RouteAssociation4"}]
     interface = resources["LaunchTemplate"]["Properties"]["LaunchTemplateData"][
         "NetworkInterfaces"
     ][0]
@@ -103,6 +115,7 @@ def test_hosts_can_terminate_instances_only_in_their_own_stack():
     statements = template["Resources"]["Role"]["Properties"]["Policies"][0]["PolicyDocument"][
         "Statement"
     ]
+    statements = [s for s in statements if "Fn::If" not in s]
     scoped = [s for s in statements if "autoscaling" in str(s["Action"]) and "Condition" in s]
     unscoped = [s for s in statements if "autoscaling" in str(s["Action"]) and "Condition" not in s]
     # Only the read-only lookup of the host's group is unconditional.
@@ -117,3 +130,51 @@ def test_hosts_can_terminate_instances_only_in_their_own_stack():
             "autoscaling:ResourceTag/aws:cloudformation:stack-id": {"Ref": "AWS::StackId"}
         }
     }
+
+
+def test_results_location_is_scoped_to_the_stack_prefix():
+    template, errors = decode(
+        str(Path(__file__).resolve().parents[1] / "cloudformation/benchmark.yaml")
+    )
+    assert not errors
+    statements = template["Resources"]["Role"]["Properties"]["Policies"][0]["PolicyDocument"][
+        "Statement"
+    ]
+    results = [s["Fn::If"] for s in statements if "Fn::If" in s]
+    assert results
+    assert all(r[0] == "HasResultsBucket" for r in results)
+    assert all(r[2] == {"Ref": "AWS::NoValue"} for r in results)
+    for _, statement, _ in results:
+        if "s3:PutObject" in statement["Action"]:
+            assert statement["Resource"]["Fn::Sub"].endswith(
+                ":s3:::${ResultsBucket}/${ResultsPrefix}/${AWS::StackName}/*"
+            )
+        elif "s3:ListBucket" in statement["Action"]:
+            assert statement["Condition"] == {
+                "StringLike": {"s3:prefix": {"Fn::Sub": "${ResultsPrefix}/${AWS::StackName}/*"}}
+            }
+        else:
+            assert statement["Action"] == "s3:GetBucketLocation"
+    condition, results_bucket, scratch = template["Outputs"]["Results"]["Value"]["Fn::If"]
+    assert condition == "HasResultsBucket"
+    assert results_bucket == {
+        "Fn::Sub": "s3://${ResultsBucket}/${ResultsPrefix}/${AWS::StackName}/"
+    }
+    assert scratch == {"Fn::Sub": "s3://${Bucket}/"}
+
+
+def test_hosts_start_the_queue_worker_and_expose_their_tags():
+    template, errors = decode(
+        str(Path(__file__).resolve().parents[1] / "cloudformation/benchmark.yaml")
+    )
+    assert not errors
+    launch = template["Resources"]["LaunchTemplate"]["Properties"]["LaunchTemplateData"]
+    assert launch["MetadataOptions"]["InstanceMetadataTags"] == "enabled"
+    user_data = launch["UserData"]["Fn::Base64"]["Fn::Sub"]
+    assert "if [ -n '${QueueName}' ]; then" in user_data
+    assert (
+        "ExecStart=/opt/pyathena/.venv/bin/python -m pyathena_bench worker --stack ${AWS::StackId}"
+        " --name ${QueueName} --api-slots ${ApiSlots} --wait --terminate-host"
+    ) in user_data
+    assert "systemctl enable --now pyathena-bench-worker.service" in user_data
+    assert template["Parameters"]["QueueName"]["Default"] == ""

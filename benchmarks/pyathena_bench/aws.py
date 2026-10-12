@@ -37,6 +37,24 @@ def client(session_: Any, service: str) -> Any:
     )
 
 
+def split_location(location: str) -> tuple[str, str]:
+    """Split an ``s3://bucket/prefix/`` location.
+
+    Args:
+        location: S3 location ending with a slash.
+
+    Returns:
+        The bucket and the key prefix, which is empty or ends with a slash.
+
+    Raises:
+        ValueError: If the location is not an S3 location ending with a slash.
+    """
+    if not re.fullmatch(r"s3://[a-z0-9][a-z0-9.-]+[a-z0-9]/([^/]+/)*", location):
+        raise ValueError(f"Invalid S3 location: {location!r}")
+    bucket, _, prefix = location[len("s3://") :].partition("/")
+    return bucket, prefix
+
+
 def stack_resources(session_: Any, stack: str) -> dict[str, str]:
     data = client(session_, "cloudformation").describe_stacks(StackName=stack)["Stacks"][0]
     tags = {item["Key"]: item["Value"] for item in data.get("Tags", [])}
@@ -52,6 +70,7 @@ def stack_resources(session_: Any, stack: str) -> dict[str, str]:
         "SourceTable",
         "WorkGroup",
         "AutoScalingGroup",
+        "Results",
     }
     if not required <= result.keys():
         raise ValueError("Stack outputs are incomplete")
@@ -61,6 +80,8 @@ def stack_resources(session_: Any, stack: str) -> dict[str, str]:
     ):
         raise ValueError("Scratch resources must differ from source resources")
     identifier(result["ScratchDatabase"])
+    if split_location(result["Results"])[0] == result["SourceBucket"]:
+        raise ValueError("Results must not be written to the source bucket")
     result["StackId"] = data["StackId"]
     return result
 
@@ -329,13 +350,23 @@ def active_queries(athena: Any, workgroup: str, prefixes: tuple[str, ...]) -> se
 def cleanup(
     settings: Settings, manifest: dict[str, Any], path: Path, trials_only: bool = False
 ) -> None:
-    """Remove this run's data after checking the current stack identity."""
+    """Remove this run's data after checking the current stack identity.
+
+    The run's objects are under ``runs/<run_id>/`` in the scratch bucket
+    (inputs and fixtures) and in the stack's results location (trial outputs);
+    both are cleaned.
+    """
     resources = validate_manifest(settings, manifest)
     session_ = session(settings)
-    bucket = resources["Bucket"]
     run_id = manifest["run_id"]
-    root = f"runs/{run_id}/"
-    prefix = root + "trials/" if trials_only else root
+    results_bucket, results_prefix = split_location(resources["Results"])
+    locations = sorted(
+        {
+            (resources["Bucket"], f"runs/{run_id}/"),
+            (results_bucket, f"{results_prefix}runs/{run_id}/"),
+        }
+    )
+    roots = tuple(f"s3://{bucket}/{root}" for bucket, root in locations)
     athena = client(session_, "athena")
     # Discover queries whose worker died before returning its query ID.
     # The query prefix is checked against live Athena output metadata.
@@ -356,11 +387,11 @@ def cleanup(
             continue
         if query.get("WorkGroup") != settings.workgroup or not query.get(
             "ResultConfiguration", {}
-        ).get("OutputLocation", "").startswith(f"s3://{bucket}/{root}"):
+        ).get("OutputLocation", "").startswith(roots):
             raise ValueError("Manifest contains a query outside this run")
         if query["Status"]["State"] in {"RUNNING", "QUEUED"}:
             ids.add(entry["query_id"])
-    ids |= active_queries(athena, settings.workgroup, (f"s3://{bucket}/{root}",))
+    ids |= active_queries(athena, settings.workgroup, roots)
     errors = cancel_queries(settings, ids)
     if errors:
         raise RuntimeError("Could not cancel queries: " + "; ".join(errors))
@@ -393,15 +424,21 @@ def cleanup(
     for table in tables:
         glue.delete_table(DatabaseName=resources["ScratchDatabase"], Name=table)
     s3 = client(session_, "s3")
-    for page in s3.get_paginator("list_multipart_uploads").paginate(Bucket=bucket, Prefix=prefix):
-        for upload in page.get("Uploads", []):
-            s3.abort_multipart_upload(Bucket=bucket, Key=upload["Key"], UploadId=upload["UploadId"])
-    for page in s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix):
-        objects = [{"Key": obj["Key"]} for obj in page.get("Contents", [])]
-        if objects:
-            response = s3.delete_objects(Bucket=bucket, Delete={"Objects": objects})
-            if response.get("Errors"):
-                raise RuntimeError(str(response["Errors"]))
+    for bucket, root in locations:
+        prefix = root + "trials/" if trials_only else root
+        for page in s3.get_paginator("list_multipart_uploads").paginate(
+            Bucket=bucket, Prefix=prefix
+        ):
+            for upload in page.get("Uploads", []):
+                s3.abort_multipart_upload(
+                    Bucket=bucket, Key=upload["Key"], UploadId=upload["UploadId"]
+                )
+        for page in s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix):
+            objects = [{"Key": obj["Key"]} for obj in page.get("Contents", [])]
+            if objects:
+                response = s3.delete_objects(Bucket=bucket, Delete={"Objects": objects})
+                if response.get("Errors"):
+                    raise RuntimeError(str(response["Errors"]))
     if not trials_only:
         manifest["cleaned"] = True
     write_json(path, manifest)

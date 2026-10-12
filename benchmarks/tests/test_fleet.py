@@ -5,8 +5,12 @@
 #
 # SPDX-License-Identifier: MIT
 
+import csv
 import io
 import json
+import threading
+import time
+import urllib.error
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,13 +21,17 @@ from pyathena_bench.__main__ import main
 from pyathena_bench.config import Settings
 from pyathena_bench.fleet import (
     Filters,
+    JobWatch,
     Queue,
+    SpotInterruptionError,
     expand_jobs,
+    interruption_notice,
     merge_jobs,
     quiesce,
     retire_host,
     status,
     submit,
+    suspend_rebalance,
     trial_evidence,
     work,
 )
@@ -32,24 +40,38 @@ SETTINGS = Settings(scales={"small": 10000, "xlarge": 10000000})
 
 
 class FakeS3:
-    """In-memory S3 with conditional creation, as used by the fleet queue."""
+    """In-memory S3 with conditional writes, as used by the fleet queue."""
 
     def __init__(self):
         self.objects = {}
+        self.etags = {}
+        self.writes = 0
 
     def put_object(self, **kwargs):
-        if kwargs.get("IfNoneMatch") == "*" and kwargs["Key"] in self.objects:
+        key = kwargs["Key"]
+        if kwargs.get("IfNoneMatch") == "*" and key in self.objects:
             raise ClientError({"Error": {"Code": "PreconditionFailed"}}, "PutObject")
-        self.objects[kwargs["Key"]] = kwargs["Body"]
+        if "IfMatch" in kwargs and self.etags.get(key) != kwargs["IfMatch"]:
+            raise ClientError({"Error": {"Code": "PreconditionFailed"}}, "PutObject")
+        self.writes += 1
+        self.objects[key] = kwargs["Body"]
+        self.etags[key] = f'"{self.writes}"'
+        return {"ETag": self.etags[key]}
 
     def get_object(self, **kwargs):
-        return {"Body": io.BytesIO(self.objects[kwargs["Key"]])}
+        if kwargs["Key"] not in self.objects:
+            raise ClientError({"Error": {"Code": "NoSuchKey"}}, "GetObject")
+        return {
+            "Body": io.BytesIO(self.objects[kwargs["Key"]]),
+            "ETag": self.etags.get(kwargs["Key"], '"0"'),
+        }
 
     def delete_object(self, **kwargs):
         self.objects.pop(kwargs["Key"], None)
+        self.etags.pop(kwargs["Key"], None)
 
     def upload_file(self, filename, bucket, key):
-        self.objects[key] = Path(filename).read_bytes()
+        self.put_object(Key=key, Body=Path(filename).read_bytes())
 
     def list_objects_v2(self, **kwargs):
         keys = [k for k in self.objects if k.startswith(kwargs["Prefix"])]
@@ -212,9 +234,8 @@ class TestQueue:
         runs = []
         settled = []
 
-        def runner(item, workdir):
+        def runner(item, workdir, out, resume, stop):
             runs.append(item["id"])
-            out = workdir / "results" / item["id"]
             out.mkdir(parents=True)
             (out / "summary.csv").write_text("x")
             return 0 if item["id"] == "light" else 1
@@ -225,7 +246,7 @@ class TestQueue:
             api_slots=1,
             poll_seconds=0,
             runner=runner,
-            settle=settled.append,
+            settle=lambda output: settled.append(output) or [],
         )
         assert (
             work(
@@ -239,8 +260,8 @@ class TestQueue:
             == []
         )
         assert sorted(runs) == ["heavy", "light"]
-        assert [path.name for path in settled] == ["heavy"]
-        assert queue.key("results", "light", "summary.csv") in s3.objects
+        assert [path.parent.name for path in settled] == ["heavy"]
+        assert queue.key("results", "light", "attempt-1", "summary.csv") in s3.objects
         assert not queue.names("slots")
         summary = status(queue)
         assert summary["done"] == 2
@@ -249,10 +270,10 @@ class TestQueue:
     def test_api_heavy_jobs_wait_for_a_free_slot(self, tmp_path):
         s3, queue = queue_with([job("heavy", heavy=True), job("light")], tmp_path)
         other_host = queue.key("slots", "0")
-        s3.put_object(Bucket="bucket", Key=other_host, Body=b"{}")
+        assert queue.acquire(other_host, {"host": "other"}, 600)
         order = []
 
-        def runner(item, workdir):
+        def runner(item, workdir, *args):
             order.append(item["id"])
             s3.delete_object(Bucket="bucket", Key=other_host)
             return 0
@@ -281,6 +302,18 @@ METADATA = {
 }
 
 
+def metadata_with(**tags):
+    def read(path):
+        if path.startswith("tags/instance/"):
+            name = path.removeprefix("tags/instance/")
+            if name not in tags:
+                raise urllib.error.HTTPError(path, 404, "Not Found", None, None)
+            return tags[name]
+        return METADATA[path]
+
+    return read
+
+
 class FakeAutoScaling:
     """Auto Scaling client that records calls in order."""
 
@@ -299,19 +332,22 @@ class FakeAutoScaling:
 
 
 class TestRetireHost:
-    def test_finished_worker_records_its_host_and_terminates_it_after_suspending_rebalance(
-        self, tmp_path
-    ):
-        s3, queue = queue_with([job("a")], tmp_path)
+    def test_worker_start_suspends_zone_rebalancing(self):
         autoscaling = FakeAutoScaling()
-        keep = tmp_path / "keep-host"
-        assert retire_host(queue, autoscaling, ["a"], keep=keep, metadata=METADATA.__getitem__)
+        assert suspend_rebalance(autoscaling, metadata_with()) == "fleet-group"
         assert autoscaling.calls == [
             ("describe", {"InstanceIds": ["i-123"]}),
             (
                 "suspend",
                 {"AutoScalingGroupName": "fleet-group", "ScalingProcesses": ["AZRebalance"]},
             ),
+        ]
+
+    def test_finished_worker_records_its_host_and_terminates_it(self, tmp_path):
+        s3, queue = queue_with([job("a")], tmp_path)
+        autoscaling = FakeAutoScaling()
+        assert retire_host(queue, autoscaling, ["a"], metadata=metadata_with(KeepHost="false"))
+        assert autoscaling.calls == [
             ("terminate", {"InstanceId": "i-123", "ShouldDecrementDesiredCapacity": True}),
         ]
         record = json.loads(s3.objects[queue.key("hosts", "i-123.json")])
@@ -323,12 +359,10 @@ class TestRetireHost:
             "spot",
         )
 
-    def test_keep_file_leaves_the_host_and_its_group_unchanged(self, tmp_path):
+    def test_keep_tag_leaves_the_host_and_its_group_unchanged(self, tmp_path):
         s3, queue = queue_with([job("a")], tmp_path)
-        keep = tmp_path / "keep-host"
-        keep.touch()
         autoscaling = FakeAutoScaling()
-        assert not retire_host(queue, autoscaling, [], keep=keep, metadata=METADATA.__getitem__)
+        assert not retire_host(queue, autoscaling, [], metadata=metadata_with(KeepHost="true"))
         assert autoscaling.calls == []
         assert json.loads(s3.objects[queue.key("hosts", "i-123.json")])["kept"] is True
 
@@ -382,9 +416,8 @@ class TestQueueSafety:
         _, queue = queue_with([job("first"), job("second")], tmp_path)
         runs = []
 
-        def runner(item, workdir):
+        def runner(item, workdir, out, resume, stop):
             runs.append(item["id"])
-            out = workdir / "results" / item["id"]
             out.mkdir(parents=True)
             (out / "events.jsonl").write_text(
                 json.dumps({"event": "query", "query_id": "q1", "trial": "t"}) + "\n"
@@ -404,7 +437,7 @@ class TestQueueSafety:
             [job("wide", heavy=True, api_weight=2), job("narrow", heavy=True)], tmp_path
         )
         other_host = queue.key("slots", "0")
-        s3.put_object(Bucket="bucket", Key=other_host, Body=b"{}")
+        assert queue.acquire(other_host, {"host": "other"}, 600)
         attempts = []
 
         def sleep_and_release(seconds):
@@ -413,7 +446,7 @@ class TestQueueSafety:
 
         order = []
 
-        def runner(item, workdir):
+        def runner(item, workdir, *args):
             order.append(item["id"])
             return 0
 
@@ -449,11 +482,11 @@ class TestQueueSafety:
         def flaky(**kwargs):
             if kwargs["Key"].endswith("slots/1"):
                 raise ClientError({"Error": {"Code": "InternalError"}}, "PutObject")
-            original(**kwargs)
+            return original(**kwargs)
 
         s3.put_object = flaky
         with pytest.raises(ClientError):
-            queue.acquire_slots(3, 2, {"host": "h"})
+            queue.acquire_slots(3, 2, {"host": "h"}, 600)
         assert not queue.names("slots")
 
     def test_overlapping_submissions_cannot_share_a_name(self, tmp_path):
@@ -542,3 +575,191 @@ class TestFollowUpSafety:
         assert errors == [
             "Could not quiesce the job: RuntimeError: Could not inspect query history"
         ]
+
+
+def ok_trial(repetition):
+    return {
+        "trial": f"t{repetition}",
+        "case_id": "case",
+        "scale": "small",
+        "repetition": repetition,
+        "warmup": False,
+        "status": "ok",
+        "queries": [{"total_seconds": 1}],
+        "successful_queries_per_second": 1,
+        "rss_peak_bytes": 1,
+        "max_threads": 1,
+    }
+
+
+class TestLeases:
+    def test_only_one_worker_takes_over_an_expired_lease(self, tmp_path):
+        _, queue = queue_with([], tmp_path)
+        key = queue.key("claims", "a")
+        assert queue.acquire(key, {"host": "dead"}, -1).body["attempt"] == 1
+        stale = queue.read_lease(key)
+        first = queue.acquire(key, {"host": "one"}, 600)
+        assert first.body["attempt"] == 2
+        assert queue.acquire(key, {"host": "two"}, 600) is None
+        # A worker that read the expired lease before the takeover cannot overwrite it.
+        assert queue.put(key, {"host": "late"}, IfMatch=stale.etag) is None
+        assert queue.renew(first, 600)
+        assert not queue.renew(stale, 600)
+        assert queue.read_lease(key).body["host"] == "one"
+
+    def test_live_claims_are_left_and_expired_ones_return_to_the_fleet(self, tmp_path):
+        _, queue = queue_with([job("live"), job("expired")], tmp_path)
+        queue.acquire(queue.key("claims", "live"), {"host": "busy"}, 600)
+        queue.acquire(queue.key("claims", "expired"), {"host": "dead"}, -1)
+        runs = []
+
+        def runner(item, workdir, out, resume, stop):
+            runs.append((item["id"], out.name, resume))
+            return 0
+
+        ran = work(
+            queue, tmp_path / "w", api_slots=1, poll_seconds=0, runner=runner, settle=no_queries
+        )
+        assert ran == ["expired"]
+        assert runs == [("expired", "attempt-2", [])]
+        running = status(queue)["running"]
+        assert running["live"] == {
+            "host": "busy",
+            "job": None,
+            "attempt": 1,
+            "state": "running",
+            "expired": False,
+        }
+
+    def test_an_expired_slot_returns_to_the_fleet(self, tmp_path):
+        _, queue = queue_with([job("heavy", heavy=True)], tmp_path)
+        queue.acquire(queue.key("slots", "0"), {"host": "dead"}, -1)
+        assert status(queue)["slots_in_use"]["0"]["expired"]
+        ran = work(
+            queue,
+            tmp_path / "w",
+            api_slots=1,
+            poll_seconds=0,
+            runner=lambda *a: 0,
+            settle=no_queries,
+        )
+        assert ran == ["heavy"]
+        assert not queue.names("slots")
+
+    def test_watch_renews_leases_and_uploads_progress(self, tmp_path):
+        _, queue = queue_with([], tmp_path)
+        lease = queue.acquire(queue.key("claims", "a"), {"host": "h"}, 1)
+        expires = lease.body["expires"]
+        uploads = []
+        with JobWatch(queue, [lease], 600, 0.01, lambda: uploads.append(1), lambda: False):
+            deadline = time.monotonic() + 5
+            while not uploads and time.monotonic() < deadline:
+                time.sleep(0.01)
+        assert uploads
+        assert queue.read_lease(lease.key).body["expires"] > expires + 500
+
+    def test_watch_stops_renewing_a_lease_taken_over_by_another_worker(self, tmp_path):
+        _, queue = queue_with([], tmp_path)
+        lease = queue.acquire(queue.key("claims", "a"), {"host": "h"}, -1)
+        assert queue.acquire(lease.key, {"host": "other"}, 600)
+        with JobWatch(queue, [lease], 600, 0.01, lambda: None, lambda: False) as watch:
+            deadline = time.monotonic() + 5
+            while not watch.lost and time.monotonic() < deadline:
+                time.sleep(0.01)
+        assert watch.lost == [lease.key]
+        assert queue.read_lease(lease.key).body["host"] == "other"
+
+
+class TestInterruption:
+    def test_notice_comes_from_instance_metadata_or_a_simulation_file(self, tmp_path):
+        def missing(path):
+            raise urllib.error.HTTPError(path, 404, "Not Found", None, None)
+
+        absent = tmp_path / "notice"
+        assert not interruption_notice(missing, absent)
+        assert interruption_notice(lambda path: '{"action": "terminate"}', absent)
+        absent.touch()
+        assert interruption_notice(missing, absent)
+
+    def test_interrupted_job_is_resumed_by_another_worker_with_the_same_trials(self, tmp_path):
+        s3, queue = queue_with([job("heavy", heavy=True), job("next")], tmp_path)
+        notice = threading.Event()
+
+        def interrupted_runner(item, workdir, out, resume, stop):
+            out.mkdir(parents=True)
+            (out / "trials.jsonl").write_text(json.dumps(ok_trial(0)) + "\n")
+            notice.set()
+            assert stop.wait(5)
+            with (out / "trials.jsonl").open("a") as stream:
+                stream.write(json.dumps({**ok_trial(1), "status": "interrupted"}) + "\n")
+            return 1
+
+        with pytest.raises(SpotInterruptionError) as raised:
+            work(
+                queue,
+                tmp_path / "w1",
+                api_slots=1,
+                poll_seconds=0,
+                runner=interrupted_runner,
+                settle=no_queries,
+                renew_seconds=0.01,
+                notice=notice.is_set,
+            )
+        assert raised.value.ran == []
+        claim = queue.read_lease(queue.key("claims", "heavy"))
+        assert claim.body["state"] == "interrupted"
+        assert not queue.names("slots")
+        assert queue.key("results", "heavy", "attempt-1", "trials.jsonl") in s3.objects
+        assert not queue.names("done")
+
+        settled = []
+        runs = []
+
+        def resumed_runner(item, workdir, out, resume, stop):
+            runs.append((item["id"], out.name, [p.name for p in resume]))
+            out.mkdir(parents=True)
+            if item["id"] == "heavy":
+                (out / "trials.jsonl").write_text(
+                    "".join(json.dumps(ok_trial(r)) + "\n" for r in (1, 2))
+                )
+            return 0
+
+        ran = work(
+            queue,
+            tmp_path / "w2",
+            api_slots=1,
+            poll_seconds=0,
+            runner=resumed_runner,
+            settle=lambda output: settled.append(output.name) or [],
+        )
+        assert ran == ["heavy", "next"]
+        assert runs == [("heavy", "attempt-2", ["attempt-1"]), ("next", "attempt-1", [])]
+        # The interrupted attempt's queries are quiesced before the job continues.
+        assert settled == ["attempt-1"]
+        summary = s3.objects[queue.key("results", "heavy", "summary.csv")].decode()
+        row = next(csv.DictReader(io.StringIO(summary)))
+        assert (row["successful_trials"], row["failed_trials"]) == ("3", "0")
+        assert json.loads(queue.read("done", "heavy"))["attempt"] == 2
+
+    def test_a_notice_between_jobs_stops_the_worker_without_claiming(self, tmp_path):
+        _, queue = queue_with([job("a")], tmp_path)
+        with pytest.raises(SpotInterruptionError):
+            work(queue, tmp_path / "w", api_slots=1, runner=lambda *a: 0, notice=lambda: True)
+        assert not queue.names("claims")
+
+    def test_worker_waits_for_publication(self, tmp_path, monkeypatch):
+        s3 = FakeS3()
+        queue = Queue(s3, "bucket", "run1", "results/stack/")
+        config = tmp_path / "config.toml"
+        config.write_text("[scales]\nsmall = 10000\n")
+        manifest = tmp_path / "manifest.json"
+        manifest.write_text("{}")
+        monkeypatch.setattr(
+            "pyathena_bench.fleet.time.sleep",
+            lambda seconds: submit(queue, [job("a")], config, manifest),
+        )
+        ran = work(
+            queue, tmp_path / "w", api_slots=1, runner=lambda *a: 0, settle=no_queries, wait=True
+        )
+        assert ran == ["a"]
+        assert all(key.startswith("results/stack/fleet/run1/") for key in s3.objects)

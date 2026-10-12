@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 from pyathena_bench.cases import Case
 from pyathena_bench.config import Settings
-from pyathena_bench.runner import Observer, run, supervise
+from pyathena_bench.runner import Observer, completed_trials, run, supervise
 
 
 def successful_worker(pipe, payload):
@@ -110,7 +110,7 @@ class TestRunner:
         calls = []
         monkeypatch.setattr(
             "pyathena_bench.runner.validate_manifest",
-            lambda *args: {"ScratchDatabase": "scratch", "Bucket": "out"},
+            lambda *args: {"ScratchDatabase": "scratch", "Bucket": "out", "Results": "s3://out/"},
         )
         monkeypatch.setattr("pyathena_bench.runner.validate_inputs", lambda *args: None)
         monkeypatch.setattr("pyathena_bench.runner.environment", lambda *args: {})
@@ -132,3 +132,40 @@ class TestRunner:
         assert calls[0]["warmup"]
         result = json.loads((tmp_path / "run/trials.jsonl").read_text())
         assert result["status"] == status
+
+
+def test_resumed_run_skips_finished_trials_and_writes_trial_outputs_to_results(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(
+        "pyathena_bench.runner.validate_manifest",
+        lambda *args: {"ScratchDatabase": "scratch", "Bucket": "out", "Results": "s3://res/p/"},
+    )
+    monkeypatch.setattr("pyathena_bench.runner.validate_inputs", lambda *args: None)
+    monkeypatch.setattr("pyathena_bench.runner.environment", lambda *args: {})
+    payloads = []
+
+    def succeed(payload, events, settings):
+        payloads.append(payload)
+        return {"status": "ok"}
+
+    monkeypatch.setattr("pyathena_bench.runner.supervise", succeed)
+    manifest = {
+        "run_id": "a" * 32,
+        "scales": {"small": {"table": "input", "rows": 10}},
+        "fixtures": {},
+    }
+    case = Case("cursor")
+    earlier = tmp_path / "attempt-1"
+    earlier.mkdir()
+    records = [
+        {"scale": "small", "case_id": case.id, "repetition": 0, "status": "ok"},
+        {"scale": "small", "case_id": case.id, "repetition": 1, "status": "interrupted"},
+    ]
+    (earlier / "trials.jsonl").write_text("".join(json.dumps(r) + "\n" for r in records))
+    settings = replace(Settings(), warmups=0, repetitions=3)
+    assert run(
+        settings, manifest, [case], ["small"], tmp_path / "attempt-2", completed_trials([earlier])
+    )
+    assert [p["repetition"] for p in payloads] == [1, 2]
+    assert all(p["output"].startswith(f"s3://res/p/runs/{'a' * 32}/trials/") for p in payloads)

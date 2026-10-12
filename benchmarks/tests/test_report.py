@@ -109,3 +109,35 @@ class TestReport:
         assert "Client result (s)" in markdown
         assert "Init (s)" in markdown
         assert "RSS increase (B)" in markdown
+
+
+def test_report_merges_attempts_and_drops_superseded_failures(tmp_path):
+    def trial(repetition, status="ok"):
+        return {
+            "trial": f"t{repetition}-{status}",
+            "case_id": "case",
+            "scale": "small",
+            "repetition": repetition,
+            "warmup": False,
+            "status": status,
+            "queries": [{"total_seconds": 1}],
+            "successful_queries_per_second": 1,
+            "rss_peak_bytes": 1,
+            "max_threads": 1,
+        }
+
+    first = tmp_path / "attempt-1"
+    second = tmp_path / "attempt-2"
+    first.mkdir()
+    second.mkdir()
+    (first / "trials.jsonl").write_text(
+        json.dumps(trial(0)) + "\n" + json.dumps(trial(1, "interrupted")) + "\n"
+    )
+    # The interrupted attempt also started a trial that it never recorded.
+    start = {"event": "trial_start", "trial": "lost", "case_id": "case", "scale": "small"}
+    (first / "events.jsonl").write_text(json.dumps({**start, "repetition": 2}) + "\n")
+    (second / "trials.jsonl").write_text(json.dumps(trial(1)) + "\n" + json.dumps(trial(2)) + "\n")
+    report(tmp_path)
+    with (tmp_path / "summary.csv").open() as stream:
+        row = next(csv.DictReader(stream))
+    assert (row["successful_trials"], row["failed_trials"]) == ("3", "0")
