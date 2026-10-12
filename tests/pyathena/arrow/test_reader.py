@@ -182,6 +182,7 @@ class _RecordingFile:
         self._short = short
         self._error_at = error_at
         self._gate = gate
+        self.gated_read_started = threading.Event()
         self.reads = []
         self.closed = False
 
@@ -191,6 +192,7 @@ class _RecordingFile:
     def read_at(self, nbytes, offset):
         self.reads.append((offset, nbytes))
         if self._gate is not None and offset > 0:
+            self.gated_read_started.set()
             assert self._gate.wait(EVENT_TIMEOUT)
         if offset == self._error_at:
             raise OSError("read failed")
@@ -268,16 +270,19 @@ class TestReadAheadStream:
         gate = threading.Event()
         file = _RecordingFile(bytes(100), gate=gate)
         stream = ReadAheadStream(file, part_size=10, max_parts=2)
-        assert stream.read(10) == bytes(10)
         closer = threading.Thread(target=stream.close)
-        closer.start()
-        closer.join(0.2)
-        # The reads of the next parts are still blocked, so close() has not returned.
-        assert closer.is_alive()
-        assert not file.closed
-        gate.set()
-        closer.join(EVENT_TIMEOUT)
-        assert not closer.is_alive()
+        try:
+            assert stream.read(10) == bytes(10)
+            assert file.gated_read_started.wait(EVENT_TIMEOUT)
+            closer.start()
+            closer.join(0.2)
+            # A read of a later part is still blocked, so close() has not returned.
+            assert closer.is_alive()
+            assert not file.closed
+        finally:
+            gate.set()
+            if closer.is_alive():
+                closer.join(EVENT_TIMEOUT)
         assert file.closed
 
     def test_csv(self):

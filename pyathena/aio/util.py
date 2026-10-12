@@ -10,11 +10,20 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import logging
+import threading
 from collections.abc import Callable
-from typing import Any
+from typing import Any, Protocol, TypeVar
 
 from pyathena.util import RetryConfig, retry_api_call
+
+
+class _Closable(Protocol):
+    def close(self) -> Any: ...
+
+
+_ClosableT = TypeVar("_ClosableT", bound=_Closable)
 
 
 async def async_retry_api_call(
@@ -58,3 +67,48 @@ async def close_in_thread(close: Callable[[], Any]) -> None:
         close: The blocking function that closes the resource.
     """
     await asyncio.shield(asyncio.get_running_loop().run_in_executor(None, close))
+
+
+async def create_in_thread(
+    factory: Callable[..., _ClosableT], *args: Any, **kwargs: Any
+) -> _ClosableT:
+    """Run a blocking constructor of a closable object in the default executor.
+
+    Like ``asyncio.to_thread()``, the constructor runs in the event loop's
+    default executor with the caller's context. If the caller is cancelled, a
+    construction that has not started is skipped, and an object constructed
+    after the cancellation is closed in the executor: nothing else can close
+    it, and a close by the garbage collector could block the event loop's
+    thread.
+
+    Args:
+        factory: The constructor.
+        *args: Positional arguments for ``factory``.
+        **kwargs: Keyword arguments for ``factory``.
+
+    Returns:
+        The constructed object.
+    """
+    loop = asyncio.get_running_loop()
+    cancelled = threading.Event()
+
+    def construct() -> _ClosableT | None:
+        if cancelled.is_set():
+            return None
+        return factory(*args, **kwargs)
+
+    def close_abandoned(future: asyncio.Future[_ClosableT | None]) -> None:
+        if future.cancelled() or future.exception() is not None:
+            return
+        abandoned = future.result()
+        if abandoned is not None:
+            loop.run_in_executor(None, abandoned.close)
+
+    future = loop.run_in_executor(None, contextvars.copy_context().run, construct)
+    try:
+        result = await asyncio.shield(future)
+    except asyncio.CancelledError:
+        cancelled.set()
+        future.add_done_callback(close_abandoned)
+        raise
+    return result  # type: ignore[return-value]
