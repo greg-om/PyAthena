@@ -93,7 +93,7 @@ There is no inbound security-group rule or SSH key; use Session Manager.
 Internet access permits package installation and calls to AWS APIs without a NAT gateway.
 
 The defaults are Amazon Linux 2023 x86_64, `r7i.2xlarge` (8 vCPUs, 64 GiB), and an encrypted 100 GiB gp3 root volume.
-Set `Architecture=arm64` with an `r7g` or `r8g` instance type to run on AWS Graviton; the template rejects an instance type that does not match the architecture.
+Set `Architecture=arm64` with an `r7g`, `r8g`, or `c8gn.2xlarge` instance type to run on AWS Graviton; the template rejects an instance type that does not match the architecture.
 Measurements depend on the CPU architecture; `environment.json` records it, and runs on different architectures are not directly comparable.
 Instance size and disk size are parameters, so a later run can deliberately test another memory budget.
 The hosts are Spot Instances of one instance type by default; `Purchase=on-demand` launches On-Demand Instances of that type instead.
@@ -237,6 +237,16 @@ uv run --no-sync python -m pyathena_bench prepare \
 uv run --no-sync python -m pyathena_bench run \
   --manifest results/input-filesystem.json --out results/filesystem-large \
   --suite filesystem --scale large
+```
+
+The transfers are bounded by the host's sustained network bandwidth: 3.75 Gbps on `r7g.2xlarge` and 25 Gbps on `c8gn.2xlarge`, both with 8 vCPUs, so that the default executor of an event loop has 12 threads on either.
+`c8gn.2xlarge` has 16 GiB of memory, in which the 6 GiB read, holding about twice the object, leaves no margin below the default RSS limit; on it, select reads and writes up to large, where copies are unsupported, and writes and copies at xlarge:
+
+```bash
+uv run --no-sync python -m pyathena_bench jobs \
+  --suite filesystem --scale small medium large --transport read write > results/jobs-filesystem.json
+uv run --no-sync python -m pyathena_bench jobs \
+  --suite filesystem --scale xlarge --transport write copy > results/jobs-filesystem-xlarge.json
 ```
 
 `jobs` reads the scales of the filesystem suite from `[filesystem] sizes`; a `jobs` command that also selects another suite accepts only scale names defined in both tables, so expand the filesystem suite in its own command when its scales differ and combine the job files with `queue --jobs`.
