@@ -37,6 +37,10 @@ def client(session_: Any, service: str) -> Any:
     )
 
 
+class IncompleteStackError(ValueError):
+    """The stack has no complete outputs yet, for example while it is being created."""
+
+
 def split_location(location: str) -> tuple[str, str]:
     """Split an ``s3://bucket/prefix/`` location.
 
@@ -73,7 +77,7 @@ def stack_resources(session_: Any, stack: str) -> dict[str, str]:
         "Results",
     }
     if not required <= result.keys():
-        raise ValueError("Stack outputs are incomplete")
+        raise IncompleteStackError("Stack outputs are incomplete")
     if (
         result["SourceBucket"] == result["Bucket"]
         or result["ScratchDatabase"] == result["SourceDatabase"]

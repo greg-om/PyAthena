@@ -13,10 +13,13 @@ import argparse
 import json
 import logging
 import sys
+import time
 from dataclasses import asdict, replace
 from pathlib import Path
+from typing import Any
 
 from pyathena_bench.aws import (
+    IncompleteStackError,
     cleanup,
     client,
     preflight,
@@ -150,6 +153,31 @@ def parser() -> argparse.ArgumentParser:
     return root
 
 
+def wait_for_stack(
+    session_: Any, stack: str, wait: bool, poll_seconds: float = 30.0
+) -> dict[str, str]:
+    """Read the stack's resources, waiting for its outputs if requested.
+
+    A host's worker starts during stack creation, before the outputs exist.
+
+    Args:
+        session_: Boto3 session.
+        stack: Stack name or ID.
+        wait: Whether to wait while the outputs are incomplete.
+        poll_seconds: Seconds between attempts.
+
+    Returns:
+        The stack resources.
+    """
+    while True:
+        try:
+            return stack_resources(session_, stack)
+        except IncompleteStackError:
+            if not wait:
+                raise
+        time.sleep(poll_seconds)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     if args.command == "report":
@@ -193,7 +221,8 @@ def main(argv: list[str] | None = None) -> int:
             cleanup(settings, manifest, args.manifest, trials_only=args.trials_only)
     elif args.command in {"queue", "worker", "status"}:
         session_ = session(settings)
-        bucket, base = split_location(stack_resources(session_, args.stack)["Results"])
+        resources = wait_for_stack(session_, args.stack, getattr(args, "wait", False))
+        bucket, base = split_location(resources["Results"])
         queue = Queue(client(session_, "s3"), bucket, args.name, base)
         if args.command == "queue":
             validate_manifest(settings, read_json(args.manifest))
@@ -293,6 +322,9 @@ def main(argv: list[str] | None = None) -> int:
             success = run(
                 settings, manifest, cases, scales, args.out, completed_trials(args.resume)
             )
+            if args.resume and not (args.out / "trials.jsonl").exists():
+                # Earlier attempts recorded every trial; the job's report merges them.
+                return 0 if success else 1
             report(args.out)
             return 0 if success else 1
     return 0

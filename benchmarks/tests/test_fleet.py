@@ -18,11 +18,13 @@ from types import SimpleNamespace
 
 import pytest
 from botocore.exceptions import ClientError
-from pyathena_bench.__main__ import main
+from pyathena_bench.__main__ import main, wait_for_stack
+from pyathena_bench.aws import IncompleteStackError
 from pyathena_bench.config import Settings
 from pyathena_bench.fleet import (
     Filters,
     JobWatch,
+    Lease,
     Queue,
     SpotInterruptionError,
     expand_jobs,
@@ -111,6 +113,15 @@ def job(job_id, heavy=False, api_weight=1):
 
 def no_queries(ids):
     return []
+
+
+def live_slots(queue):
+    """Return the API slots that a worker holds; released slots stay as objects."""
+    return [
+        name
+        for name in queue.names("slots")
+        if not queue.read_lease(queue.key("slots", name)).takeable(time.time())
+    ]
 
 
 class TestExpandJobs:
@@ -264,7 +275,7 @@ class TestQueue:
         assert sorted(runs) == ["heavy", "light"]
         assert [path.parent.name for path in settled] == ["heavy"]
         assert queue.key("results", "light", "attempt-1", "summary.csv") in s3.objects
-        assert not queue.names("slots")
+        assert not live_slots(queue)
         summary = status(queue)
         assert summary["done"] == 2
         assert list(summary["failed"]) == ["heavy"]
@@ -489,7 +500,7 @@ class TestQueueSafety:
         s3.put_object = flaky
         with pytest.raises(ClientError):
             queue.acquire_slots(3, 2, {"host": "h"}, 600)
-        assert not queue.names("slots")
+        assert not live_slots(queue)
 
     def test_overlapping_submissions_cannot_share_a_name(self, tmp_path):
         s3, queue = queue_with([job("a")], tmp_path)
@@ -654,6 +665,7 @@ class TestLeases:
             "attempt": 1,
             "state": "running",
             "expired": False,
+            "stale": False,
         }
 
     def test_an_expired_slot_returns_to_the_fleet(self, tmp_path):
@@ -669,7 +681,7 @@ class TestLeases:
             settle=no_queries,
         )
         assert ran == ["heavy"]
-        assert not queue.names("slots")
+        assert not live_slots(queue)
 
     def test_watch_renews_leases_and_uploads_progress(self, tmp_path):
         _, queue = queue_with([], tmp_path)
@@ -733,7 +745,7 @@ class TestInterruption:
         assert raised.value.ran == []
         claim = queue.read_lease(queue.key("claims", "heavy"))
         assert claim.body["state"] == "interrupted"
-        assert not queue.names("slots")
+        assert not live_slots(queue)
         assert queue.key("results", "heavy", "attempt-1", "trials.jsonl") in s3.objects
         assert not queue.names("done")
 
@@ -858,3 +870,113 @@ def test_run_job_resumes_earlier_attempts_and_interrupts_with_sigint(tmp_path, m
     assert process.signals == [signal.SIGINT]
     assert process.command[-4:] == ["--suite", "single", "--resume", str(earlier)]
     assert (tmp_path / "logs" / "a-attempt-2.log").exists()
+
+
+class TestLeaseOwnership:
+    def test_releasing_an_expired_slot_keeps_another_workers_takeover(self, tmp_path):
+        _, queue = queue_with([], tmp_path)
+        key = queue.key("slots", "0")
+        mine = queue.acquire(key, {"host": "slow"}, -1)
+        theirs = queue.acquire(key, {"host": "other"}, 600)
+        assert not queue.release_lease(mine)
+        assert queue.read_lease(key).body == theirs.body
+        assert live_slots(queue) == ["0"]
+
+    def test_interruption_is_marked_after_a_concurrent_renewal(self, tmp_path):
+        _, queue = queue_with([], tmp_path)
+        key = queue.key("claims", "a")
+        lease = queue.acquire(key, {"host": "h", "job": "a"}, 600)
+        stale = Lease(key, dict(lease.body), lease.etag)
+        assert queue.renew(lease, 600)
+        assert queue.mark_interrupted(stale)
+        assert queue.read_lease(key).body["state"] == "interrupted"
+
+    def test_a_lost_claim_stops_the_attempt_without_recording_the_job(self, tmp_path):
+        s3, queue = queue_with([job("a")], tmp_path)
+        stopped = []
+
+        def runner(item, workdir, out, resume, stop):
+            # Another worker took over the claim, for example after this host stalled.
+            s3.put_object(
+                Key=queue.key("claims", "a"),
+                Body=json.dumps(
+                    {"host": "other", "attempt": 2, "state": "running", "renewed": time.time(),
+                     "expires": time.time() + 600}
+                ).encode(),
+            )  # fmt: skip
+            stopped.append(stop.wait(5))
+            return 130
+
+        ran = work(
+            queue,
+            tmp_path / "w",
+            api_slots=1,
+            poll_seconds=0,
+            runner=runner,
+            settle=no_queries,
+            renew_seconds=0.01,
+        )
+        assert stopped == [True]
+        assert ran == []
+        assert not queue.names("done")
+        assert queue.read_lease(queue.key("claims", "a")).body["host"] == "other"
+
+    def test_a_stale_claim_keeps_the_worker_until_it_can_take_it_over(self, tmp_path):
+        s3, queue = queue_with([job("a")], tmp_path)
+        at = time.time()
+        # The worker renewed its 200-second lease long ago and has probably died.
+        s3.put_object(
+            Key=queue.key("claims", "a"),
+            Body=json.dumps(
+                {"host": "dead", "attempt": 1, "state": "running", "renewed": at - 199.5,
+                 "expires": at + 0.5}
+            ).encode(),
+        )  # fmt: skip
+        assert status(queue)["running"]["a"]["stale"]
+        runs = []
+        ran = work(
+            queue,
+            tmp_path / "w",
+            api_slots=1,
+            poll_seconds=0.2,
+            runner=lambda item, workdir, out, *a: runs.append(out.name) or 0,
+            settle=no_queries,
+        )
+        assert ran == ["a"]
+        assert runs == ["attempt-2"]
+
+
+def test_worker_waits_for_stack_outputs(monkeypatch):
+    calls = []
+
+    def resources(session_, stack):
+        calls.append(stack)
+        if len(calls) < 3:
+            raise IncompleteStackError("Stack outputs are incomplete")
+        return {"Results": "s3://bucket/"}
+
+    monkeypatch.setattr("pyathena_bench.__main__.stack_resources", resources)
+    monkeypatch.setattr("pyathena_bench.__main__.time.sleep", lambda seconds: None)
+    assert wait_for_stack(None, "stack", wait=True) == {"Results": "s3://bucket/"}
+    assert len(calls) == 3
+    calls.clear()
+    with pytest.raises(IncompleteStackError):
+        wait_for_stack(None, "stack", wait=False)
+
+
+def test_a_resumed_run_without_remaining_trials_succeeds(tmp_path, monkeypatch):
+    config = tmp_path / "config.toml"
+    config.write_text("[scales]\nsmall = 10000\n")
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text("{}")
+    monkeypatch.setattr("pyathena_bench.__main__.run", lambda *args: True)
+
+    def report(directory):
+        raise ValueError("No trials to report")
+
+    monkeypatch.setattr("pyathena_bench.__main__.report", report)
+    argv = ["--config", str(config), "run", "--suite", "single", "--scale", "small"]
+    paths = ["--manifest", str(manifest), "--out", str(tmp_path / "attempt-2")]
+    assert main([*argv, *paths, "--resume", str(tmp_path / "attempt-1")]) == 0
+    with pytest.raises(ValueError, match="No trials"):
+        main([*argv, "--manifest", str(manifest), "--out", str(tmp_path / "attempt-3")])

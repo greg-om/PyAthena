@@ -154,7 +154,9 @@ def test_results_location_is_scoped_to_the_stack_prefix():
                 "StringLike": {"s3:prefix": {"Fn::Sub": "${ResultsPrefix}/${AWS::StackName}/*"}}
             }
         else:
-            assert statement["Action"] == "s3:GetBucketLocation"
+            # Neither action supports the s3:prefix condition key.
+            assert statement["Action"] == ["s3:GetBucketLocation", "s3:ListBucketMultipartUploads"]
+            assert "Condition" not in statement
     condition, results_bucket, scratch = template["Outputs"]["Results"]["Value"]["Fn::If"]
     assert condition == "HasResultsBucket"
     assert results_bucket == {
