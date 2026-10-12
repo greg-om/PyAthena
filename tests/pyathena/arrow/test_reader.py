@@ -42,11 +42,13 @@ class _RecordingFileSystem(AbstractFileSystem):
         super().__init__()
         self.block_size = block_size
         self.fetched = []
+        self.opened = []
 
     def size(self, path):
         return os.path.getsize(path)
 
     def _open(self, path, mode="rb", block_size=None, cache_type="bytes", **kwargs):
+        self.opened.append((block_size, cache_type))
         return _RecordingFile(
             self, path, block_size=block_size or self.block_size, cache_type=cache_type, **kwargs
         )
@@ -156,6 +158,16 @@ class TestParquetChunkReader:
         with pytest.raises(OSError, match="cannot open"):
             next(ParquetChunkReader(LocalFileSystem(), paths, 2))
         assert opened == paths[:1]
+
+    def test_prefetched_file(self, paths, monkeypatch):
+        """A file read whole is opened without a cache, in blocks of PREFETCH_PART_SIZE."""
+        monkeypatch.setattr(ParquetChunkReader, "PREFETCH_PART_SIZE", 64)
+        fs = _RecordingFileSystem(block_size=32 * 2**10)
+        with ParquetChunkReader(fs, paths[2:], 10) as reader:
+            assert next(reader).num_rows == 7
+        assert fs.opened == [(64, "none")]
+        # One read of exactly the file, which PyAthena's filesystem splits into blocks.
+        assert fs.fetched == [(0, os.path.getsize(paths[2]))]
 
     @pytest.mark.parametrize("cache_type", [None, "bytes"], ids=["default", "bytes"])
     def test_streamed_file_row_groups(self, tmp_path, monkeypatch, cache_type):

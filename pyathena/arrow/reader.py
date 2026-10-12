@@ -32,9 +32,11 @@ class ParquetChunkReader(abc.Iterator):  # type: ignore[type-arg]
     the last, which has the remaining rows; rows carry over from one row group and
     file to the next.
 
-    A file of at most ``MAX_PREFETCH_SIZE`` bytes is read whole with one
-    ``cat_file()`` call, and the next file is read in a background thread while
-    the current one is decoded. A larger file is opened with ``open()``, by default
+    A file of at most ``MAX_PREFETCH_SIZE`` bytes is read whole, ahead of
+    decoding: it is opened without a cache and with a block size of
+    ``PREFETCH_PART_SIZE`` bytes, in which PyAthena's filesystem splits the read
+    into parallel range requests, and the next file is read in a background
+    thread while the current one is decoded. A larger file is opened with ``open()``, by default
     without the filesystem's read-ahead cache, and the column chunks of each row
     group are pre-buffered: pyarrow reads them in large coalesced ranges, which
     PyAthena's filesystem splits into parallel requests, and holds them until the
@@ -52,6 +54,8 @@ class ParquetChunkReader(abc.Iterator):  # type: ignore[type-arg]
 
     #: The largest file that is read whole, ahead of decoding.
     MAX_PREFETCH_SIZE: int = 32 * 2**20
+    #: The block size with which a file read whole is opened.
+    PREFETCH_PART_SIZE: int = 4 * 2**20
 
     def __init__(
         self,
@@ -217,5 +221,8 @@ class ParquetChunkReader(abc.Iterator):  # type: ignore[type-arg]
         import pyarrow as pa
 
         if self._fs.size(path) <= self.MAX_PREFETCH_SIZE:
-            return pa.BufferReader(self._fs.cat_file(path))
+            with self._fs.open(
+                path, "rb", block_size=self.PREFETCH_PART_SIZE, cache_type="none"
+            ) as f:
+                return pa.BufferReader(f.read())
         return self._fs.open(path, "rb", cache_type=self._cache_type)
