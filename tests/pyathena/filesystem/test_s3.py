@@ -3395,6 +3395,7 @@ class TestS3FileSystem:
         fs, _ = self._make_object_fs(data)
 
         with fs.open("s3://bucket/key", "rb", cache_type=cache_type, block_size=16) as f:
+            assert f.cache.name == cache_type
             assert f.read(10) == data[:10]
             assert f.read(40) == data[10:50]
             f.seek(5)

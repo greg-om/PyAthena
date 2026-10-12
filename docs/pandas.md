@@ -597,8 +597,8 @@ df = cursor.execute("SELECT * FROM many_rows").as_pandas()
 
 Without `block_size` or `cache_type`, a CSV result file is read in 32 MiB blocks with the `"background"` cache, which reads the next block while pandas parses the current one and keeps two blocks.
 With either option, the file is read with the given values and the filesystem's defaults for the other, `"bytes"` and 5 MiB blocks.
-Without `cache_type`, a Parquet file larger than 32 MiB of an UNLOAD result read in chunks of `chunksize` rows is read with the `"none"` cache, which requests only the ranges that pyarrow reads; a smaller file is read at once.
-With `storage_options` given to `execute()`, the CSV result file is opened through fsspec with those options instead, and `block_size` and `cache_type` do not apply to it.
+When an UNLOAD result is read in chunks of `chunksize` rows, a Parquet file of up to 32 MiB is read at once, and a larger one is read with the given `cache_type`, or without it with the `"none"` cache, which requests only the ranges that pyarrow reads.
+With `storage_options` given to `execute()`, or `filesystem` for an UNLOAD result, pandas reads the result files with those options instead of these.
 
 ### Unload options
 
