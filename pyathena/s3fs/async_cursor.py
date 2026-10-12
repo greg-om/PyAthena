@@ -217,7 +217,8 @@ class AsyncS3FSCursor(AsyncCursor):
                 :class:`~pyathena.options.ExecuteOptions` instance. Individual
                 keyword arguments take precedence over ``options`` fields.
             **kwargs: Supported S3FS result-set overrides. Unknown names raise TypeError.
-                ``block_size`` sets the read block size for this query, and
+                ``block_size`` sets the read block size for this query (without it, the
+                CSV result file is read in 32 MiB blocks with fsspec's background cache), and
                 ``csv_reader`` overrides the cursor's value.
                 ``filesystem_class`` overrides the filesystem used to read results.
 

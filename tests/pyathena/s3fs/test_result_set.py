@@ -12,6 +12,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from pyathena.error import OperationalError
+from pyathena.filesystem.s3 import S3FileSystem
 from pyathena.model import AthenaQueryExecution
 from pyathena.s3fs.converter import DefaultS3FSTypeConverter
 from pyathena.s3fs.reader import AthenaCSVReader, EmptyStringAsNullCSVReader
@@ -35,8 +37,8 @@ class _TupleCSVReader:
         self._reader.close()
 
 
-def _result_set(data, csv_reader, suffix=".csv", column_types=None, type_hints=None):
-    stream = BytesIO(data.encode())
+def _result_set(data, csv_reader, suffix=".csv", column_types=None, type_hints=None, stream=None):
+    stream = stream or BytesIO(data.encode())
     filesystem = MagicMock()
     filesystem._open.return_value = stream
     connection = MagicMock()
@@ -74,7 +76,54 @@ def _result_set(data, csv_reader, suffix=".csv", column_types=None, type_hints=N
     return result_set, stream
 
 
+class _FailingCSVReader(_TupleCSVReader):
+    """A reader that fails to read the header row."""
+
+    def __next__(self) -> tuple[str | None, ...]:
+        raise ValueError("unreadable header")
+
+
 class TestAthenaS3FSResultSet:
+    @pytest.mark.parametrize(
+        ("block_size_given", "filesystem", "expected"),
+        [
+            (
+                False,
+                MagicMock(spec=S3FileSystem),
+                {
+                    "block_size": 32 * 2**20,
+                    "cache_type": "background",
+                    "cache_options": {"maxblocks": 2},
+                },
+            ),
+            (True, MagicMock(spec=S3FileSystem), {}),
+            (False, MagicMock(), {}),
+        ],
+        ids=["default", "block_size", "other_filesystem"],
+    )
+    def test_get_csv_open_options(self, block_size_given, filesystem, expected):
+        """PyAthena's filesystem prefetches the CSV result unless block_size is given."""
+        result_set = AthenaS3FSResultSet.__new__(AthenaS3FSResultSet)
+        result_set._block_size_given = block_size_given
+        result_set._fs = filesystem
+        assert result_set._get_csv_open_options() == expected
+
+    def test_reader_closes_at_end_of_results(self):
+        """The file is closed once every row has been read, before close()."""
+        result_set, stream = _result_set("null_col,empty_col,value_col\n,,a\n", None)
+        assert result_set.fetchall() == [(None, None, "a")]
+        assert stream.closed
+        assert result_set.fetchone() is None
+        result_set.close()
+
+    def test_reader_failure_closes_file(self):
+        """A failure to read the header row closes the file."""
+        data = "null_col,empty_col,value_col\n"
+        stream = BytesIO(data.encode())
+        with pytest.raises(OperationalError, match="unreadable header"):
+            _result_set(data, _FailingCSVReader, stream=stream)
+        assert stream.closed
+
     @pytest.mark.parametrize(
         ("csv_reader", "expected_empty"),
         [

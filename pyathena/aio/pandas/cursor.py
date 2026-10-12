@@ -84,8 +84,7 @@ class AioPandasCursor(WithAsyncFetch):
                 it takes precedence over ``auto_optimize_chunksize``.
             block_size: Default block size of the S3 filesystem that reads the results.
             cache_type: Default cache type of the S3 filesystem that reads the results. Without
-                ``block_size`` or ``cache_type``, a CSV result file that ``pandas.read_csv()`` reads
-                in one call, without ``chunksize`` or ``iterator``, is read in 32 MiB blocks with
+                ``block_size`` or ``cache_type``, a CSV result file is read in 32 MiB blocks with
                 fsspec's background cache, which reads the next block while pandas parses the
                 current one.
             s3_max_workers: Maximum number of workers of the S3 filesystem.

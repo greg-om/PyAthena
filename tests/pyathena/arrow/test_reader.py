@@ -8,11 +8,12 @@
 from concurrent.futures import Future
 
 import pyarrow as pa
+import pyarrow.csv as pa_csv
 import pyarrow.parquet as pq
 import pytest
 from fsspec.implementations.local import LocalFileSystem
 
-from pyathena.arrow.reader import ParquetChunkReader
+from pyathena.arrow.reader import ParquetChunkReader, ReadAheadStream
 
 
 class _ImmediateExecutor:
@@ -25,6 +26,9 @@ class _ImmediateExecutor:
         return self
 
     def __exit__(self, *args):
+        pass
+
+    def shutdown(self, wait=True, cancel_futures=False):
         pass
 
     def submit(self, fn, *args, **kwargs):
@@ -166,3 +170,97 @@ class TestParquetChunkReader:
         assert opened
         assert all(f.closed for f in opened)
         assert list(reader) == []
+
+
+class _RecordingFile:
+    """A random-access file over bytes that records its reads."""
+
+    def __init__(self, data, short=False, error_at=None):
+        self._data = data
+        self._short = short
+        self._error_at = error_at
+        self.reads = []
+        self.closed = False
+
+    def size(self):
+        return len(self._data)
+
+    def read_at(self, nbytes, offset):
+        self.reads.append((offset, nbytes))
+        if offset == self._error_at:
+            raise OSError("read failed")
+        return self._data[offset : offset + nbytes - (1 if self._short else 0)]
+
+    def close(self):
+        self.closed = True
+
+
+class TestReadAheadStream:
+    """Tests for reading a random-access file sequentially with parallel range reads."""
+
+    @pytest.mark.parametrize("size", [0, 1, 6, 7, 21, 25])
+    @pytest.mark.parametrize("read_size", [1, 5, 7, 100])
+    def test_read(self, size, read_size):
+        data = bytes(range(256))[:size]
+        file = _RecordingFile(data)
+        stream = ReadAheadStream(file, part_size=7, max_parts=2)
+        chunks = []
+        while chunk := stream.read(read_size):
+            # Every read is full except at the end of the file.
+            assert len(chunk) == read_size or sum(map(len, chunks)) + len(chunk) == size
+            chunks.append(chunk)
+        assert b"".join(chunks) == data
+        assert stream.tell() == size
+        assert sorted(file.reads) == [(o, min(7, size - o)) for o in range(0, size, 7)]
+        stream.close()
+        assert file.closed
+
+    def test_parts_in_flight(self, monkeypatch):
+        """At most max_parts parts are requested ahead of the one being consumed."""
+        monkeypatch.setattr("pyathena.arrow.reader.ThreadPoolExecutor", _ImmediateExecutor)
+        file = _RecordingFile(bytes(100))
+        stream = ReadAheadStream(file, part_size=10, max_parts=3)
+        assert file.reads == []
+        assert stream.read(1) == bytes(1)
+        # Three parts were requested, the first is being consumed, and one more follows.
+        assert file.reads == [(0, 10), (10, 10), (20, 10), (30, 10)]
+        assert stream.read(9) == bytes(9)
+        assert len(file.reads) == 4
+        stream.close()
+
+    def test_short_read(self):
+        stream = ReadAheadStream(_RecordingFile(bytes(20), short=True), part_size=10, max_parts=2)
+        with pytest.raises(OSError, match="Read 9 bytes of a range of 10 bytes"):
+            stream.read(20)
+        stream.close()
+
+    def test_read_error(self):
+        """An error is raised by the read that reaches the failed part."""
+        file = _RecordingFile(bytes(30), error_at=10)
+        stream = ReadAheadStream(file, part_size=10, max_parts=2)
+        assert stream.read(10) == bytes(10)
+        with pytest.raises(OSError, match="read failed"):
+            stream.read(10)
+        stream.close()
+        assert file.closed
+
+    def test_close_before_end(self):
+        """Closing cancels the queued reads and closes the file."""
+        file = _RecordingFile(bytes(1000))
+        stream = ReadAheadStream(file, part_size=10, max_parts=2)
+        assert stream.read(5) == bytes(5)
+        stream.close()
+        assert file.closed
+        assert stream.closed
+        assert len(file.reads) <= 3
+        stream.close()
+
+    def test_csv(self):
+        """pyarrow reads a CSV through the stream with its own block size."""
+        data = b"a,b\n" + b"".join(f"{i},x{i}\n".encode() for i in range(10_000))
+        file = pa.BufferReader(data)
+        read_options = pa_csv.ReadOptions(block_size=4096)
+        with pa.PythonFile(ReadAheadStream(file, 7, 3), mode="r") as source:
+            table = pa_csv.read_csv(source, read_options=read_options)
+        assert table.equals(pa_csv.read_csv(pa.BufferReader(data), read_options=read_options))
+        assert file.closed

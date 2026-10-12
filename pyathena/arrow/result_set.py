@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
+from contextlib import nullcontext
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -12,6 +13,7 @@ from typing import (
 
 from pyathena import OperationalError
 from pyathena.arrow.converter import _to_timestamp
+from pyathena.arrow.reader import ReadAheadStream
 from pyathena.arrow.util import to_column_info
 from pyathena.converter import Converter, _to_default
 from pyathena.model import AthenaQueryExecution
@@ -64,6 +66,10 @@ class AthenaArrowResultSet(AthenaResultSet):
     """
 
     DEFAULT_BLOCK_SIZE = 1024 * 1024 * 128
+    #: Bytes requested by one range read of a CSV result file; see _open_csv().
+    CSV_READ_PART_SIZE: ClassVar[int] = 8 * 2**20
+    #: The most range reads of a CSV result file in flight at once.
+    CSV_READ_PARTS: ClassVar[int] = 16
 
     _timestamp_parsers: ClassVar[list[str]] = [
         "%Y-%m-%d",
@@ -228,6 +234,26 @@ class AthenaArrowResultSet(AthenaResultSet):
         self._rownumber += 1
         return self._rows.popleft()
 
+    def _open_csv(self, location: str) -> Any:
+        """Open the CSV result file for ``pyarrow.csv.read_csv()``.
+
+        The file is read in parts of ``CSV_READ_PART_SIZE`` bytes, with up to
+        ``CSV_READ_PARTS`` parts read ahead in parallel through the pyarrow S3
+        filesystem; see :class:`~pyathena.arrow.reader.ReadAheadStream`.
+
+        Args:
+            location: The bucket and key of the file.
+
+        Returns:
+            The file as a pyarrow input stream, which closes the file when closed.
+        """
+        import pyarrow as pa
+
+        stream = ReadAheadStream(
+            self._fs.open_input_file(location), self.CSV_READ_PART_SIZE, self.CSV_READ_PARTS
+        )
+        return pa.PythonFile(stream, mode="r")
+
     def _read_csv(self) -> Table:
         """Read the CSV result file, or the GetQueryResults rows as one without it.
 
@@ -317,20 +343,25 @@ class AthenaArrowResultSet(AthenaResultSet):
             return pa.Table.from_pydict({})
 
         try:
-            table = csv.read_csv(
-                self._fs.open_input_stream(location) if data is None else pa.BufferReader(data),
-                read_options=read_opts,
-                parse_options=parse_opts,
-                convert_options=csv.ConvertOptions(
-                    strings_can_be_null=bool(binary_columns),
-                    quoted_strings_can_be_null=False,
-                    timestamp_parsers=self.timestamp_parsers,
-                    column_types={
-                        **column_types,
-                        **{column_names[i]: pa.string() for i in timestamp_types},
-                    },
-                ),
-            )
+            with (
+                self._open_csv(location)
+                if data is None
+                else nullcontext(pa.BufferReader(data)) as source
+            ):
+                table = csv.read_csv(
+                    source,
+                    read_options=read_opts,
+                    parse_options=parse_opts,
+                    convert_options=csv.ConvertOptions(
+                        strings_can_be_null=bool(binary_columns),
+                        quoted_strings_can_be_null=False,
+                        timestamp_parsers=self.timestamp_parsers,
+                        column_types={
+                            **column_types,
+                            **{column_names[i]: pa.string() for i in timestamp_types},
+                        },
+                    ),
+                )
             for index, type_ in timestamp_types.items():
                 table = table.set_column(
                     index,
