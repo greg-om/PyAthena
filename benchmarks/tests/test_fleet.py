@@ -1150,13 +1150,16 @@ class TestWork:
         failing = threading.Event()
         failing.set()
 
-        def unavailable(lease, seconds, **changes):
-            # S3 is unreachable during the first attempt, until its claim expires locally.
+        def accepted_but_lost(lease, seconds, **changes):
+            # During the first attempt, S3 applies each renewal, but its response
+            # is lost, so the claim stays live in S3 while it expires locally.
             if failing.is_set() and changes.get("state") is None:
-                raise ClientError({"Error": {"Code": "SlowDown"}}, "PutObject")
+                at = time.time()
+                queue.put(lease.key, {**lease.body, "renewed": at, "expires": at + 600})
+                raise ClientError({"Error": {"Code": "RequestTimeout"}}, "PutObject")
             return renew(lease, seconds, **changes)
 
-        queue.renew = unavailable
+        queue.renew = accepted_but_lost
         calls = []
 
         def runner(item, workdir, out, resume, stop, checkpoint):
