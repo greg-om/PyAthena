@@ -297,7 +297,7 @@ def _read_parquet_chunks(tmp_path, tables, chunksize, write_statistics=True, **k
     result_set._chunksize = chunksize
     result_set._kwargs = kwargs
     result_set._unload_location = None
-    result_set._parquet_null_columns = set()
+    result_set._parquet_null_dtypes = {}
     with patch.object(AthenaPandasResultSet, "_read_data_manifest", return_value=paths):
         assert result_set._read_parquet_footers()[0] == sum(t.num_rows for t in tables)
     chunks = list(result_set._iter_parquet_chunks())

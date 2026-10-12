@@ -180,6 +180,8 @@ class ParquetChunkReader(abc.Iterator):  # type: ignore[type-arg]
         """
         if not self._paths:
             return
+        # One worker opens the one file read ahead: at most the file being decoded and
+        # the next one are held, which bounds memory to two files.
         with ThreadPoolExecutor(max_workers=1) as executor:
             ahead: Future[Any] | None = executor.submit(self._open, self._paths[0])
             try:

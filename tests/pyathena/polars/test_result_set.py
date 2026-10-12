@@ -99,7 +99,7 @@ class TestAthenaPolarsResultSet:
                 new_callable=PropertyMock,
                 return_value={},
             ),
-            patch("pyathena.filesystem.s3.S3FileSystem", lambda **_: LocalFileSystem()),
+            patch("pyathena.polars.result_set.S3FileSystem", lambda **_: LocalFileSystem()),
             patch("polars.scan_parquet", wraps=pl.scan_parquet) as scan_parquet,
             pytest.raises(OperationalError) as error,
         ):
