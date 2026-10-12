@@ -22,7 +22,9 @@ from pyathena_bench.aws import (
     preflight,
     prepare,
     prepare_fixtures,
+    run_locations,
     session,
+    split_location,
     stack_resources,
     validate_manifest,
 )
@@ -32,15 +34,17 @@ from pyathena_bench.fleet import (
     API_FAMILIES,
     Filters,
     Queue,
+    SpotInterruptionError,
     expand_jobs,
     merge_jobs,
     retire_host,
     status,
     submit,
+    suspend_rebalance,
     work,
 )
 from pyathena_bench.report import report
-from pyathena_bench.runner import run
+from pyathena_bench.runner import completed_trials, run, s3_checkpoint
 
 
 def parser() -> argparse.ArgumentParser:
@@ -92,6 +96,18 @@ def parser() -> argparse.ArgumentParser:
         if name == "run":
             command.add_argument("--manifest", type=Path, required=True)
             command.add_argument("--out", type=Path, required=True)
+            command.add_argument(
+                "--resume",
+                type=Path,
+                nargs="+",
+                default=[],
+                help="Output directories of earlier attempts whose finished trials are skipped",
+            )
+            command.add_argument(
+                "--checkpoint",
+                help="s3:// prefix below which each trial's start and record are written "
+                "between trials; set by fleet workers, whose job summary merges the attempts",
+            )
     enqueue = commands.add_parser(
         "queue", help="Publish jobs and a prepared manifest for fleet workers"
     )
@@ -102,7 +118,11 @@ def parser() -> argparse.ArgumentParser:
     )
     enqueue.add_argument("--manifest", type=Path, required=True)
     consume = commands.add_parser("worker", help="Run queued jobs on this host until none remain")
-    consume.add_argument("--stack", required=True)
+    location = consume.add_mutually_exclusive_group(required=True)
+    location.add_argument("--stack", help="Stack whose Results output holds the queue")
+    location.add_argument(
+        "--results", help="The stack's results location, which hosts know from their user data"
+    )
     consume.add_argument("--name", required=True)
     consume.add_argument(
         "--api-slots",
@@ -114,7 +134,19 @@ def parser() -> argparse.ArgumentParser:
     consume.add_argument(
         "--terminate-host",
         action="store_true",
-        help="Terminate this host through its Auto Scaling group after every job is claimed",
+        help="Suspend zone rebalancing at start, and terminate this host through its Auto "
+        "Scaling group when no job is left to claim",
+    )
+    consume.add_argument(
+        "--wait",
+        action="store_true",
+        help="Wait for the queue to be published instead of failing",
+    )
+    consume.add_argument(
+        "--lease-seconds",
+        type=float,
+        default=600.0,
+        help="Seconds after which a dead worker's claim and API slots return to the fleet",
     )
     progress = commands.add_parser("status", help="Summarize a fleet queue")
     progress.add_argument("--stack", required=True)
@@ -164,10 +196,13 @@ def main(argv: list[str] | None = None) -> int:
                         if args.trials_only
                         else f"b_{manifest['run_id']}_*"
                     ),
-                    "s3_prefix": f"s3://{resources['Bucket']}/runs/{manifest['run_id']}/"
-                    + ("trials/" if args.trials_only else ""),
+                    "s3_prefixes": [
+                        root + ("trials/" if args.trials_only else "")
+                        for root in sorted(
+                            set(run_locations(resources, manifest["run_id"]).values())
+                        )
+                    ],
                     "preserve_inputs_and_fixtures": args.trials_only,
-                    "query_output_prefix": f"s3://{resources['Bucket']}/runs/{manifest['run_id']}/",
                 },
                 indent=2,
             )
@@ -177,20 +212,39 @@ def main(argv: list[str] | None = None) -> int:
             cleanup(settings, manifest, args.manifest, trials_only=args.trials_only)
     elif args.command in {"queue", "worker", "status"}:
         session_ = session(settings)
-        queue = Queue(
-            client(session_, "s3"), stack_resources(session_, args.stack)["Bucket"], args.name
-        )
+        results = getattr(args, "results", None) or stack_resources(session_, args.stack)["Results"]
+        bucket, base = split_location(results)
+        queue = Queue(client(session_, "s3"), bucket, args.name, base)
         if args.command == "queue":
             validate_manifest(settings, read_json(args.manifest))
             submit(queue, merge_jobs(read_json(p) for p in args.jobs), args.config, args.manifest)
         elif args.command == "worker":
             if args.api_slots < 1:
                 raise ValueError("--api-slots must be positive")
-            ran = work(queue, args.workdir or Path("results/fleet") / args.name, args.api_slots)
+            if args.lease_seconds < 300:
+                raise ValueError("--lease-seconds must be at least 300")
+            autoscaling = client(session_, "autoscaling")
+            if args.terminate_host:
+                suspend_rebalance(autoscaling)
+            try:
+                ran = work(
+                    queue,
+                    args.workdir or Path("results/fleet") / args.name,
+                    args.api_slots,
+                    lease_seconds=args.lease_seconds,
+                    wait=args.wait,
+                )
+            except SpotInterruptionError as interrupted:
+                # The host is being reclaimed, and its group launches a replacement; after
+                # a rehearsed notice, the operator terminates the host the same way.
+                sys.stdout.write(
+                    json.dumps({"ran": interrupted.ran, "interrupted": True}, indent=2) + "\n"
+                )
+                return 0
             sys.stdout.write(json.dumps({"ran": ran}, indent=2) + "\n")
             if args.terminate_host:
                 # Only a normal return retires the host; an error keeps it for inspection.
-                retire_host(queue, client(session_, "autoscaling"), ran)
+                retire_host(queue, autoscaling, ran)
         else:
             sys.stdout.write(json.dumps(status(queue), indent=2) + "\n")
     else:
@@ -248,8 +302,23 @@ def main(argv: list[str] | None = None) -> int:
             manifest = read_json(args.manifest)
             if args.suite == "init":
                 prepare_fixtures(settings, manifest, args.manifest, scales, args.shape)
-            success = run(settings, manifest, cases, scales, args.out)
-            report(args.out)
+            checkpoint = (
+                s3_checkpoint(client(session(settings), "s3"), args.checkpoint)
+                if args.checkpoint
+                else None
+            )
+            success = run(
+                settings,
+                manifest,
+                cases,
+                scales,
+                args.out,
+                completed_trials(args.resume),
+                checkpoint,
+            )
+            if not checkpoint:
+                # A fleet job's summary merges its attempts instead.
+                report(args.out)
             return 0 if success else 1
     return 0
 

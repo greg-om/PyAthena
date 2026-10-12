@@ -26,9 +26,14 @@ Parameters:
     Description: CPU architecture of the benchmark hosts; it must match the instance type.
   Purchase:
     Type: String
-    Default: on-demand
+    Default: spot
     AllowedValues: [on-demand, spot]
     Description: Purchase option of the benchmark hosts; every host uses the same instance type either way.
+  Zones:
+    Type: Number
+    Default: 4
+    AllowedValues: [3, 4]
+    Description: Availability Zones to spread the hosts over, the first ones that Fn::GetAZs returns; more zones widen Spot capacity.
   InstanceType:
     Type: String
     Default: r7i.2xlarge
@@ -74,6 +79,25 @@ Parameters:
     Type: String
     Default: pypi_file_downloads
     AllowedPattern: '[a-z][a-z0-9_]*'
+  ResultsBucket:
+    Type: String
+    Default: ''
+    AllowedPattern: '([a-z0-9][a-z0-9.-]+[a-z0-9])?'
+    Description: Existing bucket for queue state, reports, and trial outputs under ResultsPrefix/<stack name>/; empty uses the scratch bucket.
+  ResultsPrefix:
+    Type: String
+    Default: pyathena-benchmark
+    AllowedPattern: '[a-zA-Z0-9_-]+(/[a-zA-Z0-9_-]+)*'
+  QueueName:
+    Type: String
+    Default: ''
+    AllowedPattern: '[a-zA-Z0-9._-]*'
+    Description: Fleet queue that every host's worker consumes once it is published; empty starts no worker.
+  ApiSlots:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    Description: Fleet-wide limit of simultaneous GetQueryResults paging queries for the started workers.
 
 Rules:
   X86InstanceType:
@@ -90,6 +114,8 @@ Rules:
 Conditions:
   IsArm64: !Equals [!Ref Architecture, arm64]
   IsSpot: !Equals [!Ref Purchase, spot]
+  UseFourZones: !Equals [!Ref Zones, 4]
+  HasResultsBucket: !Not [!Equals [!Ref ResultsBucket, '']]
 
 Resources:
   Vpc:
@@ -105,7 +131,7 @@ Resources:
     Properties:
       VpcId: !Ref Vpc
       InternetGatewayId: !Ref Gateway
-  # Three Availability Zones give Spot capacity more than one pool.
+  # Several Availability Zones give Spot capacity more than one pool.
   Subnet:
     Type: AWS::EC2::Subnet
     Properties:
@@ -124,6 +150,13 @@ Resources:
       VpcId: !Ref Vpc
       CidrBlock: 10.93.2.0/24
       AvailabilityZone: !Select [2, !GetAZs '']
+  Subnet4:
+    Type: AWS::EC2::Subnet
+    Condition: UseFourZones
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.93.3.0/24
+      AvailabilityZone: !Select [3, !GetAZs '']
   RouteTable:
     Type: AWS::EC2::RouteTable
     Properties:
@@ -149,6 +182,12 @@ Resources:
     Type: AWS::EC2::SubnetRouteTableAssociation
     Properties:
       SubnetId: !Ref Subnet3
+      RouteTableId: !Ref RouteTable
+  RouteAssociation4:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: UseFourZones
+    Properties:
+      SubnetId: !Ref Subnet4
       RouteTableId: !Ref RouteTable
   SecurityGroup:
     Type: AWS::EC2::SecurityGroup
@@ -260,6 +299,22 @@ Resources:
               - Effect: Allow
                 Action: [s3:GetObject, s3:PutObject, s3:DeleteObject, s3:AbortMultipartUpload, s3:ListMultipartUploadParts]
                 Resource: !Sub '${Bucket.Arn}/*'
+              # Queue state, reports, and trial outputs go only below this stack's results prefix.
+              # Listing covers the whole bucket: without s3:ListBucket, reading a missing key
+              # returns 403 instead of 404, which breaks existence checks of fsspec and pyarrow,
+              # and ListBucketMultipartUploads does not support the s3:prefix condition key.
+              - !If
+                - HasResultsBucket
+                - Effect: Allow
+                  Action: [s3:GetBucketLocation, s3:ListBucket, s3:ListBucketMultipartUploads]
+                  Resource: !Sub arn:${AWS::Partition}:s3:::${ResultsBucket}
+                - !Ref AWS::NoValue
+              - !If
+                - HasResultsBucket
+                - Effect: Allow
+                  Action: [s3:GetObject, s3:PutObject, s3:DeleteObject, s3:AbortMultipartUpload, s3:ListMultipartUploadParts]
+                  Resource: !Sub arn:${AWS::Partition}:s3:::${ResultsBucket}/${ResultsPrefix}/${AWS::StackName}/*
+                - !Ref AWS::NoValue
   InstanceProfile:
     Type: AWS::IAM::InstanceProfile
     Properties:
@@ -271,6 +326,8 @@ Resources:
         MetadataOptions:
           HttpTokens: required
           HttpEndpoint: enabled
+          # A worker reads the KeepHost tag from instance metadata.
+          InstanceMetadataTags: enabled
         ImageId: !If [IsArm64, !Ref Arm64ImageId, !Ref ImageId]
         InstanceType: !Ref InstanceType
         IamInstanceProfile:
@@ -292,22 +349,48 @@ Resources:
               - Key: Name
                 Value: !Sub '${AWS::StackName}-benchmark'
         UserData:
-          Fn::Base64: !Sub |
-            #!/bin/bash
-            set -euo pipefail
-            dnf install -y git aws-cfn-bootstrap
-            trap '/opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource Fleet --region ${AWS::Region}' EXIT
-            curl --proto '=https' --tlsv1.2 -LsSf https://astral.sh/uv/${UvVersion}/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
-            git clone https://github.com/pyathena-dev/PyAthena.git /opt/pyathena
-            git -C /opt/pyathena fetch origin ${GitCommit}
-            git -C /opt/pyathena checkout --detach ${GitCommit}
-            export UV_PYTHON_INSTALL_DIR=/opt/uv-python
-            uv python install ${PythonVersion}
-            uv sync --directory /opt/pyathena/benchmarks --locked --no-dev --python ${PythonVersion}
-            chmod -R a+rX /opt/uv-python
-            chown -R ec2-user:ec2-user /opt/pyathena
-            printf '%s\n' '${AWS::StackId}' > /opt/pyathena/benchmarks/stack-id.txt
-            printf '%s\n' 'Setup complete. Run preflight and prepare manually.'
+          Fn::Base64: !Sub
+            - |
+              #!/bin/bash
+              set -euo pipefail
+              dnf install -y git aws-cfn-bootstrap
+              trap '/opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource Fleet --region ${AWS::Region}' EXIT
+              curl --proto '=https' --tlsv1.2 -LsSf https://astral.sh/uv/${UvVersion}/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
+              git clone https://github.com/pyathena-dev/PyAthena.git /opt/pyathena
+              git -C /opt/pyathena fetch origin ${GitCommit}
+              git -C /opt/pyathena checkout --detach ${GitCommit}
+              export UV_PYTHON_INSTALL_DIR=/opt/uv-python
+              uv python install ${PythonVersion}
+              uv sync --directory /opt/pyathena/benchmarks --locked --no-dev --python ${PythonVersion}
+              chmod -R a+rX /opt/uv-python
+              chown -R ec2-user:ec2-user /opt/pyathena
+              printf '%s\n' '${AWS::StackId}' > /opt/pyathena/benchmarks/stack-id.txt
+              printf '%s\n' '${Results}' > /opt/pyathena/benchmarks/results-location.txt
+              sudo -u ec2-user mkdir -p /opt/pyathena/benchmarks/results
+              if [ -n '${QueueName}' ]; then
+              cat > /etc/systemd/system/pyathena-bench-worker.service <<'UNIT'
+              [Unit]
+              Description=PyAthena benchmark fleet worker
+              Wants=network-online.target
+              After=network-online.target
+              [Service]
+              User=ec2-user
+              WorkingDirectory=/opt/pyathena/benchmarks
+              Environment=AWS_DEFAULT_REGION=${AWS::Region}
+              ExecStart=/opt/pyathena/.venv/bin/python -m pyathena_bench worker --results ${Results} --name ${QueueName} --api-slots ${ApiSlots} --wait --terminate-host
+              StandardOutput=append:/opt/pyathena/benchmarks/results/worker.log
+              StandardError=inherit
+              [Install]
+              WantedBy=multi-user.target
+              UNIT
+              systemctl daemon-reload
+              systemctl enable --now pyathena-bench-worker.service
+              fi
+              printf '%s\n' 'Setup complete. Run preflight and prepare manually.'
+            - Results: !If
+                - HasResultsBucket
+                - !Sub s3://${ResultsBucket}/${ResultsPrefix}/${AWS::StackName}/
+                - !Sub s3://${Bucket}/
   Fleet:
     Type: AWS::AutoScaling::AutoScalingGroup
     DependsOn: [Route, RouteAssociation, RouteAssociation2, RouteAssociation3]
@@ -320,8 +403,17 @@ Resources:
       MinSize: 0
       MaxSize: !Ref FleetSize
       DesiredCapacity: !Ref FleetSize
-      VPCZoneIdentifier: [!Ref Subnet, !Ref Subnet2, !Ref Subnet3]
+      VPCZoneIdentifier: !If
+        - UseFourZones
+        - [!Ref Subnet, !Ref Subnet2, !Ref Subnet3, !Ref Subnet4]
+        - [!Ref Subnet, !Ref Subnet2, !Ref Subnet3]
       HealthCheckType: EC2
+      Tags:
+        # DependsOn cannot name the conditional fourth zone's route association; this
+        # reference makes hosts launch only after it exists, so bootstrap reaches the Internet.
+        - Key: pyathena-benchmark-route
+          Value: !If [UseFourZones, !Ref RouteAssociation4, none]
+          PropagateAtLaunch: false
       MixedInstancesPolicy:
         LaunchTemplate:
           LaunchTemplateSpecification:
@@ -339,6 +431,11 @@ Outputs:
     Value: !Ref ScratchDatabase
   AutoScalingGroup:
     Value: !Ref Fleet
+  Results:
+    Value: !If
+      - HasResultsBucket
+      - !Sub s3://${ResultsBucket}/${ResultsPrefix}/${AWS::StackName}/
+      - !Sub s3://${Bucket}/
   SourceBucket:
     Value: !Ref SourceBucket
   SourcePrefix:

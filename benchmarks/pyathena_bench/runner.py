@@ -13,6 +13,7 @@ import asyncio
 import hashlib
 import importlib.metadata
 import json
+import logging
 import multiprocessing
 import os
 import platform
@@ -24,6 +25,7 @@ import tempfile
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import asdict
 from multiprocessing.connection import Connection
 from pathlib import Path
@@ -36,12 +38,17 @@ from pyathena_bench.adapters import BACKEND_VERSIONS, Adapter, run_adapter
 from pyathena_bench.aws import (
     cancel_queries,
     client,
+    run_locations,
     session,
+    split_location,
     validate_inputs,
     validate_manifest,
 )
 from pyathena_bench.cases import Case
 from pyathena_bench.config import Settings, select_sql, write_json
+from pyathena_bench.report import CHECKPOINT, read_trials, trial_key
+
+_logger = logging.getLogger(__name__)
 
 
 class Observer:
@@ -375,9 +382,80 @@ def environment(settings: Settings) -> dict[str, Any]:
     }
 
 
+def completed_trials(directories: list[Path]) -> set[tuple[str, str, int | None]]:
+    """Collect the trials that earlier attempts of a job recorded as finished.
+
+    Args:
+        directories: Output directories of earlier attempts.
+
+    Returns:
+        ``(scale, case_id, repetition)`` for successful measured trials, and
+        ``(scale, case_id, None)`` for cases recorded as unsupported. Warmups
+        are not included: each attempt runs its own before its measured trials.
+    """
+    return {
+        trial_key(trial)
+        for directory in directories
+        for trial in read_trials(directory)
+        if (trial["status"] == "ok" and not trial.get("warmup")) or trial["status"] == "unsupported"
+    }
+
+
+def s3_checkpoint(s3: Any, location: str) -> Callable[[str, dict[str, Any]], None]:
+    """Return a function that writes a fleet attempt's per-trial records to S3.
+
+    Args:
+        s3: S3 client.
+        location: The attempt's ``s3://`` prefix; records go below ``checkpoint/``.
+
+    Returns:
+        A function that writes a record under a name, logging a failure: a
+        missing checkpoint only makes a resumed job repeat that trial.
+    """
+    bucket, prefix = split_location(location)
+
+    def write(name: str, record: dict[str, Any]) -> None:
+        try:
+            s3.put_object(
+                Bucket=bucket,
+                Key=f"{prefix}{CHECKPOINT}/{name}",
+                Body=json.dumps(record, sort_keys=True).encode(),
+            )
+        except Exception:
+            _logger.warning("Could not write the checkpoint %s", name, exc_info=True)
+
+    return write
+
+
 def run(
-    settings: Settings, manifest: dict[str, Any], cases: list[Case], scales: list[str], output: Path
+    settings: Settings,
+    manifest: dict[str, Any],
+    cases: list[Case],
+    scales: list[str],
+    output: Path,
+    completed: set[tuple[str, str, int | None]] | None = None,
+    checkpoint: Callable[[str, dict[str, Any]], None] | None = None,
 ) -> bool:
+    """Run every trial of the selected cases into a new output directory.
+
+    Args:
+        settings: Configuration.
+        manifest: Prepared manifest.
+        cases: Cases to run.
+        scales: Scales to run.
+        output: New output directory.
+        completed: Trials from :func:`completed_trials` to skip, so that a
+            resumed job runs only the missing measured repetitions, after its
+            own warmups; a case without missing repetitions is skipped.
+        checkpoint: Function from :func:`s3_checkpoint` that receives each
+            trial's ``trial_start`` event before the trial and its record
+            after it, between trials, so that a fleet worker can resume the
+            job if the host is lost.
+
+    Returns:
+        True if every trial succeeded.
+    """
+    completed = completed or set()
     resources = validate_manifest(settings, manifest)
     validate_inputs(settings, manifest, scales)
     output.mkdir(parents=True, exist_ok=False)
@@ -385,9 +463,12 @@ def run(
     write_json(output / "manifest.json", manifest)
     success = True
     s3 = client(session(settings), "s3")
+    results_root = run_locations(resources, manifest["run_id"])["results"]
     for scale in scales:
         for case in cases:
             if case.unsupported:
+                if (scale, case.id, None) in completed:
+                    continue
                 append_json(
                     output / "trials.jsonl",
                     {
@@ -399,9 +480,16 @@ def run(
                     },
                 )
                 continue
+            if all(
+                (scale, case.id, repetition) in completed
+                for repetition in range(settings.repetitions)
+            ):
+                continue
             for repetition in range(-settings.warmups, settings.repetitions):
+                # Warmups run again on this host; measured trials are not repeated.
+                if repetition >= 0 and (scale, case.id, repetition) in completed:
+                    continue
                 trial = uuid.uuid4().hex
-                prefix = f"runs/{manifest['run_id']}/trials/{trial}/"
                 payload = {
                     "settings": asdict(settings),
                     "case": asdict(case),
@@ -411,7 +499,7 @@ def run(
                     "repetition": repetition,
                     "warmup": repetition < 0,
                     "database": resources["ScratchDatabase"],
-                    "output": f"s3://{resources['Bucket']}/{prefix}",
+                    "output": f"{results_root}trials/{trial}/",
                     "temp_table": f"b_{manifest['run_id']}_{trial}",
                     "sql": select_sql(
                         resources["ScratchDatabase"], manifest["scales"][scale]["table"], case.shape
@@ -419,7 +507,10 @@ def run(
                     "expected_rows": manifest["scales"][scale]["rows"],
                     "fixture": manifest["fixtures"].get(f"{scale}-{case.shape}-{case.transport}"),
                 }
-                append_json(output / "events.jsonl", {"event": "trial_start", **payload})
+                start = {"event": "trial_start", **payload}
+                append_json(output / "events.jsonl", start)
+                if checkpoint:
+                    checkpoint(f"{trial}-start.json", start)
                 result = supervise(payload, output / "events.jsonl", settings)
                 if (
                     result["status"] == "ok"
@@ -432,18 +523,18 @@ def run(
                     except Exception as exc:
                         # The measurement stands; only the file summary is missing.
                         result["output_files_error"] = f"{type(exc).__name__}: {exc}"
-                append_json(
-                    output / "trials.jsonl",
-                    {
-                        "trial": trial,
-                        "case_id": case.id,
-                        "case": asdict(case),
-                        "scale": scale,
-                        "repetition": repetition,
-                        "warmup": repetition < 0,
-                        **result,
-                    },
-                )
+                record = {
+                    "trial": trial,
+                    "case_id": case.id,
+                    "case": asdict(case),
+                    "scale": scale,
+                    "repetition": repetition,
+                    "warmup": repetition < 0,
+                    **result,
+                }
+                append_json(output / "trials.jsonl", record)
+                if checkpoint:
+                    checkpoint(f"{trial}.json", record)
                 success = success and result["status"] == "ok"
                 # A failed worker can leave an unobserved query running in Athena.
                 # Do not let it contaminate subsequent trials before cleanup.

@@ -10,7 +10,15 @@ from types import SimpleNamespace
 
 import pytest
 from botocore.exceptions import ClientError
-from pyathena_bench.aws import cleanup, prepare, validate_inputs, validate_manifest
+from pyathena_bench.aws import (
+    cleanup,
+    prepare,
+    run_locations,
+    split_location,
+    stack_resources,
+    validate_inputs,
+    validate_manifest,
+)
 from pyathena_bench.config import Settings, read_json
 
 RUN = "a" * 32
@@ -24,6 +32,7 @@ RESOURCES = {
     "SourceTable": "pypi_file_downloads",
     "WorkGroup": "pyathena",
     "AutoScalingGroup": "fleet-test",
+    "Results": "s3://temporary/",
 }
 
 
@@ -284,3 +293,85 @@ class TestCleanup:
         else:
             with pytest.raises(ClientError, match="AccessDeniedException"):
                 cleanup(Settings(), data, tmp_path / "manifest.json")
+
+
+def test_cleanup_covers_a_separate_results_location(aws_metadata, monkeypatch, tmp_path):
+    resources = {**RESOURCES, "Results": "s3://results/bench/stack/"}
+    monkeypatch.setattr(
+        "pyathena_bench.aws.stack_resources", lambda session, stack: dict(resources)
+    )
+    actions = []
+    scanned = {}
+
+    class Fake:
+        def get_paginator(self, operation):
+            def pages(**kwargs):
+                actions.append((operation, kwargs))
+                return {
+                    "get_tables": [{"TableList": []}],
+                    "list_multipart_uploads": [{}],
+                    "list_objects_v2": [{}],
+                }[operation]
+
+            return SimpleNamespace(paginate=pages)
+
+    def active(athena, workgroup, prefixes):
+        scanned["prefixes"] = prefixes
+        return set()
+
+    monkeypatch.setattr("pyathena_bench.aws.client", lambda *args: Fake())
+    monkeypatch.setattr("pyathena_bench.aws.active_queries", active)
+    monkeypatch.setattr("pyathena_bench.aws.cancel_queries", lambda settings, ids: [])
+    data = manifest()
+    data["resources"] = dict(resources)
+    cleanup(Settings(), data, tmp_path / "manifest.json", trials_only=True)
+    assert scanned["prefixes"] == (
+        f"s3://results/bench/stack/runs/{RUN}/",
+        f"s3://temporary/runs/{RUN}/",
+    )
+    listed = {(k["Bucket"], k["Prefix"]) for op, k in actions if op == "list_objects_v2"}
+    assert listed == {
+        ("results", f"bench/stack/runs/{RUN}/trials/"),
+        ("temporary", f"runs/{RUN}/trials/"),
+    }
+
+
+@pytest.mark.parametrize(
+    ("location", "expected"),
+    [("s3://bucket/", ("bucket", "")), ("s3://bucket/a/b/", ("bucket", "a/b/"))],
+)
+def test_split_location(location, expected):
+    assert split_location(location) == expected
+
+
+@pytest.mark.parametrize("location", ["s3://bucket", "s3://bucket/a", "bucket/a/", "s3://B/"])
+def test_split_location_rejects_invalid_locations(location):
+    with pytest.raises(ValueError, match="Invalid S3 location"):
+        split_location(location)
+
+
+def test_stack_resources_require_the_results_output(monkeypatch):
+    outputs = {k: v for k, v in RESOURCES.items() if k != "StackId"}
+    stack = {
+        "StackId": "arn:stack",
+        "Tags": [{"Key": "Purpose", "Value": "pyathena-benchmark"}],
+        "Outputs": [{"OutputKey": k, "OutputValue": v} for k, v in outputs.items()],
+    }
+    fake = SimpleNamespace(describe_stacks=lambda **kwargs: {"Stacks": [stack]})
+    monkeypatch.setattr("pyathena_bench.aws.client", lambda *args: fake)
+    assert stack_resources(None, "stack")["Results"] == "s3://temporary/"
+    stack["Outputs"] = [o for o in stack["Outputs"] if o["OutputKey"] != "Results"]
+    with pytest.raises(ValueError, match="Stack outputs are incomplete"):
+        stack_resources(None, "stack")
+
+
+@pytest.mark.parametrize(
+    ("results", "expected"),
+    [
+        ("s3://temporary/", f"s3://temporary/runs/{RUN}/"),
+        ("s3://results/bench/stack/", f"s3://results/bench/stack/runs/{RUN}/"),
+    ],
+)
+def test_run_locations(results, expected):
+    locations = run_locations({**RESOURCES, "Results": results}, RUN)
+    assert locations == {"scratch": f"s3://temporary/runs/{RUN}/", "results": expected}
