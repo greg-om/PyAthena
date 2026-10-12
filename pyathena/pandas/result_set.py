@@ -262,15 +262,17 @@ class _JSONConverter:
         if values.dtype.kind in "mM":
             # pandas parsed the text as dates, as parse_dates given to execute() asks.
             return pd.Series(values.array, index=index)
-        # A missing value is NULL, which the converter gets as an empty string, as
-        # pandas passes NULL to a converter.
+        # Each value is one of three kinds:
+        # - text, which pandas kept as read: the JSON text, converted here;
+        # - a missing value: NULL, converted from an empty string, as pandas passes
+        #   NULL to a converter;
+        # - any other value, which pandas already parsed (an index label): kept.
+        # A comprehension, rather than a function per value, keeps this loop fast.
         converted = pd.Series(
             [
                 self._converter(v)
                 if isinstance(v, str)
-                else self._converter("")
-                if pd.isna(v)
-                else v
+                else (self._converter("") if pd.isna(v) else v)
                 for v in values.to_numpy()
             ],
             index=index,
