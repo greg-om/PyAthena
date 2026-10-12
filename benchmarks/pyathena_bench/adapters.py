@@ -190,7 +190,9 @@ class Adapter:
         """Return the cursor options of the case for a cursor family.
 
         Args:
-            family: The cursor family, which a SQLAlchemy case maps from its driver.
+            family: The cursor family, or the SQLAlchemy driver of a
+                ``read_sql_query()`` case, whose cursor takes the options of the
+                family of the same name.
 
         Returns:
             The keyword arguments that the family's cursor accepts.
@@ -223,7 +225,7 @@ class Adapter:
 
         The engine connects with the same arguments as the cursor cases, and its
         connections create cursors with the cursor options of the driver's
-        family, including ``chunksize`` for the pandas and Polars drivers, so a
+        name, including ``chunksize`` for the pandas and Polars drivers, so a
         chunked read also streams the result file. ``NullPool`` opens one
         connection per query. Result reuse is disabled through the connection's
         ``result_reuse_enable``, and the client cache stays off because the
@@ -232,14 +234,13 @@ class Adapter:
         Returns:
             The engine.
         """
-        driver = self.case.family.removeprefix("sqla_")
-        family = "cursor" if driver == "rest" else driver
+        driver = SQLALCHEMY_FAMILIES[self.case.family]
         return create_engine(
             f"awsathena+{driver}://athena.{self.settings.region}.amazonaws.com:443/{self.database}",
             poolclass=NullPool,
             connect_args={
                 **self.connection_kwargs(),
-                "cursor_kwargs": self.cursor_kwargs(family),
+                "cursor_kwargs": self.cursor_kwargs(driver),
             },
         )
 
@@ -310,17 +311,16 @@ async def measure_query(adapter: Adapter, cursor: Any, sql: str, expected: int) 
     case = adapter.case
     result = None
     try:
-        if case.family == "wrangler":
-            result = adapter.wrangler(sql)
+        if case.family == "wrangler" or case.family in SQLALCHEMY_FAMILIES:
+            # The "cursor" of a SQLAlchemy case is its connection, opened during setup.
+            result = (
+                adapter.wrangler(sql)
+                if case.family == "wrangler"
+                else pd.read_sql_query(sql, cursor, chunksize=case.chunksize)
+            )
             ready = time.perf_counter()
             count = consume(result, case)
             query_id = None  # The botocore observer captures IDs even for iterators.
-        elif case.family in SQLALCHEMY_FAMILIES:
-            # The "cursor" of a SQLAlchemy case is its connection, opened during setup.
-            result = pd.read_sql_query(sql, cursor, chunksize=case.chunksize)
-            ready = time.perf_counter()
-            count = consume(result, case)
-            query_id = None
         elif case.api == "thread":
             query_id, future = await asyncio.to_thread(
                 cursor.execute, sql, **adapter.execute_kwargs()

@@ -131,8 +131,8 @@ def expand_jobs(
     """Split a selection into independent ``run`` invocations.
 
     A job covers one suite, scale, shape, family, API, transport, and output
-    kind, and additionally one arraysize for row output. A chunk size filter
-    is passed on to each job and named in its ID. Jobs that page through
+    kind, and additionally one arraysize for row output. With a chunk size
+    filter, each job runs and names the chunk sizes of its group's cases. Jobs that page through
     GetQueryResults are marked with the number of simultaneous paging queries
     so workers can bound the fleet's request rate. When one trial of such a job
     needs at least ``split_pages`` pages, each measured repetition becomes a
@@ -176,9 +176,9 @@ def expand_jobs(
                         base += f"-a{arraysize}"
                         args += ["--arraysize", str(arraysize)]
                     if filters.chunksize:
-                        # The job runs the same chunk selection, which its ID names
-                        # in one order so that equal selections share an ID.
-                        chunks = [str(c) for c in sorted(set(filters.chunksize))]
+                        # The job runs its group's chunk sizes, which its ID names in
+                        # order, so equal selections share an ID.
+                        chunks = [str(c) for c in sorted({c.chunksize or 0 for c in cases})]
                         base += "-c" + "_".join(chunks)
                         args += ["--chunksize", *chunks]
                     runnable = [c for c in cases if c.unsupported is None]

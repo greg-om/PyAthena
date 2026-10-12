@@ -10,7 +10,7 @@ from dataclasses import replace
 
 import pytest
 from pyathena_bench.__main__ import main
-from pyathena_bench.cases import matrix
+from pyathena_bench.cases import SQLALCHEMY_FAMILIES, matrix
 from pyathena_bench.config import Settings, identifier, select_sql
 
 
@@ -53,7 +53,7 @@ def test_matrix_preserves_unsupported_capabilities():
 
 
 def test_sqlalchemy_cases_are_synchronous_single_query_reads():
-    cases = [c for c in matrix(Settings(), "single", "flat") if c.family.startswith("sqla_")]
+    cases = [c for c in matrix(Settings(), "single", "flat") if c.family in SQLALCHEMY_FAMILIES]
     assert {(c.family, c.transport) for c in cases} == {
         ("sqla_rest", "csv"),
         ("sqla_s3fs", "csv"),
@@ -62,7 +62,9 @@ def test_sqlalchemy_cases_are_synchronous_single_query_reads():
     assert {c.chunksize for c in cases} == {None, 10000, 100000}
     assert {(c.api, c.output, c.unsupported) for c in cases} == {("sync", "native", None)}
     for suite in ("concurrent", "init"):
-        assert not [c for c in matrix(Settings(), suite, "flat") if c.family.startswith("sqla_")]
+        assert not [c for c in matrix(Settings(), suite, "flat") if c.family in SQLALCHEMY_FAMILIES]
+        # The pyarrow dtype variants belong to the single-query suite too.
+        assert not [c for c in matrix(Settings(), suite, "flat") if c.dtype_backend]
 
 
 def test_json_shape_covers_pandas_and_wrangler_reads():

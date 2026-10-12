@@ -31,6 +31,7 @@ from typing import Any
 
 import psutil
 
+from pyathena.util import parse_output_location
 from pyathena_bench.adapters import BACKEND_VERSIONS, Adapter, run_adapter
 from pyathena_bench.aws import (
     cancel_queries,
@@ -327,7 +328,7 @@ def output_files(s3: Any, location: str) -> dict[str, int]:
     Raises:
         ValueError: If no manifest is below the location.
     """
-    bucket, _, prefix = location.removeprefix("s3://").partition("/")
+    bucket, prefix = parse_output_location(location)
     listed: dict[str, int] = {}
     for page in s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix):
         listed.update((item["Key"], item["Size"]) for item in page.get("Contents", []))
@@ -338,7 +339,7 @@ def output_files(s3: Any, location: str) -> dict[str, int]:
     for manifest in manifests:
         body: str = s3.get_object(Bucket=bucket, Key=manifest)["Body"].read().decode()
         for line in filter(None, body.splitlines()):
-            file_bucket, _, key = line.removeprefix("s3://").partition("/")
+            file_bucket, key = parse_output_location(line)
             size = listed.get(key) if file_bucket == bucket else None
             if size is None:
                 size = s3.head_object(Bucket=file_bucket, Key=key)["ContentLength"]
@@ -383,8 +384,7 @@ def run(
     write_json(output / "environment.json", environment(settings))
     write_json(output / "manifest.json", manifest)
     success = True
-    # Created on first use and shared by the run's output file summaries.
-    s3: Any = None
+    s3 = client(session(settings), "s3")
     for scale in scales:
         for case in cases:
             if case.unsupported:
@@ -423,12 +423,11 @@ def run(
                 result = supervise(payload, output / "events.jsonl", settings)
                 if (
                     result["status"] == "ok"
+                    and repetition >= 0
                     and case.transport in {"unload", "ctas"}
                     and case.suite != "init"
                 ):
                     try:
-                        if s3 is None:
-                            s3 = client(session(settings), "s3")
                         result["output_files"] = output_files(s3, payload["output"])
                     except Exception as exc:
                         # The measurement stands; only the file summary is missing.

@@ -42,6 +42,28 @@ def cache_writing_worker(pipe, payload):
     pipe.close()
 
 
+RUN_MANIFEST = {
+    "run_id": "a" * 32,
+    "scales": {"small": {"table": "input", "rows": 10}},
+    "fixtures": {},
+}
+
+
+@pytest.fixture
+def run_stubs(monkeypatch):
+    """Replace the AWS calls of ``run()`` and return the S3 client it creates."""
+    s3 = object()
+    monkeypatch.setattr(
+        "pyathena_bench.runner.validate_manifest",
+        lambda *args: {"ScratchDatabase": "scratch", "Bucket": "out"},
+    )
+    monkeypatch.setattr("pyathena_bench.runner.validate_inputs", lambda *args: None)
+    monkeypatch.setattr("pyathena_bench.runner.environment", lambda *args: {})
+    monkeypatch.setattr("pyathena_bench.runner.session", lambda settings: None)
+    monkeypatch.setattr("pyathena_bench.runner.client", lambda session_, service: s3)
+    return s3
+
+
 def test_observer_keeps_first_completion_and_query_id():
     events = []
 
@@ -107,27 +129,18 @@ class TestRunner:
         assert result["status"] == "timeout"
 
     @pytest.mark.parametrize("status", ["timeout", "memory_limit", "worker_exit", "error"])
-    def test_failed_trial_stops_suite_before_any_more_queries(self, monkeypatch, tmp_path, status):
+    def test_failed_trial_stops_suite_before_any_more_queries(
+        self, monkeypatch, tmp_path, run_stubs, status
+    ):
         calls = []
-        monkeypatch.setattr(
-            "pyathena_bench.runner.validate_manifest",
-            lambda *args: {"ScratchDatabase": "scratch", "Bucket": "out"},
-        )
-        monkeypatch.setattr("pyathena_bench.runner.validate_inputs", lambda *args: None)
-        monkeypatch.setattr("pyathena_bench.runner.environment", lambda *args: {})
 
         def fail(payload, events, settings):
             calls.append(payload)
             return {"status": status}
 
         monkeypatch.setattr("pyathena_bench.runner.supervise", fail)
-        manifest = {
-            "run_id": "a" * 32,
-            "scales": {"small": {"table": "input", "rows": 10}},
-            "fixtures": {},
-        }
         assert not run(
-            Settings(), manifest, [Case("cursor"), Case("dict")], ["small"], tmp_path / "run"
+            Settings(), RUN_MANIFEST, [Case("cursor"), Case("dict")], ["small"], tmp_path / "run"
         )
         assert len(calls) == 1
         assert calls[0]["warmup"]
@@ -211,44 +224,22 @@ def test_output_files_without_a_manifest_is_an_error():
     ("case", "listed"),
     [(Case("pandas", transport="unload", output="native"), True), (Case("pandas"), False)],
 )
-def test_unload_trials_record_their_output_files(monkeypatch, tmp_path, case, listed):
-    monkeypatch.setattr(
-        "pyathena_bench.runner.validate_manifest",
-        lambda *args: {"ScratchDatabase": "scratch", "Bucket": "out"},
-    )
-    monkeypatch.setattr("pyathena_bench.runner.validate_inputs", lambda *args: None)
-    monkeypatch.setattr("pyathena_bench.runner.environment", lambda *args: {})
+def test_unload_trials_record_their_output_files(monkeypatch, tmp_path, run_stubs, case, listed):
     monkeypatch.setattr("pyathena_bench.runner.supervise", lambda *args: {"status": "ok"})
-    locations = []
-    clients = []
+    calls = []
 
     def summarize(s3, location):
-        locations.append(location)
-        clients.append(s3)
+        calls.append((s3, location))
         return {"count": 1, "bytes": 5, "max_bytes": 5, "min_bytes": 5}
 
-    created = []
-
-    def make_client(session_, service):
-        assert service == "s3"
-        created.append(object())
-        return created[-1]
-
     monkeypatch.setattr("pyathena_bench.runner.output_files", summarize)
-    monkeypatch.setattr("pyathena_bench.runner.session", lambda settings: None)
-    monkeypatch.setattr("pyathena_bench.runner.client", make_client)
-    manifest = {
-        "run_id": "a" * 32,
-        "scales": {"small": {"table": "input", "rows": 10}},
-        "fixtures": {},
-    }
-    settings = replace(Settings(), warmups=0, repetitions=2)
-    assert run(settings, manifest, [case], ["small"], tmp_path / "run")
+    settings = replace(Settings(), warmups=1, repetitions=2)
+    assert run(settings, RUN_MANIFEST, [case], ["small"], tmp_path / "run")
     trials = [json.loads(line) for line in (tmp_path / "run/trials.jsonl").read_text().splitlines()]
-    assert all(("output_files" in trial) is listed for trial in trials)
-    assert [loc.startswith(f"s3://out/runs/{'a' * 32}/trials/") for loc in locations] == (
-        [True, True] if listed else []
+    # Measured trials only, with the run's one client.
+    assert [("output_files" in t) for t in trials] == [False, listed, listed]
+    assert len(calls) == (2 if listed else 0)
+    assert all(
+        s3 is run_stubs and location.startswith(f"s3://out/runs/{'a' * 32}/trials/")
+        for s3, location in calls
     )
-    # One client serves every trial of the run.
-    assert len(created) == (1 if listed else 0)
-    assert clients == created * 2

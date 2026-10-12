@@ -14,11 +14,20 @@ from dataclasses import dataclass, replace
 from pyathena_bench.config import Settings
 
 FAMILIES = ("cursor", "dict", "s3fs", "pandas", "arrow", "polars")
-# pandas.read_sql_query() through a SQLAlchemy engine of each PyAthena driver.
-SQLALCHEMY_FAMILIES = ("sqla_rest", "sqla_pandas", "sqla_arrow", "sqla_polars", "sqla_s3fs")
+# The cursor families that read result files as DataFrames or tables, also from UNLOAD.
+RESULT_FILE_FAMILIES = ("pandas", "arrow", "polars")
+# pandas.read_sql_query() through a SQLAlchemy engine, by the PyAthena driver it uses.
+# A driver's cursor takes the options of the cursor family of the same name; the rest
+# driver's Cursor takes those of no family in particular.
+SQLALCHEMY_FAMILIES = {
+    "sqla_rest": "rest",
+    "sqla_pandas": "pandas",
+    "sqla_arrow": "arrow",
+    "sqla_polars": "polars",
+    "sqla_s3fs": "s3fs",
+}
+ALL_FAMILIES = (*FAMILIES, "wrangler", *SQLALCHEMY_FAMILIES)
 SHAPES = ("flat", "nested", "json")
-# The SQLAlchemy drivers that read result files and can read UNLOAD results.
-RESULT_FILE_SQLALCHEMY = {"sqla_pandas", "sqla_arrow", "sqla_polars"}
 
 
 @dataclass(frozen=True)
@@ -74,27 +83,30 @@ def matrix(settings: Settings, suite: str, shape: str) -> list[Case]:
     for family in FAMILIES:
         for api in ("sync", "thread", "aio"):
             cases.extend(Case(family, api, arraysize=a, shape=shape) for a in arraysizes)
-            if family in {"pandas", "arrow", "polars"}:
+            if family in RESULT_FILE_FAMILIES:
                 for transport in ("csv", "unload"):
                     chunks: list[int | None] = (
                         [None] if family == "arrow" else [None, *settings.chunksizes]
                     )
-                    for chunk in chunks:
-                        cases.append(
-                            Case(family, api, transport, "native", chunksize=chunk, shape=shape)
+                    # Single queries also measure pandas UNLOAD reads with pyarrow dtypes.
+                    backends: tuple[str | None, ...] = (
+                        (None, "pyarrow")
+                        if suite == "single" and family == "pandas" and transport == "unload"
+                        else (None,)
+                    )
+                    cases.extend(
+                        Case(
+                            family,
+                            api,
+                            transport,
+                            "native",
+                            chunksize=chunk,
+                            shape=shape,
+                            dtype_backend=backend,
                         )
-                        if family == "pandas" and transport == "unload":
-                            cases.append(
-                                Case(
-                                    family,
-                                    api,
-                                    transport,
-                                    "native",
-                                    chunksize=chunk,
-                                    shape=shape,
-                                    dtype_backend="pyarrow",
-                                )
-                            )
+                        for chunk in chunks
+                        for backend in backends
+                    )
                 cases.extend(
                     Case(family, api, "unload", arraysize=a, shape=shape) for a in arraysizes
                 )
@@ -116,8 +128,8 @@ def matrix(settings: Settings, suite: str, shape: str) -> list[Case]:
                 )
             )
     if suite == "single":
-        for family in SQLALCHEMY_FAMILIES:
-            transports = ["csv", "unload"] if family in RESULT_FILE_SQLALCHEMY else ["csv"]
+        for family, driver in SQLALCHEMY_FAMILIES.items():
+            transports = ["csv", "unload"] if driver in RESULT_FILE_FAMILIES else ["csv"]
             cases.extend(
                 Case(family, transport=transport, output="native", chunksize=chunk, shape=shape)
                 for transport in transports
@@ -139,11 +151,10 @@ def matrix(settings: Settings, suite: str, shape: str) -> list[Case]:
             if c.api in {"thread", "aio"}
             and c.arraysize == 1000
             and c.chunksize is None
-            and c.dtype_backend is None
             and c.transport == "csv"
             and (
                 (c.family in {"cursor", "dict", "s3fs"} and c.output == "rows")
-                or (c.family in {"pandas", "arrow", "polars"} and c.output == "native")
+                or (c.family in RESULT_FILE_FAMILIES and c.output == "native")
             )
             for n in settings.concurrency
         ]
@@ -154,11 +165,10 @@ def matrix(settings: Settings, suite: str, shape: str) -> list[Case]:
             if c.api == "sync"
             and c.arraysize == 1000
             and c.chunksize is None
-            and c.dtype_backend is None
             and c.family != "wrangler"
             and (
                 (c.family in {"cursor", "dict", "s3fs"} and c.output == "rows")
-                or (c.family in {"pandas", "arrow", "polars"} and c.output == "native")
+                or (c.family in RESULT_FILE_FAMILIES and c.output == "native")
             )
             for api in ("direct", "to_thread")
         ]

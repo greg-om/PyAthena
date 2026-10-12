@@ -341,7 +341,7 @@ Several `jobs` selections can make up one bounded matrix.
 For example, the following selection, with `chunksizes = [10000, 100000, 1000000]` and `timeout_seconds = 5400.0` in `results/fleet.toml`, measures the synchronous API only:
 
 - medium as a small regression subset: Cursor and S3FS rows with arraysize 1000, and the native reads of the DataFrame families and Wrangler without chunks, flat, three repetitions;
-- large, flat and nested: Cursor and S3FS rows with arraysize 1000 (five repetitions), Cursor with arraysize 100 (three, split into single-repetition jobs), DictCursor flat (three), every native read of the DataFrame families and Wrangler including the json workload (five), and `read_sql_query()` for every driver without chunks and with 100,000-row chunks (five; three for `sqla_rest`, split);
+- large, flat and nested: Cursor and S3FS rows with arraysize 1000 (five repetitions), Cursor with arraysize 100 (three, split into single-repetition jobs), DictCursor flat (three), every native read of the DataFrame families and Wrangler (five), the json workload's CSV reads without chunks and with 100,000-row chunks (five), and `read_sql_query()` through the pandas, Arrow, Polars, and S3FS drivers without chunks and with 100,000-row chunks (five) and through the REST driver without chunks (three, split); `sqla_s3fs` covers the chunked `fetchmany()` path without GetQueryResults paging;
 - xlarge: S3FS rows flat, every native read of the DataFrame families and Wrangler, the json workload without chunks and with 100,000-row chunks, and `read_sql_query()` through the pandas, Arrow, Polars, and S3FS drivers flat without chunks and with chunks, and through the pandas, Arrow, and Polars drivers nested with chunks only, all with three repetitions.
 
 It leaves out the ThreadPool and native asyncio APIs, whose single-query timings matched the synchronous API, the initialization suite, the concurrency suite, arraysize 100 for every family but Cursor, and DictCursor beyond one scale.
@@ -359,11 +359,13 @@ jobs --suite single --scale large --shape flat nested --api sync --arraysize 100
   --family cursor --repetitions 3 --split-pages 5000 > results/jobs-large-cursor-100.json
 jobs --suite single --scale large --shape flat --api sync --arraysize 1000 \
   --family dict --repetitions 3 > results/jobs-large-dict.json
-jobs --suite single --scale large --shape flat nested json --api sync \
+jobs --suite single --scale large --shape flat nested --api sync \
   --family pandas arrow polars wrangler --output-kind native --repetitions 5 > results/jobs-large-native.json
+jobs --suite single --scale large --shape json --api sync --transport csv --chunksize 0 100000 \
+  --family pandas wrangler --repetitions 5 > results/jobs-large-json.json
 jobs --suite single --scale large --shape flat nested --chunksize 0 100000 \
   --family sqla_pandas sqla_arrow sqla_polars sqla_s3fs --repetitions 5 > results/jobs-large-sqla.json
-jobs --suite single --scale large --shape flat nested --chunksize 0 100000 \
+jobs --suite single --scale large --shape flat nested --chunksize 0 \
   --family sqla_rest --repetitions 3 --split-pages 1000 > results/jobs-large-sqla-rest.json
 jobs --suite single --scale xlarge --shape flat --api sync --arraysize 1000 \
   --family s3fs --output-kind rows --repetitions 3 > results/jobs-xlarge-s3fs.json
@@ -382,7 +384,7 @@ uv run --no-sync python -m pyathena_bench --config results/fleet.toml queue \
 
 The manifest for this selection must be prepared with `--scale medium large xlarge`.
 It is published as `large-1` in place of the previous example, so the worker and status commands below apply unchanged.
-The selection has 99 jobs, three of which only record the unsupported json UNLOAD and CTAS cases; from the job durations of the 2026-10-11 run, they take about 14 hours of job time on `r7g.2xlarge` hosts, and the longest, xlarge nested pandas CSV, about 75 minutes.
+The selection has 96 jobs; from the job durations of the 2026-10-11 run, they take about 14 hours of job time on `r7g.2xlarge` hosts, and the longest, xlarge nested pandas CSV, about 75 minutes.
 
 `queue` reserves the name with a conditional write, stores the configuration, manifest, and jobs under `fleet/<name>/` in the scratch bucket, and writes the `queue.json` marker last.
 Workers refuse a queue without the marker.
@@ -423,7 +425,7 @@ Every output directory contains `environment.json`, a copy of the input manifest
 Environment metadata includes Git SHA, dirty state, Python and dependency versions, lockfile hash, CPU count, RAM, and settings.
 SDK events preserve query IDs, SQL, output locations, Athena statistics, and failed operations without storing result rows.
 Successful measurements generate `summary.csv` and `summary.md`; failed trials and unsupported cases remain visible.
-After each successful UNLOAD or CTAS trial, `run` reads the query manifests (`<query_id>-manifest.csv`) below the trial's output location and records the number and sizes of the data files they list in `output_files`; the summary shows the most files and the largest file of the measured trials, and notes a measured trial whose files could not be summarized.
+After each successful measured UNLOAD or CTAS trial, `run` reads the query manifests (`<query_id>-manifest.csv`) below the trial's output location and records the number and sizes of the data files they list in `output_files`; the summary shows the most files and the largest file of the measured trials, and notes a measured trial whose files could not be summarized.
 Regenerate reports after interruption with:
 
 ```bash

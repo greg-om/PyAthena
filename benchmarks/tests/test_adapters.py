@@ -27,7 +27,13 @@ from pyathena_bench.adapters import (
     measure_query,
     run_adapter,
 )
-from pyathena_bench.cases import Case, matrix
+from pyathena_bench.cases import (
+    FAMILIES,
+    RESULT_FILE_FAMILIES,
+    SQLALCHEMY_FAMILIES,
+    Case,
+    matrix,
+)
 from pyathena_bench.config import Settings
 
 from pyathena.arrow.cursor import ArrowCursor
@@ -137,7 +143,7 @@ class TestAdapter:
         )
         settings = Settings(executor_workers=3)
         for case in matrix(settings, "single", "flat"):
-            if case.family == "wrangler" or case.family.startswith("sqla_") or case.unsupported:
+            if case.family not in FAMILIES or case.unsupported:
                 continue
             adapter = Adapter(settings, case, session, "scratch", "s3://out/", "temp")
             with adapter.connection() as connection:
@@ -165,7 +171,7 @@ class TestAdapter:
             "sqla_arrow": ArrowCursor,
             "sqla_polars": PolarsCursor,
         }
-        cases = [c for c in matrix(settings, "single", "flat") if c.family.startswith("sqla_")]
+        cases = [c for c in matrix(settings, "single", "flat") if c.family in SQLALCHEMY_FAMILIES]
         for case in cases:
             engine = Adapter(settings, case, session, "scratch", "s3://out/", "temp").engine()
             try:
@@ -179,9 +185,10 @@ class TestAdapter:
                     cursor = raw.cursor()
                     assert type(cursor) is expected[case.family]
                     assert cursor.arraysize == 1000
-                    if case.family in {"sqla_pandas", "sqla_arrow", "sqla_polars"}:
+                    driver = SQLALCHEMY_FAMILIES[case.family]
+                    if driver in RESULT_FILE_FAMILIES:
                         assert cursor._unload is (case.transport == "unload")
-                    if case.family in {"sqla_pandas", "sqla_polars"}:
+                    if driver in {"pandas", "polars"}:
                         assert cursor._chunksize == case.chunksize
                         assert cursor._s3_max_workers == 3
                     cursor.close()

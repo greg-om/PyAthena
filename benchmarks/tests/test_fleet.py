@@ -217,6 +217,17 @@ class TestExpandJobsSelection:
         ]
         assert [j["args"][-2:] for j in jobs] == [["--chunksize", "0"], ["--chunksize", "100000"]]
         assert merge_jobs([jobs[:1], jobs[1:]]) == jobs
+        # A group without chunked cases names only what it runs.
+        rows = expand_jobs(
+            SETTINGS,
+            ["single"],
+            ["small"],
+            ["flat"],
+            Filters(family=["s3fs"], api=["sync"], arraysize=[1000], chunksize=[0, 100000]),
+        )
+        assert [(j["id"], j["args"][-2:]) for j in rows] == [
+            ("single-small-flat-s3fs-sync-csv-rows-a1000-c0", ["--chunksize", "0"])
+        ]
         # Equal selections in another order or with repeats get the same job.
         again = expand_jobs(
             SETTINGS, ["single"], ["small"], ["flat"], replace(selection, chunksize=[100000, 0, 0])

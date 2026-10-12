@@ -26,7 +26,7 @@ from pyathena_bench.aws import (
     stack_resources,
     validate_manifest,
 )
-from pyathena_bench.cases import FAMILIES, SHAPES, SQLALCHEMY_FAMILIES, matrix
+from pyathena_bench.cases import ALL_FAMILIES, SHAPES, matrix
 from pyathena_bench.config import Settings, read_json
 from pyathena_bench.fleet import (
     API_FAMILIES,
@@ -76,9 +76,7 @@ def parser() -> argparse.ArgumentParser:
         command.add_argument("--warmups", type=int, help="Override the configured warmups")
         command.add_argument("--repetitions", type=int, help="Override the configured repetitions")
         command.add_argument("--scale", nargs="+", required=True)
-        command.add_argument(
-            "--family", choices=(*FAMILIES, "wrangler", *SQLALCHEMY_FAMILIES), nargs="+"
-        )
+        command.add_argument("--family", choices=ALL_FAMILIES, nargs="+")
         command.add_argument(
             "--api", choices=("sync", "thread", "aio", "direct", "to_thread"), nargs="+"
         )
@@ -195,7 +193,7 @@ def main(argv: list[str] | None = None) -> int:
                 retire_host(queue, client(session_, "autoscaling"), ran)
         else:
             sys.stdout.write(json.dumps(status(queue), indent=2) + "\n")
-    elif args.command == "jobs":
+    else:
         filters = Filters(
             args.family, args.api, args.transport, args.output_kind, args.arraysize, args.chunksize
         )
@@ -204,6 +202,7 @@ def main(argv: list[str] | None = None) -> int:
         }
         if overrides:
             settings = replace(settings, **overrides)
+    if args.command == "jobs":
         jobs = expand_jobs(
             settings,
             args.suite,
@@ -214,15 +213,7 @@ def main(argv: list[str] | None = None) -> int:
             explicit_trials=bool(overrides),
         )
         sys.stdout.write(json.dumps(jobs, indent=1) + "\n")
-    else:
-        overrides = {
-            k: v for k in ("warmups", "repetitions") if (v := getattr(args, k)) is not None
-        }
-        if overrides:
-            settings = replace(settings, **overrides)
-        filters = Filters(
-            args.family, args.api, args.transport, args.output_kind, args.arraysize, args.chunksize
-        )
+    elif args.command in {"plan", "run"}:
         cases = filters.select(matrix(settings, args.suite, args.shape))
         if not cases:
             raise ValueError("No cases match the selected filters")
