@@ -1,14 +1,60 @@
+import asyncio
+import threading
 from datetime import datetime
 from decimal import Decimal
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import sqlalchemy
 from sqlalchemy import cast, literal, select, text, types
 from sqlalchemy.sql.schema import Column, MetaData, Table
+from sqlalchemy.util.concurrency import greenlet_spawn
 
+from pyathena.aio.sqlalchemy.base import AsyncAdapt_pyathena_cursor
 from pyathena.sqlalchemy.types import AthenaArray
 from tests import ENV
 from tests.pyathena.util import throttle_metadata_api
+
+
+class TestAsyncAdaptPyathenaCursor:
+    @pytest.mark.parametrize(
+        "error",
+        [ValueError("conversion failed"), asyncio.CancelledError()],
+        ids=["error", "cancel"],
+    )
+    async def test_execute_closes_cursor_off_event_loop_when_fetch_fails(self, error):
+        cursor = MagicMock()
+        cursor.execute = AsyncMock(return_value=cursor)
+        cursor.description = [("col", "varchar", None, None, None, None, None)]
+        cursor.fetchall = AsyncMock(side_effect=error)
+        closes = []
+        cursor.close.side_effect = lambda: closes.append(threading.get_ident())
+        adapted = AsyncAdapt_pyathena_cursor(cursor)
+
+        with pytest.raises(type(error)):
+            await greenlet_spawn(adapted.execute, "SELECT 1")
+
+        assert len(closes) == 1
+        assert closes[0] != threading.get_ident()
+
+    @pytest.mark.parametrize(
+        "error",
+        [ValueError("conversion failed"), asyncio.CancelledError()],
+        ids=["error", "cancel"],
+    )
+    async def test_execute_keeps_fetch_error_when_close_fails(self, error, caplog):
+        cursor = MagicMock()
+        cursor.execute = AsyncMock(return_value=cursor)
+        cursor.description = [("col", "varchar", None, None, None, None, None)]
+        cursor.fetchall = AsyncMock(side_effect=error)
+        cursor.close.side_effect = ValueError("generator already executing")
+        adapted = AsyncAdapt_pyathena_cursor(cursor)
+
+        with pytest.raises(type(error)) as raised:
+            await greenlet_spawn(adapted.execute, "SELECT 1")
+
+        assert raised.value is error
+        assert "Failed to close the cursor after a failed fetch." in caplog.text
 
 
 class TestAsyncSQLAlchemyAthena:

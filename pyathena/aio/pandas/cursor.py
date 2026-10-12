@@ -88,6 +88,8 @@ class AioPandasCursor(WithAsyncFetch):
                 in one call, without ``chunksize`` or ``iterator``, is read in 32 MiB blocks with
                 fsspec's background cache, which reads the next block while pandas parses the
                 current one.
+                Without ``cache_type``, PyAthena's filesystem reads a Parquet file of a chunked
+                UNLOAD result that is larger than 32 MiB without a cache.
             s3_max_workers: Maximum number of workers of the S3 filesystem.
             result_reuse_enable: Whether to enable Athena query result reuse.
             result_reuse_minutes: Maximum age of a reused query result in minutes.
@@ -181,7 +183,7 @@ class AioPandasCursor(WithAsyncFetch):
         Returns:
             Self reference for method chaining.
         """
-        self._reset_state()
+        await self._async_reset_state()
         options = ExecuteOptions.resolve(
             options,
             work_group=work_group,

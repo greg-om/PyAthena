@@ -7,6 +7,7 @@ import importlib
 import logging
 from collections import abc
 from collections.abc import Callable, Iterable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from functools import partial
 from io import BufferedReader, BytesIO, IOBase, StringIO, TextIOWrapper
@@ -579,6 +580,8 @@ class AthenaPandasResultSet(AthenaResultSet):
                 file that ``pandas.read_csv()`` reads in one call, without ``chunksize`` or
                 ``iterator``, is read in 32 MiB blocks with fsspec's background cache, which reads
                 the next block while pandas parses the current one.
+                Without ``cache_type``, PyAthena's filesystem reads a Parquet file of a chunked
+                UNLOAD result that is larger than 32 MiB without a cache.
             max_workers: Maximum worker threads for parallel operations.
             auto_optimize_chunksize: Enable automatic chunksize determination
                                    for large files when chunksize is None.
@@ -1474,6 +1477,7 @@ class AthenaPandasResultSet(AthenaResultSet):
                 self._data_manifest,
                 cast(int, self._chunksize),
                 columns=self._kwargs.get("columns"),
+                cache_type=self._cache_type,
             ) as reader:
                 for table in reader:
                     df = self._convert_parquet_chunk(table, start)
@@ -1513,37 +1517,55 @@ class AthenaPandasResultSet(AthenaResultSet):
         df.index = pd.RangeIndex(start, start + len(df))
         return df
 
-    def _read_parquet_footers(self) -> tuple[int, list[str]]:
+    def _read_parquet_footers(self) -> list[FileMetaData]:
         """Read the data manifest and the footers of its Parquet files.
 
-        It sets the unload location, and the whole-result dtypes of the columns that
-        ``_get_parquet_null_dtypes()`` finds in any file.
+        The footers are read concurrently, with no more threads than the connection pool
+        of the S3 client. It sets the unload location, and the whole-result dtypes of the
+        columns that ``_get_parquet_null_dtypes()`` finds in any file.
 
         Returns:
-            The number of rows in the files, and the names of the top-level columns of
-            the first file.
+            The footers of the files, in the order of the data manifest.
 
         Raises:
             OperationalError: If reading the footers fails.
         """
-        from pyarrow import parquet
-
         self._data_manifest = self._read_data_manifest()
         if not self._data_manifest:
-            return 0, []
+            return []
         if not self._unload_location:
             self._unload_location = "/".join(self._data_manifest[0].split("/")[:-1]) + "/"
-        footers: list[FileMetaData] = []
+        # More threads than the S3 client's connection pool would discard connections,
+        # each with a warning from urllib3.
+        workers = min(
+            self.connection.s3_client.meta.config.max_pool_connections,
+            len(self._data_manifest),
+        )
         try:
-            for path in self._data_manifest:
-                with self._fs.open(path, "rb") as f:
-                    footers.append(parquet.read_metadata(f))
+            # When the failure of a read reaches map()'s iterator, it cancels the reads
+            # that have not started.
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                footers = list(executor.map(self._read_parquet_footer, self._data_manifest))
         except Exception as e:
             _logger.exception(f"Failed to read {self._unload_location}.")
             raise OperationalError(*e.args) from e
         for footer in footers:
             self._parquet_null_dtypes.update(self._get_parquet_null_dtypes(footer))
-        return sum(f.num_rows for f in footers), footers[0].schema.to_arrow_schema().names
+        return footers
+
+    def _read_parquet_footer(self, path: str) -> FileMetaData:
+        """Read the footer of a Parquet file.
+
+        Args:
+            path: The path of the file.
+
+        Returns:
+            The metadata of the file.
+        """
+        from pyarrow import parquet
+
+        with self._fs.open(path, "rb") as f:
+            return parquet.read_metadata(f)
 
     @staticmethod
     def _get_parquet_null_dtypes(footer: FileMetaData) -> dict[str, Any]:
@@ -1586,12 +1608,16 @@ class AthenaPandasResultSet(AthenaResultSet):
             import pandas as pd
 
             engine = self._get_parquet_engine()
-            rows, names = self._read_parquet_footers()
-            if rows == 0:
+            footers = self._read_parquet_footers()
+            if not any(footer.num_rows for footer in footers):
                 self._metadata = ()
                 return pd.DataFrame()
-            if set(self._kwargs.get("columns") or ()) <= set(names):
-                self._metadata = self._read_parquet_schema(engine)
+            # The files of one UNLOAD query have the same schema.
+            schema = footers[0].schema.to_arrow_schema()
+            if set(self._kwargs.get("columns") or ()) <= set(schema.names):
+                if engine != "pyarrow":
+                    raise ProgrammingError("Engine must be `pyarrow`.")
+                self._metadata = to_column_info(schema)
                 return self._iter_parquet_chunks()
             # Columns that are not top-level columns of the result are read whole,
             # where pandas selects nested fields or raises for missing columns.

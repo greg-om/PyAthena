@@ -27,6 +27,7 @@ def _chunked_result_set() -> AthenaPolarsResultSet:
     """
     result_set = AthenaPolarsResultSet.__new__(AthenaPolarsResultSet)  # bypass __init__
     result_set._chunksize = 10_000
+    result_set._cache_type = None
     result_set._kwargs = {}
     result_set._metadata = None
     return result_set
