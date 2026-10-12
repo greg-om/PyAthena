@@ -13,18 +13,16 @@ import argparse
 import json
 import logging
 import sys
-import time
 from dataclasses import asdict, replace
 from pathlib import Path
-from typing import Any
 
 from pyathena_bench.aws import (
-    IncompleteStackError,
     cleanup,
     client,
     preflight,
     prepare,
     prepare_fixtures,
+    run_locations,
     session,
     split_location,
     stack_resources,
@@ -34,12 +32,10 @@ from pyathena_bench.cases import ALL_FAMILIES, SHAPES, matrix
 from pyathena_bench.config import Settings, read_json
 from pyathena_bench.fleet import (
     API_FAMILIES,
-    SIMULATED_NOTICE,
     Filters,
     Queue,
     SpotInterruptionError,
     expand_jobs,
-    interruption_notice,
     merge_jobs,
     retire_host,
     status,
@@ -48,7 +44,7 @@ from pyathena_bench.fleet import (
     work,
 )
 from pyathena_bench.report import report
-from pyathena_bench.runner import completed_trials, run
+from pyathena_bench.runner import completed_trials, run, s3_checkpoint
 
 
 def parser() -> argparse.ArgumentParser:
@@ -107,6 +103,11 @@ def parser() -> argparse.ArgumentParser:
                 default=[],
                 help="Output directories of earlier attempts whose finished trials are skipped",
             )
+            command.add_argument(
+                "--checkpoint",
+                help="s3:// prefix below which each trial's start and record are written "
+                "between trials; set by fleet workers, whose job summary merges the attempts",
+            )
     enqueue = commands.add_parser(
         "queue", help="Publish jobs and a prepared manifest for fleet workers"
     )
@@ -117,7 +118,11 @@ def parser() -> argparse.ArgumentParser:
     )
     enqueue.add_argument("--manifest", type=Path, required=True)
     consume = commands.add_parser("worker", help="Run queued jobs on this host until none remain")
-    consume.add_argument("--stack", required=True)
+    location = consume.add_mutually_exclusive_group(required=True)
+    location.add_argument("--stack", help="Stack whose Results output holds the queue")
+    location.add_argument(
+        "--results", help="The stack's results location, which hosts know from their user data"
+    )
     consume.add_argument("--name", required=True)
     consume.add_argument(
         "--api-slots",
@@ -135,7 +140,7 @@ def parser() -> argparse.ArgumentParser:
     consume.add_argument(
         "--wait",
         action="store_true",
-        help="Wait for the stack's outputs and for the queue to be published instead of failing",
+        help="Wait for the queue to be published instead of failing",
     )
     consume.add_argument(
         "--lease-seconds",
@@ -161,31 +166,6 @@ def parser() -> argparse.ArgumentParser:
         help="Keep fixed inputs and initialization fixtures for retry",
     )
     return root
-
-
-def wait_for_stack(
-    session_: Any, stack: str, wait: bool, poll_seconds: float = 30.0
-) -> dict[str, str]:
-    """Read the stack's resources, waiting for its outputs if requested.
-
-    A host's worker starts during stack creation, before the outputs exist.
-
-    Args:
-        session_: Boto3 session.
-        stack: Stack name or ID.
-        wait: Whether to wait while the outputs are incomplete.
-        poll_seconds: Seconds between attempts.
-
-    Returns:
-        The stack resources.
-    """
-    while True:
-        try:
-            return stack_resources(session_, stack)
-        except IncompleteStackError:
-            if not wait:
-                raise
-        time.sleep(poll_seconds)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -217,9 +197,10 @@ def main(argv: list[str] | None = None) -> int:
                         else f"b_{manifest['run_id']}_*"
                     ),
                     "s3_prefixes": [
-                        f"{root}runs/{manifest['run_id']}/"
-                        + ("trials/" if args.trials_only else "")
-                        for root in sorted({f"s3://{resources['Bucket']}/", resources["Results"]})
+                        root + ("trials/" if args.trials_only else "")
+                        for root in sorted(
+                            set(run_locations(resources, manifest["run_id"]).values())
+                        )
                     ],
                     "preserve_inputs_and_fixtures": args.trials_only,
                 },
@@ -231,8 +212,8 @@ def main(argv: list[str] | None = None) -> int:
             cleanup(settings, manifest, args.manifest, trials_only=args.trials_only)
     elif args.command in {"queue", "worker", "status"}:
         session_ = session(settings)
-        resources = wait_for_stack(session_, args.stack, getattr(args, "wait", False))
-        bucket, base = split_location(resources["Results"])
+        results = getattr(args, "results", None) or stack_resources(session_, args.stack)["Results"]
+        bucket, base = split_location(results)
         queue = Queue(client(session_, "s3"), bucket, args.name, base)
         if args.command == "queue":
             validate_manifest(settings, read_json(args.manifest))
@@ -243,8 +224,6 @@ def main(argv: list[str] | None = None) -> int:
             if args.lease_seconds < 300:
                 raise ValueError("--lease-seconds must be at least 300")
             autoscaling = client(session_, "autoscaling")
-            # A rehearsed notice applies to one worker; a restarted worker starts clean.
-            SIMULATED_NOTICE.unlink(missing_ok=True)
             if args.terminate_host:
                 suspend_rebalance(autoscaling)
             try:
@@ -253,8 +232,6 @@ def main(argv: list[str] | None = None) -> int:
                     args.workdir or Path("results/fleet") / args.name,
                     args.api_slots,
                     lease_seconds=args.lease_seconds,
-                    renew_seconds=args.lease_seconds / 10,
-                    notice=interruption_notice,
                     wait=args.wait,
                 )
             except SpotInterruptionError as interrupted:
@@ -325,13 +302,23 @@ def main(argv: list[str] | None = None) -> int:
             manifest = read_json(args.manifest)
             if args.suite == "init":
                 prepare_fixtures(settings, manifest, args.manifest, scales, args.shape)
-            success = run(
-                settings, manifest, cases, scales, args.out, completed_trials(args.resume)
+            checkpoint = (
+                s3_checkpoint(client(session(settings), "s3"), args.checkpoint)
+                if args.checkpoint
+                else None
             )
-            if args.resume and not (args.out / "trials.jsonl").exists():
-                # Earlier attempts recorded every trial; the job's report merges them.
-                return 0 if success else 1
-            report(args.out)
+            success = run(
+                settings,
+                manifest,
+                cases,
+                scales,
+                args.out,
+                completed_trials(args.resume),
+                checkpoint,
+            )
+            if not checkpoint:
+                # A fleet job's summary merges its attempts instead.
+                report(args.out)
             return 0 if success else 1
     return 0
 

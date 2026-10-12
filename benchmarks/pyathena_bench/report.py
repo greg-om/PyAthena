@@ -96,7 +96,6 @@ def summarize(trials: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     t["status"] not in {"ok", "unsupported"} and not t.get("superseded")
                     for t in measured
                 ),
-                "superseded_failures": sum(bool(t.get("superseded")) for t in measured),
                 "failed_warmups": sum(
                     t.get("warmup", False) and t["status"] != "ok" for t in group
                 ),
@@ -161,16 +160,68 @@ def read_records(path: Path) -> list[dict[str, Any]]:
     return records
 
 
+# A fleet attempt's per-trial records in S3, written between trials; see runner.run().
+CHECKPOINT = "checkpoint"
+
+
+def trial_key(trial: dict[str, Any]) -> tuple[str, str, int | None]:
+    """Return the scale, case, and repetition that identify a trial across attempts.
+
+    Args:
+        trial: Trial record or ``trial_start`` event.
+
+    Returns:
+        The key; the repetition is None for a case recorded as unsupported.
+    """
+    return (trial["scale"], trial["case_id"], trial.get("repetition"))
+
+
+def read_trials(directory: Path) -> list[dict[str, Any]]:
+    """Read the trial records of one output directory, including its checkpoint.
+
+    Args:
+        directory: Output directory of a run or of a fleet attempt.
+
+    Returns:
+        Records from ``trials.jsonl`` and checkpoint records missing from it.
+    """
+    trials = read_records(directory / "trials.jsonl")
+    recorded = {trial.get("trial") for trial in trials}
+    for path in sorted((directory / CHECKPOINT).glob("*.json")):
+        if not path.name.endswith("-start.json") and path.stem not in recorded:
+            trials.append(json.loads(path.read_text()))
+    return trials
+
+
+def read_trial_starts(directory: Path) -> list[dict[str, Any]]:
+    """Read the ``trial_start`` events of one output directory, including its checkpoint.
+
+    Args:
+        directory: Output directory of a run or of a fleet attempt.
+
+    Returns:
+        Events from ``events.jsonl`` and checkpoint events missing from it.
+    """
+    starts = [e for e in read_records(directory / "events.jsonl") if e["event"] == "trial_start"]
+    started = {event.get("trial") for event in starts}
+    starts.extend(
+        json.loads(path.read_text())
+        for path in sorted((directory / CHECKPOINT).glob("*-start.json"))
+        if path.name.removesuffix("-start.json") not in started
+    )
+    return starts
+
+
 def collect_trials(directory: Path) -> list[dict[str, Any]]:
     """Read the trials of an output directory and of its attempt subdirectories.
 
     A fleet job keeps each attempt in an ``attempt-<n>`` subdirectory; their
-    trials are merged.
-    A started trial without a final record is reported as incomplete. A failed
-    or incomplete trial is marked ``superseded`` when another attempt recorded
-    the same measured repetition as successful, so a resumed job counts the
-    trials of an uninterrupted run while its failures stay visible; a second
-    successful record of a repetition is dropped.
+    trials are merged. A started trial without a final record is reported as
+    incomplete. A failed or incomplete trial whose measured repetition another
+    attempt recorded as successful is marked ``superseded``: it is noted but
+    not counted as failed, so a resumed job counts the trials of an
+    uninterrupted run. A repetition that two attempts recorded as successful
+    counts once.
 
     Args:
         directory: Output directory of a run, or a job directory with attempts.
@@ -179,31 +230,25 @@ def collect_trials(directory: Path) -> list[dict[str, Any]]:
         Trial records.
     """
     sources = [directory, *sorted(p for p in directory.glob("attempt-*") if p.is_dir())]
-    trials = [t for source in sources for t in read_records(source / "trials.jsonl")]
+    trials = [t for source in sources for t in read_trials(source)]
     recorded = {trial.get("trial") for trial in trials}
     trials.extend(
         {**event, "status": "incomplete", "error": "Trial started without a final record"}
         for source in sources
-        for event in read_records(source / "events.jsonl")
-        if event["event"] == "trial_start" and event["trial"] not in recorded
+        for event in read_trial_starts(source)
+        if event["trial"] not in recorded
     )
-    succeeded = {
-        (t["scale"], t["case_id"], t.get("repetition"))
-        for t in trials
-        if t["status"] == "ok" and not t.get("warmup")
-    }
+    succeeded = {trial_key(t) for t in trials if t["status"] == "ok" and not t.get("warmup")}
     merged = []
-    kept: set[tuple[Any, ...]] = set()
+    counted: set[tuple[str, str, int | None]] = set()
     for trial in trials:
-        key = (trial["scale"], trial["case_id"], trial.get("repetition"))
-        if trial["status"] == "ok":
-            # Two attempts can both record a repetition when a takeover resumed
-            # from a checkpoint older than the interrupted attempt's last upload.
-            if len(sources) > 1 and key in kept:
+        if trial["status"] == "ok" and not trial.get("warmup"):
+            if len(sources) > 1 and trial_key(trial) in counted:
                 continue
-            kept.add(key)
-        elif trial["status"] != "unsupported" and key in succeeded and not trial.get("warmup"):
-            trial = {**trial, "superseded": True}
+            counted.add(trial_key(trial))
+        elif trial["status"] != "unsupported" and not trial.get("warmup"):
+            if trial_key(trial) in succeeded:
+                trial = {**trial, "superseded": True}
         merged.append(trial)
     return merged
 

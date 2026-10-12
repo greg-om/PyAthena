@@ -175,11 +175,16 @@ def test_hosts_start_the_queue_worker_and_expose_their_tags():
     assert not errors
     launch = template["Resources"]["LaunchTemplate"]["Properties"]["LaunchTemplateData"]
     assert launch["MetadataOptions"]["InstanceMetadataTags"] == "enabled"
-    user_data = launch["UserData"]["Fn::Base64"]["Fn::Sub"]
+    user_data, variables = launch["UserData"]["Fn::Base64"]["Fn::Sub"]
     assert "if [ -n '${QueueName}' ]; then" in user_data
+    # The worker reads the results location from user data, before the stack's outputs exist.
     assert (
-        "ExecStart=/opt/pyathena/.venv/bin/python -m pyathena_bench worker --stack ${AWS::StackId}"
+        "ExecStart=/opt/pyathena/.venv/bin/python -m pyathena_bench worker --results ${Results}"
         " --name ${QueueName} --api-slots ${ApiSlots} --wait --terminate-host"
     ) in user_data
+    assert (
+        "printf '%s\\n' '${Results}' > /opt/pyathena/benchmarks/results-location.txt" in user_data
+    )
+    assert variables["Results"] == template["Outputs"]["Results"]["Value"]
     assert "systemctl enable --now pyathena-bench-worker.service" in user_data
     assert template["Parameters"]["QueueName"]["Default"] == ""

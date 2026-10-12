@@ -19,8 +19,7 @@ from types import SimpleNamespace
 
 import pytest
 from botocore.exceptions import ClientError
-from pyathena_bench.__main__ import main, wait_for_stack
-from pyathena_bench.aws import IncompleteStackError
+from pyathena_bench.__main__ import main
 from pyathena_bench.cases import Case
 from pyathena_bench.config import Settings
 from pyathena_bench.fleet import (
@@ -79,6 +78,9 @@ class FakeS3:
 
     def upload_file(self, filename, bucket, key):
         self.put_object(Key=key, Body=Path(filename).read_bytes())
+
+    def download_file(self, bucket, key, filename):
+        Path(filename).write_bytes(self.objects[key])
 
     def list_objects_v2(self, **kwargs):
         keys = [k for k in self.objects if k.startswith(kwargs["Prefix"])]
@@ -312,7 +314,7 @@ class TestQueue:
         runs = []
         settled = []
 
-        def runner(item, workdir, out, resume, stop):
+        def runner(item, workdir, out, resume, stop, checkpoint):
             runs.append(item["id"])
             out.mkdir(parents=True)
             (out / "summary.csv").write_text("x")
@@ -494,7 +496,7 @@ class TestQueueSafety:
         _, queue = queue_with([job("first"), job("second")], tmp_path)
         runs = []
 
-        def runner(item, workdir, out, resume, stop):
+        def runner(item, workdir, out, resume, stop, checkpoint):
             runs.append(item["id"])
             out.mkdir(parents=True)
             (out / "events.jsonl").write_text(
@@ -544,7 +546,9 @@ class TestQueueSafety:
                 ]
             )
         )
-        assert trial_evidence(tmp_path) == ({"a"}, ("s3://b/runs/r/trials/t1/",))
+        # A trial process killed while writing leaves an incomplete final record.
+        with pytest.warns(UserWarning, match="incomplete final record"):
+            assert trial_evidence(tmp_path) == ({"a"}, ("s3://b/runs/r/trials/t1/",))
         assert trial_evidence(tmp_path / "missing") == (set(), ())
 
     def test_jobs_wider_than_the_api_slots_stop_the_worker_before_claiming(self, tmp_path):
@@ -651,11 +655,11 @@ class TestFollowUpSafety:
         assert ran == ["first"]
         errors = status(queue)["failed"]["first"]["quiesce_errors"]
         assert errors == [
-            "Could not quiesce the job: RuntimeError: Could not inspect query history"
+            "Could not quiesce attempt-1: RuntimeError: Could not inspect query history"
         ]
 
 
-def ok_trial(repetition):
+def ok_trial(repetition, **changes):
     return {
         "trial": f"t{repetition}",
         "case_id": "case",
@@ -667,10 +671,34 @@ def ok_trial(repetition):
         "successful_queries_per_second": 1,
         "rss_peak_bytes": 1,
         "max_threads": 1,
+        **changes,
     }
 
 
-class TestLeases:
+def take_over(queue, job_id, host="other", attempt=2):
+    """Write the claim that another worker holds after taking the job over."""
+    at = time.time()
+    queue.put(
+        queue.key("claims", job_id),
+        {"host": host, "job": job_id, "attempt": attempt, "state": "running",
+         "renewed": at, "expires": at + 600},
+    )  # fmt: skip
+
+
+def recording_runner(calls, code=0, trials=None):
+    """Return a runner that records its calls and writes the given trial records."""
+
+    def runner(item, workdir, out, resume, stop, checkpoint):
+        calls.append((item["id"], out.name, [p.name for p in resume]))
+        out.mkdir(parents=True)
+        records = (trials or {}).get(item["id"], [])
+        (out / "trials.jsonl").write_text("".join(json.dumps(t) + "\n" for t in records))
+        return code
+
+    return runner
+
+
+class TestLease:
     def test_only_one_worker_takes_over_an_expired_lease(self, tmp_path):
         _, queue = queue_with([], tmp_path)
         key = queue.key("claims", "a")
@@ -708,217 +736,115 @@ class TestLeases:
             assert taken.body["attempt"] == (1 if operation == "create" else 2)
             assert queue.read_lease(key).etag == taken.etag
 
-    def test_live_claims_are_left_and_expired_ones_return_to_the_fleet(self, tmp_path, monkeypatch):
-        _, queue = queue_with([job("live"), job("expired")], tmp_path)
-        busy = queue.acquire(queue.key("claims", "live"), {"host": "busy"}, 600)
-        queue.acquire(queue.key("claims", "expired"), {"host": "dead"}, -1)
-        runs = []
-        waits = []
+    def test_acquire_does_not_write_a_live_lease(self, tmp_path):
+        s3, queue = queue_with([], tmp_path)
+        key = queue.key("claims", "a")
+        queue.acquire(key, {"host": "busy"}, 600)
+        attempts = []
+        original = s3.put_object
+        s3.put_object = lambda **kwargs: attempts.append(kwargs["Key"]) or original(**kwargs)
+        assert queue.acquire(key, {"host": "me"}, 600) is None
+        assert attempts == []
 
-        def runner(item, workdir, out, resume, stop):
-            runs.append((item["id"], out.name, resume))
-            return 0
-
-        def sleep(seconds):
-            # The busy worker renews its claim while this worker waits to exit.
-            waits.append(seconds)
-            assert queue.renew(busy, 600)
-
-        monkeypatch.setattr("pyathena_bench.fleet.time.sleep", sleep)
-        ran = work(
-            queue, tmp_path / "w", api_slots=1, poll_seconds=0, runner=runner, settle=no_queries
-        )
-        assert len(waits) == 1
-        assert ran == ["expired"]
-        assert runs == [("expired", "attempt-2", [])]
-        running = status(queue)["running"]
-        assert running["live"] == {
-            "host": "busy",
-            "job": None,
-            "attempt": 1,
-            "state": "running",
-            "expired": False,
-            "stale": False,
-        }
-
-    def test_an_expired_slot_returns_to_the_fleet(self, tmp_path):
-        _, queue = queue_with([job("heavy", heavy=True)], tmp_path)
-        queue.acquire(queue.key("slots", "0"), {"host": "dead"}, -1)
-        assert status(queue)["slots_in_use"]["0"]["expired"]
-        ran = work(
-            queue,
-            tmp_path / "w",
-            api_slots=1,
-            poll_seconds=0,
-            runner=lambda *a: 0,
-            settle=no_queries,
-        )
-        assert ran == ["heavy"]
-        assert not live_slots(queue)
-
-    def test_watch_renews_leases_and_uploads_progress(self, tmp_path):
+    def test_ending_an_expired_lease_keeps_another_workers_takeover(self, tmp_path):
         _, queue = queue_with([], tmp_path)
-        lease = queue.acquire(queue.key("claims", "a"), {"host": "h"}, 1)
-        expires = lease.body["expires"]
-        uploads = []
-        with JobWatch(queue, [lease], 600, 0.01, lambda: uploads.append(1), lambda: False):
-            deadline = time.monotonic() + 5
-            while not uploads and time.monotonic() < deadline:
-                time.sleep(0.01)
-        assert uploads
-        assert queue.read_lease(lease.key).body["expires"] > expires + 500
+        key = queue.key("slots", "0")
+        mine = queue.acquire(key, {"host": "slow"}, -1)
+        theirs = queue.acquire(key, {"host": "other"}, 600)
+        assert not queue.end_lease(mine, "released")
+        assert queue.read_lease(key).body == theirs.body
+        assert live_slots(queue) == ["0"]
 
-    def test_watch_stops_renewing_a_lease_taken_over_by_another_worker(self, tmp_path):
+    @pytest.mark.parametrize("state", ["interrupted", "released"])
+    def test_ending_a_lease_after_its_own_concurrent_renewal(self, tmp_path, state):
         _, queue = queue_with([], tmp_path)
-        lease = queue.acquire(queue.key("claims", "a"), {"host": "h"}, -1)
-        assert queue.acquire(lease.key, {"host": "other"}, 600)
-        with JobWatch(queue, [lease], 600, 0.01, lambda: None, lambda: False) as watch:
-            deadline = time.monotonic() + 5
-            while not watch.lost and time.monotonic() < deadline:
-                time.sleep(0.01)
-        assert watch.lost == [lease.key]
-        assert queue.read_lease(lease.key).body["host"] == "other"
+        key = queue.key("claims", "a")
+        lease = queue.acquire(key, {"host": "h", "job": "a"}, 600)
+        copy = Lease(key, dict(lease.body), lease.etag)
+        assert queue.renew(lease, 600)
+        assert queue.end_lease(copy, state)
+        assert queue.read_lease(key).body["state"] == state
+
+    def test_slots_are_written_only_when_enough_are_free(self, tmp_path):
+        s3, queue = queue_with([], tmp_path)
+        queue.acquire(queue.key("slots", "0"), {"host": "busy"}, 600)
+        attempts = []
+        original = s3.put_object
+        s3.put_object = lambda **kwargs: attempts.append(kwargs["Key"]) or original(**kwargs)
+        assert queue.acquire_slots(2, 2, {"host": "me"}, 600) is None
+        assert attempts == []
 
 
-class TestInterruption:
-    def test_notice_comes_from_instance_metadata_or_a_simulation_file(self, tmp_path):
+class TestJobWatch:
+    def test_renews_the_claim_and_slots(self, tmp_path):
+        _, queue = queue_with([], tmp_path)
+        claim = queue.acquire(queue.key("claims", "a"), {"host": "h"}, 1)
+        slot = queue.acquire(queue.key("slots", "0"), {"host": "h"}, 1)
+        renewed = claim.body["renewed"], slot.body["renewed"]
+        # The renew interval is a tenth of the lease period.
+        with JobWatch(queue, claim, [slot], 1, lambda: False) as watch:
+            time.sleep(0.5)
+            assert not watch.stop_event.is_set()
+        assert queue.read_lease(claim.key).body["renewed"] > renewed[0]
+        assert queue.read_lease(slot.key).body["renewed"] > renewed[1]
+
+    def test_a_claim_taken_over_by_another_worker_is_lost(self, tmp_path):
+        _, queue = queue_with([], tmp_path)
+        claim = queue.acquire(queue.key("claims", "a"), {"host": "h"}, 0.1)
+        take_over(queue, "a")
+        with JobWatch(queue, claim, [], 0.1, lambda: False) as watch:
+            assert watch.stop_event.wait(5)
+        assert watch.claim_lost.is_set()
+        assert not watch.interrupted.is_set()
+        assert queue.read_lease(claim.key).body["host"] == "other"
+
+    def test_a_stalled_renewal_that_outlasts_the_claim_loses_it(self, tmp_path):
+        _, queue = queue_with([], tmp_path)
+        claim = queue.acquire(queue.key("claims", "a"), {"host": "h"}, 0.2)
+        stalled = threading.Event()
+        released = threading.Event()
+
+        def stall(lease, seconds, **changes):
+            stalled.set()
+            released.wait()
+            return False
+
+        queue.renew = stall
+        with JobWatch(queue, claim, [], 0.1, lambda: False) as watch:
+            try:
+                assert stalled.wait(5)
+                # The claim expires while its renewal is still blocked in S3.
+                assert watch.claim_lost.wait(5)
+                assert not watch.interrupted.is_set()
+            finally:
+                # Unblock the renewal before leaving the block joins the thread.
+                released.set()
+
+
+class TestInterruptionNotice:
+    def test_notice_comes_from_instance_metadata_or_a_rehearsal_file(self, tmp_path):
         def missing(path):
             raise urllib.error.HTTPError(path, 404, "Not Found", None, None)
 
-        absent = tmp_path / "notice"
-        assert not interruption_notice(missing, absent)
-        assert interruption_notice(lambda path: '{"action": "terminate"}', absent)
-        absent.touch()
-        assert interruption_notice(missing, absent)
+        rehearsal = tmp_path / "notice"
+        assert not interruption_notice(missing, rehearsal)
+        assert interruption_notice(lambda path: '{"action": "terminate"}', rehearsal)
+        rehearsal.touch()
+        assert interruption_notice(missing, rehearsal)
 
-    def test_interrupted_job_is_resumed_by_another_worker_with_the_same_trials(self, tmp_path):
-        s3, queue = queue_with([job("heavy", heavy=True), job("next")], tmp_path)
-        notice = threading.Event()
+    def test_notice_errors_count_as_no_notice(self, tmp_path):
+        def incomplete(path):
+            raise http.client.IncompleteRead(b"")
 
-        def interrupted_runner(item, workdir, out, resume, stop):
-            out.mkdir(parents=True)
-            (out / "trials.jsonl").write_text(json.dumps(ok_trial(0)) + "\n")
-            notice.set()
-            assert stop.wait(5)
-            with (out / "trials.jsonl").open("a") as stream:
-                interrupted = {**ok_trial(1), "status": "interrupted"}
-                del interrupted["queries"]
-                stream.write(json.dumps(interrupted) + "\n")
-            return 1
+        assert not interruption_notice(incomplete)
 
-        with pytest.raises(SpotInterruptionError) as raised:
-            work(
-                queue,
-                tmp_path / "w1",
-                api_slots=1,
-                poll_seconds=0,
-                runner=interrupted_runner,
-                settle=no_queries,
-                renew_seconds=0.01,
-                notice=notice.is_set,
-            )
-        assert raised.value.ran == []
-        claim = queue.read_lease(queue.key("claims", "heavy"))
-        assert claim.body["state"] == "interrupted"
-        assert not live_slots(queue)
-        assert queue.key("results", "heavy", "attempt-1", "trials.jsonl") in s3.objects
-        assert not queue.names("done")
+        def broken():
+            raise RuntimeError("unexpected")
 
-        settled = []
-        runs = []
-        writes = []
-        original_put = s3.put_object
-
-        def recording_put(**kwargs):
-            writes.append(kwargs["Key"])
-            return original_put(**kwargs)
-
-        s3.put_object = recording_put
-
-        def resumed_runner(item, workdir, out, resume, stop):
-            runs.append((item["id"], out.name, [p.name for p in resume]))
-            out.mkdir(parents=True)
-            if item["id"] == "heavy":
-                (out / "trials.jsonl").write_text(
-                    "".join(json.dumps(ok_trial(r)) + "\n" for r in (1, 2))
-                )
-            return 0
-
-        ran = work(
-            queue,
-            tmp_path / "w2",
-            api_slots=1,
-            poll_seconds=0,
-            runner=resumed_runner,
-            settle=lambda output: settled.append(output.name) or [],
-        )
-        assert ran == ["heavy", "next"]
-        assert runs == [("heavy", "attempt-2", ["attempt-1"]), ("next", "attempt-1", [])]
-        # The interrupted attempt's queries are quiesced before the job continues.
-        assert settled == ["attempt-1"]
-        summary_key = queue.key("results", "heavy", "attempt-2", "job-summary.csv")
-        order = [key for key in writes if key in {summary_key, queue.key("done", "heavy")}]
-        # A recorded job always has its summary, below the attempt that the marker names.
-        assert order == [summary_key, queue.key("done", "heavy")]
-        assert json.loads(queue.read("done", "heavy"))["summary"] == "heavy/attempt-2"
-        summary = s3.objects[summary_key].decode()
-        row = next(csv.DictReader(io.StringIO(summary)))
-        assert (row["successful_trials"], row["failed_trials"]) == ("3", "0")
-        # The interrupted trial stays visible.
-        assert row["superseded_failures"] == "1"
-        assert "Superseded: interrupted" in row["notes"]
-        assert json.loads(queue.read("done", "heavy"))["attempt"] == 2
-
-    def test_a_notice_while_quiescing_an_earlier_attempt_skips_the_run(self, tmp_path):
-        s3, queue = queue_with([job("a")], tmp_path)
-        queue.acquire(queue.key("claims", "a"), {"host": "dead"}, -1)
-        s3.put_object(Key=queue.key("results", "a", "attempt-1", "events.jsonl"), Body=b"")
-        notice = threading.Event()
-
-        def settle(output):
-            notice.set()
-            time.sleep(0.2)
-            return []
-
-        def runner(*args):
-            pytest.fail("A job must not start after an interruption notice")
-
-        with pytest.raises(SpotInterruptionError):
-            work(
-                queue,
-                tmp_path / "w",
-                api_slots=1,
-                poll_seconds=0,
-                runner=runner,
-                settle=settle,
-                renew_seconds=0.01,
-                notice=notice.is_set,
-            )
-        lease = queue.read_lease(queue.key("claims", "a"))
-        assert (lease.body["state"], lease.body["attempt"]) == ("interrupted", 2)
-
-    def test_a_notice_between_jobs_stops_the_worker_without_claiming(self, tmp_path):
+        assert not check_notice(broken)
         _, queue = queue_with([job("a")], tmp_path)
-        with pytest.raises(SpotInterruptionError):
-            work(queue, tmp_path / "w", api_slots=1, runner=lambda *a: 0, notice=lambda: True)
-        assert not queue.names("claims")
-
-    def test_worker_waits_for_publication(self, tmp_path, monkeypatch):
-        s3 = FakeS3()
-        queue = Queue(s3, "bucket", "run1", "results/stack/")
-        config = tmp_path / "config.toml"
-        config.write_text("[scales]\nsmall = 10000\n")
-        manifest = tmp_path / "manifest.json"
-        manifest.write_text("{}")
-        monkeypatch.setattr(
-            "pyathena_bench.fleet.time.sleep",
-            lambda seconds: submit(queue, [job("a")], config, manifest),
-        )
-        ran = work(
-            queue, tmp_path / "w", api_slots=1, runner=lambda *a: 0, settle=no_queries, wait=True
-        )
-        assert ran == ["a"]
-        assert all(key.startswith("results/stack/fleet/run1/") for key in s3.objects)
+        assert work(queue, tmp_path / "w", api_slots=1, runner=lambda *a: 0, settle=no_queries,
+                    notice=broken) == ["a"]  # fmt: skip
 
 
 class FakeProcess:
@@ -941,438 +867,292 @@ class FakeProcess:
         return 130
 
 
-def test_run_job_resumes_earlier_attempts_and_interrupts_with_sigint(tmp_path, monkeypatch):
-    processes = []
+class TestRunJob:
+    def test_resumes_writes_checkpoints_and_interrupts_with_sigint(self, tmp_path, monkeypatch):
+        processes = []
 
-    def popen(command, stdout, stderr, start_new_session):
-        processes.append(FakeProcess(command, stdout, stderr, start_new_session))
-        return processes[-1]
+        def popen(command, stdout, stderr, start_new_session):
+            processes.append(FakeProcess(command, stdout, stderr, start_new_session))
+            return processes[-1]
 
-    killed = []
-    monkeypatch.setattr("pyathena_bench.fleet.subprocess.Popen", popen)
-    monkeypatch.setattr(
-        "pyathena_bench.fleet.os.killpg", lambda pid, signum: killed.append((pid, signum))
-    )
-    stop = threading.Event()
-    stop.set()
-    earlier = tmp_path / "results" / "a" / "attempt-1"
-    code = run_job(
-        {"id": "a", "args": ["--suite", "single"]},
-        tmp_path,
-        tmp_path / "results" / "a" / "attempt-2",
-        [earlier],
-        stop,
-    )
-    assert code == 130
-    [process] = processes
-    assert process.signals == [signal.SIGINT]
-    # The orchestrator's own process group, including any trial process, is killed.
-    assert process.start_new_session
-    assert killed == [(4321, signal.SIGKILL)]
-    assert process.command[-4:] == ["--suite", "single", "--resume", str(earlier)]
-    assert (tmp_path / "logs" / "a-attempt-2.log").exists()
+        killed = []
+        monkeypatch.setattr("pyathena_bench.fleet.subprocess.Popen", popen)
+        monkeypatch.setattr(
+            "pyathena_bench.fleet.os.killpg", lambda pid, signum: killed.append((pid, signum))
+        )
+        stop = threading.Event()
+        stop.set()
+        earlier = tmp_path / "results" / "a" / "attempt-1"
+        code = run_job(
+            {"id": "a", "args": ["--suite", "single"]},
+            tmp_path,
+            tmp_path / "results" / "a" / "attempt-2",
+            [earlier],
+            stop,
+            "s3://bucket/fleet/q/results/a/attempt-2/",
+        )
+        assert code == 130
+        [process] = processes
+        assert process.signals == [signal.SIGINT]
+        assert process.command[-6:] == [
+            "--checkpoint", "s3://bucket/fleet/q/results/a/attempt-2/",
+            "--suite", "single", "--resume", str(earlier),
+        ]  # fmt: skip
+        # The orchestrator's own process group, including any trial process, is killed.
+        assert process.start_new_session
+        assert killed == [(4321, signal.SIGKILL)]
+        assert (tmp_path / "logs" / "a-attempt-2.log").exists()
 
 
-class TestLeaseOwnership:
-    def test_releasing_an_expired_slot_keeps_another_workers_takeover(self, tmp_path):
-        _, queue = queue_with([], tmp_path)
-        key = queue.key("slots", "0")
-        mine = queue.acquire(key, {"host": "slow"}, -1)
-        theirs = queue.acquire(key, {"host": "other"}, 600)
-        assert not queue.release_lease(mine)
-        assert queue.read_lease(key).body == theirs.body
-        assert live_slots(queue) == ["0"]
+class TestWork:
+    def test_expired_claims_are_taken_over_and_live_ones_left(self, tmp_path):
+        _, queue = queue_with([job("live"), job("expired")], tmp_path)
+        queue.acquire(queue.key("claims", "live"), {"host": "busy", "job": "live"}, 600)
+        queue.acquire(queue.key("claims", "expired"), {"host": "dead"}, -1)
+        calls = []
+        ran = work(
+            queue, tmp_path / "w", api_slots=1, poll_seconds=0, runner=recording_runner(calls),
+            settle=no_queries,
+        )  # fmt: skip
+        # Nothing else is pending, so the worker exits while the live claim runs.
+        assert ran == ["expired"]
+        assert calls == [("expired", "attempt-2", [])]
+        assert status(queue)["running"]["live"] == {
+            "host": "busy", "job": "live", "attempt": 1, "state": "running", "expired": False,
+        }  # fmt: skip
 
-    def test_interruption_is_marked_after_a_concurrent_renewal(self, tmp_path):
-        _, queue = queue_with([], tmp_path)
-        key = queue.key("claims", "a")
-        lease = queue.acquire(key, {"host": "h", "job": "a"}, 600)
-        stale = Lease(key, dict(lease.body), lease.etag)
-        assert queue.renew(lease, 600)
-        assert queue.end_lease(stale, "interrupted")
-        assert queue.read_lease(key).body["state"] == "interrupted"
-        # A stale copy of a slot is released the same way.
-        slot = queue.acquire(queue.key("slots", "0"), {"host": "h", "job": "a"}, 600)
-        copy = Lease(slot.key, dict(slot.body), slot.etag)
-        assert queue.renew(slot, 600)
-        assert queue.release_lease(copy)
-        assert live_slots(queue) == []
+    def test_an_expired_slot_returns_to_the_fleet(self, tmp_path):
+        _, queue = queue_with([job("heavy", heavy=True)], tmp_path)
+        queue.acquire(queue.key("slots", "0"), {"host": "dead"}, -1)
+        assert status(queue)["slots_in_use"]["0"]["expired"]
+        ran = work(
+            queue, tmp_path / "w", api_slots=1, poll_seconds=0, runner=lambda *a: 0,
+            settle=no_queries,
+        )  # fmt: skip
+        assert ran == ["heavy"]
+        assert not live_slots(queue)
 
-    def test_a_lost_claim_stops_the_attempt_without_recording_the_job(self, tmp_path, monkeypatch):
+    def test_an_interrupted_job_is_resumed_by_another_worker_with_the_same_trials(self, tmp_path):
+        s3, queue = queue_with([job("heavy", heavy=True), job("next")], tmp_path)
+        notice = threading.Event()
+
+        def interrupted_runner(item, workdir, out, resume, stop, checkpoint):
+            out.mkdir(parents=True)
+            (out / "trials.jsonl").write_text(json.dumps(ok_trial(0)) + "\n")
+            notice.set()
+            assert stop.wait(5)
+            with (out / "trials.jsonl").open("a") as stream:
+                stream.write(json.dumps(ok_trial(1, status="interrupted", queries=[])) + "\n")
+            return 1
+
+        with pytest.raises(SpotInterruptionError) as raised:
+            work(
+                queue, tmp_path / "w1", api_slots=1, poll_seconds=0, runner=interrupted_runner,
+                settle=no_queries, lease_seconds=0.5, notice=notice.is_set,
+            )  # fmt: skip
+        assert raised.value.ran == []
+        assert queue.read_lease(queue.key("claims", "heavy")).body["state"] == "interrupted"
+        assert not live_slots(queue)
+        assert queue.key("results", "heavy", "attempt-1", "trials.jsonl") in s3.objects
+        assert not queue.names("done")
+
+        settled = []
+        calls = []
+        writes = []
+        original_put = s3.put_object
+        s3.put_object = lambda **kwargs: writes.append(kwargs["Key"]) or original_put(**kwargs)
+        runner = recording_runner(calls, trials={"heavy": [ok_trial(1), ok_trial(2)]})
+        ran = work(
+            queue, tmp_path / "w2", api_slots=1, poll_seconds=0, runner=runner,
+            settle=lambda output: settled.append(output.name) or [],
+        )  # fmt: skip
+        assert ran == ["heavy", "next"]
+        assert calls == [("heavy", "attempt-2", ["attempt-1"]), ("next", "attempt-1", [])]
+        # The interrupted attempt's queries are quiesced before the job continues.
+        assert settled == ["attempt-1"]
+        summary_key = queue.key("results", "heavy", "attempt-2", "job-summary.csv")
+        order = [key for key in writes if key in {summary_key, queue.key("done", "heavy")}]
+        # A recorded job always has its summary, below the attempt that the marker names.
+        assert order == [summary_key, queue.key("done", "heavy")]
+        assert json.loads(queue.read("done", "heavy"))["summary"] == "heavy/attempt-2"
+        row = next(csv.DictReader(io.StringIO(s3.objects[summary_key].decode())))
+        assert (row["successful_trials"], row["failed_trials"]) == ("3", "0")
+        # The interrupted trial stays visible.
+        assert "Superseded: interrupted" in row["notes"]
+
+    def test_a_job_resumes_from_the_checkpoint_of_a_lost_host(self, tmp_path):
         s3, queue = queue_with([job("a")], tmp_path)
+        # The host died after one trial; only its checkpoint is in S3.
+        queue.acquire(queue.key("claims", "a"), {"host": "dead", "job": "a"}, -1)
+        checkpoint = ("results", "a", "attempt-1", "checkpoint")
+        start = {"event": "trial_start", "trial": "t1", "output": "s3://r/runs/x/trials/t1/",
+                 "case_id": "case", "scale": "small", "repetition": 1}  # fmt: skip
+        queue.put(queue.key(*checkpoint, "t0.json"), ok_trial(0))
+        queue.put(queue.key(*checkpoint, "t1-start.json"), start)
+        prefixes = []
+        calls = []
+
+        def settle(output):
+            prefixes.extend(trial_evidence(output)[1])
+            return []
+
+        runner = recording_runner(calls, trials={"a": [ok_trial(1)]})
+        assert work(queue, tmp_path / "w", api_slots=1, runner=runner, settle=settle) == ["a"]
+        assert calls == [("a", "attempt-2", ["attempt-1"])]
+        # The started trial is quiesced, and the finished one is not repeated.
+        assert prefixes == ["s3://r/runs/x/trials/t1/"]
+        summary = queue.key("results", "a", "attempt-2", "job-summary.csv")
+        row = next(csv.DictReader(io.StringIO(s3.objects[summary].decode())))
+        assert row["successful_trials"] == "2"
+
+    def test_a_notice_while_quiescing_an_earlier_attempt_skips_the_run(self, tmp_path):
+        _, queue = queue_with([job("a")], tmp_path)
+        queue.acquire(queue.key("claims", "a"), {"host": "dead"}, -1)
+        queue.put(queue.key("results", "a", "attempt-1", "events.jsonl"), {})
+        notice = threading.Event()
+
+        def settle(output):
+            notice.set()
+            time.sleep(0.2)
+            return []
+
+        def runner(*args):
+            pytest.fail("A job must not start after an interruption notice")
+
+        with pytest.raises(SpotInterruptionError):
+            work(queue, tmp_path / "w", api_slots=1, poll_seconds=0, runner=runner,
+                 settle=settle, lease_seconds=0.5, notice=notice.is_set)  # fmt: skip
+        lease = queue.read_lease(queue.key("claims", "a"))
+        assert (lease.body["state"], lease.body["attempt"]) == ("interrupted", 2)
+
+    def test_a_notice_between_jobs_stops_the_worker_without_claiming(self, tmp_path):
+        _, queue = queue_with([job("a")], tmp_path)
+        with pytest.raises(SpotInterruptionError):
+            work(queue, tmp_path / "w", api_slots=1, runner=lambda *a: 0, notice=lambda: True)
+        assert not queue.names("claims")
+
+    def test_waits_for_publication_and_removes_a_rehearsal_notice(self, tmp_path, monkeypatch):
+        s3 = FakeS3()
+        queue = Queue(s3, "bucket", "run1", "results/stack/")
+        config = tmp_path / "config.toml"
+        config.write_text("[scales]\nsmall = 10000\n")
+        manifest = tmp_path / "manifest.json"
+        manifest.write_text("{}")
+        rehearsal = tmp_path / "w" / "interruption-notice"
+        rehearsal.parent.mkdir()
+        rehearsal.touch()
+        monkeypatch.setattr(
+            "pyathena_bench.fleet.time.sleep",
+            lambda seconds: submit(queue, [job("a")], config, manifest),
+        )
+
+        def no_instance_action(path):
+            raise urllib.error.HTTPError(path, 404, "Not Found", None, None)
+
+        monkeypatch.setattr("pyathena_bench.fleet.instance_metadata", no_instance_action)
+        ran = work(queue, tmp_path / "w", api_slots=1, runner=lambda *a: 0, settle=no_queries,
+                   wait=True)  # fmt: skip
+        # The default notice reads the rehearsal file, which the worker removed when it started.
+        assert not rehearsal.exists()
+        assert ran == ["a"]
+
+    def test_a_lost_claim_stops_the_attempt_and_quiesces_it(self, tmp_path):
+        _, queue = queue_with([job("a")], tmp_path)
         stopped = []
         settled = []
 
-        def sleep(seconds):
-            # The new owner renews the claim while this worker waits to exit.
-            other = queue.read_lease(queue.key("claims", "a"))
-            assert queue.renew(other, 600)
-
-        monkeypatch.setattr("pyathena_bench.fleet.time.sleep", sleep)
-
-        def runner(item, workdir, out, resume, stop):
+        def runner(item, workdir, out, resume, stop, checkpoint):
             # Another worker took over the claim, for example after this host stalled.
-            s3.put_object(
-                Key=queue.key("claims", "a"),
-                Body=json.dumps(
-                    {"host": "other", "attempt": 2, "state": "running", "renewed": time.time(),
-                     "expires": time.time() + 600}
-                ).encode(),
-            )  # fmt: skip
+            take_over(queue, "a")
             stopped.append(stop.wait(5))
             return 130
 
-        ran = work(
-            queue,
-            tmp_path / "w",
-            api_slots=1,
-            poll_seconds=0,
-            runner=runner,
-            settle=lambda output: settled.append(output.name) or [],
-            renew_seconds=0.01,
-        )
-        # The stopped attempt's queries are quiesced before the worker goes on.
-        assert settled == ["attempt-1"]
+        ran = work(queue, tmp_path / "w", api_slots=1, poll_seconds=0, runner=runner,
+                   settle=lambda output: settled.append(output.name) or [],
+                   lease_seconds=0.5)  # fmt: skip
         assert stopped == [True]
+        assert settled == ["attempt-1"]
         assert ran == []
         assert not queue.names("done")
-        assert queue.read_lease(queue.key("claims", "a")).body["host"] == "other"
 
-    def test_a_stale_claim_keeps_the_worker_until_it_can_take_it_over(self, tmp_path):
-        s3, queue = queue_with([job("a")], tmp_path)
-        at = time.time()
-        # The worker renewed its 200-second lease long ago and has probably died.
-        s3.put_object(
-            Key=queue.key("claims", "a"),
-            Body=json.dumps(
-                {"host": "dead", "attempt": 1, "state": "running", "renewed": at - 199.5,
-                 "expires": at + 0.5}
-            ).encode(),
-        )  # fmt: skip
-        assert status(queue)["running"]["a"]["stale"]
-        runs = []
-        ran = work(
-            queue,
-            tmp_path / "w",
-            api_slots=1,
-            poll_seconds=0.2,
-            runner=lambda item, workdir, out, *a: runs.append(out.name) or 0,
-            settle=no_queries,
-        )
-        assert ran == ["a"]
-        assert runs == ["attempt-2"]
-
-
-def test_worker_waits_for_stack_outputs(monkeypatch):
-    calls = []
-
-    def resources(session_, stack):
-        calls.append(stack)
-        if len(calls) < 3:
-            raise IncompleteStackError("Stack outputs are incomplete")
-        return {"Results": "s3://bucket/"}
-
-    monkeypatch.setattr("pyathena_bench.__main__.stack_resources", resources)
-    monkeypatch.setattr("pyathena_bench.__main__.time.sleep", lambda seconds: None)
-    assert wait_for_stack(None, "stack", wait=True) == {"Results": "s3://bucket/"}
-    assert len(calls) == 3
-    calls.clear()
-    with pytest.raises(IncompleteStackError):
-        wait_for_stack(None, "stack", wait=False)
-
-
-def test_a_resumed_run_without_remaining_trials_succeeds(tmp_path, monkeypatch):
-    config = tmp_path / "config.toml"
-    config.write_text("[scales]\nsmall = 10000\n")
-    manifest = tmp_path / "manifest.json"
-    manifest.write_text("{}")
-    monkeypatch.setattr("pyathena_bench.__main__.run", lambda *args: True)
-
-    def report(directory):
-        raise ValueError("No trials to report")
-
-    monkeypatch.setattr("pyathena_bench.__main__.report", report)
-    argv = ["--config", str(config), "run", "--suite", "single", "--scale", "small"]
-    paths = ["--manifest", str(manifest), "--out", str(tmp_path / "attempt-2")]
-    assert main([*argv, *paths, "--resume", str(tmp_path / "attempt-1")]) == 0
-    with pytest.raises(ValueError, match="No trials"):
-        main([*argv, "--manifest", str(manifest), "--out", str(tmp_path / "attempt-3")])
-
-
-class TestLeaseExpiry:
-    def test_watch_stops_the_job_when_a_stalled_renewal_outlasts_the_claim(self, tmp_path):
-        _, queue = queue_with([], tmp_path)
-        claim = queue.acquire(queue.key("claims", "a"), {"host": "h"}, 0.2)
-        stalled = threading.Event()
-        released = threading.Event()
-
-        def stall(lease, seconds, **changes):
-            stalled.set()
-            released.wait()
-            return False
-
-        queue.renew = stall
-        watch = JobWatch(queue, [claim], 600, 0.01, lambda: None, lambda: False)
-        with watch:
-            try:
-                assert stalled.wait(5)
-                # The claim expires while its renewal is still blocked in S3.
-                assert watch.stop_requested.wait(5)
-                assert not watch.interrupted.is_set()
-                assert not watch.lost
-            finally:
-                # Unblock the renewal before leaving the block joins the thread.
-                released.set()
-
-    def test_losing_a_slot_does_not_stop_the_job(self, tmp_path):
-        s3, queue = queue_with([job("heavy", heavy=True)], tmp_path)
-
-        def runner(item, workdir, out, resume, stop):
-            # Another worker took over the slot, for example after this host stalled.
-            s3.put_object(
-                Key=queue.key("slots", "0"),
-                Body=json.dumps(
-                    {"host": "other", "state": "running", "expires": time.time() + 600}
-                ).encode(),
-            )
-            time.sleep(0.2)
-            assert not stop.is_set()
-            return 0
-
-        assert work(
-            queue, tmp_path / "w", api_slots=1, poll_seconds=0, runner=runner, settle=no_queries,
-            renew_seconds=0.01,
-        ) == ["heavy"]  # fmt: skip
-        assert json.loads(queue.read("done", "heavy"))["lost_slots"] == [queue.key("slots", "0")]
-        # The other worker's slot is kept.
-        assert json.loads(s3.objects[queue.key("slots", "0")])["host"] == "other"
-
-    def test_a_fresh_claim_that_is_never_renewed_is_taken_over_after_it_expires(self, tmp_path):
-        _, queue = queue_with([job("a")], tmp_path)
-        # Its worker died right after renewing it.
-        queue.acquire(queue.key("claims", "a"), {"host": "dead"}, 0.5)
-        runs = []
-        ran = work(
-            queue,
-            tmp_path / "w",
-            api_slots=1,
-            poll_seconds=0.2,
-            runner=lambda item, workdir, out, *a: runs.append(out.name) or 0,
-            settle=no_queries,
-        )
-        assert ran == ["a"]
-        assert runs == ["attempt-2"]
-
-    def test_a_former_owner_records_nothing_after_a_takeover(self, tmp_path, monkeypatch):
+    def test_a_former_owner_records_nothing_after_a_takeover(self, tmp_path):
         s3, queue = queue_with([job("a")], tmp_path)
 
-        def runner(item, workdir, out, resume, stop):
-            # This host stalled; the claim expired and another worker took it over,
-            # before this worker's watch noticed.
-            s3.put_object(
-                Key=queue.key("claims", "a"),
-                Body=json.dumps(
-                    {"host": "other", "job": "a", "attempt": 2, "state": "running",
-                     "renewed": time.time(), "expires": time.time() + 600}
-                ).encode(),
-            )  # fmt: skip
+        def runner(item, workdir, out, resume, stop, checkpoint):
+            # This host stalled; another worker took the claim over before the
+            # watch noticed.
+            take_over(queue, "a")
             out.mkdir(parents=True)
             (out / "trials.jsonl").write_text(json.dumps(ok_trial(0)) + "\n")
             return 0
 
-        def sleep(seconds):
-            other = queue.read_lease(queue.key("claims", "a"))
-            assert queue.renew(other, 600)
-
-        monkeypatch.setattr("pyathena_bench.fleet.time.sleep", sleep)
         assert work(queue, tmp_path / "w", api_slots=1, runner=runner, settle=no_queries) == []
         assert not queue.names("done")
         assert not [key for key in s3.objects if key.endswith("job-summary.csv")]
 
+    def test_losing_a_slot_does_not_stop_the_job(self, tmp_path):
+        _, queue = queue_with([job("heavy", heavy=True)], tmp_path)
 
-def test_a_claim_renewed_once_then_stale_does_not_let_the_worker_exit(tmp_path, monkeypatch):
-    s3, queue = queue_with([job("a")], tmp_path)
-    queue.acquire(queue.key("claims", "a"), {"host": "x", "job": "a"}, 600)
-    sleeps = []
-    real_sleep = time.sleep
-
-    def sleep(seconds):
-        sleeps.append(seconds)
-        if len(sleeps) == 1:
-            # Its worker renewed the claim once and then died long ago.
-            at = time.time()
-            s3.put_object(
-                Key=queue.key("claims", "a"),
-                Body=json.dumps(
-                    {"host": "x", "job": "a", "attempt": 1, "state": "running",
-                     "renewed": at - 199.7, "expires": at + 0.3}
-                ).encode(),
-            )  # fmt: skip
-        real_sleep(0.2)
-
-    monkeypatch.setattr("pyathena_bench.fleet.time.sleep", sleep)
-    runs = []
-    ran = work(
-        queue,
-        tmp_path / "w",
-        api_slots=1,
-        poll_seconds=0,
-        runner=lambda item, workdir, out, *a: runs.append(out.name) or 0,
-        settle=no_queries,
-    )
-    assert ran == ["a"]
-    assert runs == ["attempt-2"]
-
-
-class TestReviewRepairs:
-    def test_acquire_does_not_write_a_live_lease(self, tmp_path):
-        s3, queue = queue_with([], tmp_path)
-        key = queue.key("claims", "a")
-        queue.acquire(key, {"host": "busy"}, 600)
-        attempts = []
-        original = s3.put_object
-        s3.put_object = lambda **kwargs: attempts.append(kwargs["Key"]) or original(**kwargs)
-        assert queue.acquire(key, {"host": "me"}, 600) is None
-        assert attempts == []
-
-    def test_notice_errors_do_not_stop_the_watch_or_the_worker(self, tmp_path):
-        def incomplete(path):
-            raise http.client.IncompleteRead(b"")
-
-        assert not interruption_notice(incomplete, tmp_path / "notice")
-
-        def broken():
-            raise RuntimeError("unexpected")
-
-        assert not check_notice(broken)
-        _, queue = queue_with([job("a")], tmp_path)
-        assert work(queue, tmp_path / "w", api_slots=1, runner=lambda *a: 0, settle=no_queries,
-                    notice=broken) == ["a"]  # fmt: skip
-
-    def test_progress_uploads_at_trial_boundaries(self, tmp_path):
-        s3, queue = queue_with([job("a")], tmp_path)
-        events_key = queue.key("results", "a", "attempt-1", "events.jsonl")
-        uploads = []
-        original = s3.upload_file
-
-        def recording(filename, bucket, key):
-            uploads.append(key)
-            return original(filename, bucket, key)
-
-        s3.upload_file = recording
-
-        def runner(item, workdir, out, resume, stop):
-            out.mkdir(parents=True)
-            events = out / "events.jsonl"
-            events.write_text(json.dumps({"event": "trial_start", "trial": "t"}) + "\n")
-            deadline = time.monotonic() + 5
-            while events_key not in uploads and time.monotonic() < deadline:
-                time.sleep(0.01)
-            started = uploads.count(events_key)
-            with events.open("a") as stream:
-                for _ in range(20):
-                    stream.write(json.dumps({"event": "query", "query_id": "q"}) + "\n")
-                    stream.flush()
-                    time.sleep(0.01)
-            # Query events between trial boundaries are not uploaded.
-            assert uploads.count(events_key) == started == 1
+        def runner_slot_only(item, workdir, out, resume, stop, checkpoint):
+            # Another worker took over the slot, for example after this host stalled.
+            queue.put(queue.key("slots", "0"), {"host": "other", "state": "running",
+                                                  "expires": time.time() + 600})  # fmt: skip
+            time.sleep(0.2)
+            assert not stop.is_set()
             return 0
 
-        assert work(queue, tmp_path / "w", api_slots=1, runner=runner, settle=no_queries,
-                    renew_seconds=0.01) == ["a"]  # fmt: skip
+        assert work(queue, tmp_path / "w", api_slots=1, poll_seconds=0, runner=runner_slot_only,
+                    settle=no_queries, lease_seconds=0.5) == ["heavy"]  # fmt: skip
+        assert json.loads(queue.read("done", "heavy"))["lost_slots"] == [queue.key("slots", "0")]
+        # The other worker's slot is kept.
+        assert queue.read_lease(queue.key("slots", "0")).body["host"] == "other"
 
-    def test_worker_removes_a_rehearsal_notice_when_it_starts(self, tmp_path, monkeypatch):
-        config = tmp_path / "config.toml"
-        config.write_text("[scales]\nsmall = 10000\n")
-        monkeypatch.chdir(tmp_path)
-        Path("interruption-notice").touch()
-        monkeypatch.setattr(
-            "pyathena_bench.__main__.wait_for_stack", lambda *a: {"Results": "s3://bucket/"}
-        )
-        monkeypatch.setattr("pyathena_bench.__main__.session", lambda settings: None)
-        monkeypatch.setattr("pyathena_bench.__main__.client", lambda *a: FakeS3())
-        monkeypatch.setattr("pyathena_bench.__main__.work", lambda *a, **k: [])
-        argv = ["--config", str(config), "worker", "--stack", "s", "--name", "q"]
-        assert main(argv) == 0
-        assert not Path("interruption-notice").exists()
+    def test_an_unconfirmed_stopped_attempt_keeps_the_host(self, tmp_path):
+        _, queue = queue_with([job("a")], tmp_path)
 
-
-class TestReviewRepairsFollowUp:
-    def test_an_unconfirmed_stopped_attempt_keeps_the_host(self, tmp_path, monkeypatch):
-        s3, queue = queue_with([job("a")], tmp_path)
-
-        def runner(item, workdir, out, resume, stop):
-            s3.put_object(
-                Key=queue.key("claims", "a"),
-                Body=json.dumps(
-                    {"host": "other", "job": "a", "attempt": 2, "state": "running",
-                     "renewed": time.time(), "expires": time.time() + 600}
-                ).encode(),
-            )  # fmt: skip
+        def runner(item, workdir, out, resume, stop, checkpoint):
+            take_over(queue, "a")
             assert stop.wait(5)
             return 130
 
         with pytest.raises(RuntimeError, match="Could not quiesce a stopped attempt of a"):
-            work(
-                queue,
-                tmp_path / "w",
-                api_slots=1,
-                runner=runner,
-                settle=lambda output: ["q1: still RUNNING"],
-                renew_seconds=0.01,
-            )
+            work(queue, tmp_path / "w", api_slots=1, runner=runner,
+                 settle=lambda output: ["q1: still RUNNING"], lease_seconds=0.5)  # fmt: skip
         assert not queue.names("done")
 
-    def test_a_failed_trial_start_upload_is_retried(self, tmp_path):
-        s3, queue = queue_with([job("a")], tmp_path)
-        events_key = queue.key("results", "a", "attempt-1", "events.jsonl")
-        original = s3.upload_file
-        failures = []
+    def test_cleanup_errors_survive_a_claim_lost_during_cleanup(self, tmp_path):
+        _, queue = queue_with([job("a"), job("b")], tmp_path)
+        calls = []
 
-        def flaky(filename, bucket, key):
-            if key == events_key and not failures:
-                failures.append(key)
-                raise ClientError({"Error": {"Code": "SlowDown"}}, "PutObject")
-            return original(filename, bucket, key)
+        def settle(output):
+            # The failed job's queries do not stop, and the claim is lost meanwhile.
+            take_over(queue, "a")
+            return ["q1: still RUNNING"]
 
-        s3.upload_file = flaky
-
-        def runner(item, workdir, out, resume, stop):
-            out.mkdir(parents=True)
-            (out / "events.jsonl").write_text(json.dumps({"event": "trial_start"}) + "\n")
-            deadline = time.monotonic() + 5
-            while events_key not in s3.objects and time.monotonic() < deadline:
-                time.sleep(0.01)
-            # The trial is still running; its start was uploaded after one failure.
-            assert failures == [events_key]
-            assert events_key in s3.objects
-            return 0
-
-        assert work(queue, tmp_path / "w", api_slots=1, runner=runner, settle=no_queries,
-                    renew_seconds=0.01) == ["a"]  # fmt: skip
+        with pytest.raises(RuntimeError, match="q1: still RUNNING"):
+            work(queue, tmp_path / "w", api_slots=1, runner=recording_runner(calls, code=1),
+                 settle=settle)  # fmt: skip
+        # No further trials start while the query may still run.
+        assert [call[0] for call in calls] == ["a"]
+        assert not queue.names("done")
 
 
-def test_cleanup_errors_survive_a_claim_lost_during_cleanup(tmp_path):
-    s3, queue = queue_with([job("a"), job("b")], tmp_path)
-    ran = []
+class TestWorkerCommand:
+    def test_worker_uses_the_results_location_without_the_stack(self, tmp_path, monkeypatch):
+        config = tmp_path / "config.toml"
+        config.write_text("[scales]\nsmall = 10000\n")
+        queues = []
 
-    def settle(output):
-        # The failed job's queries do not stop, and the claim is lost meanwhile.
-        s3.put_object(
-            Key=queue.key("claims", "a"),
-            Body=json.dumps(
-                {"host": "other", "job": "a", "attempt": 2, "state": "running",
-                 "renewed": time.time(), "expires": time.time() + 600}
-            ).encode(),
-        )  # fmt: skip
-        return ["q1: still RUNNING"]
+        def stack_resources(*args):
+            pytest.fail("A worker with --results needs no stack outputs")
 
-    def runner(item, workdir, out, resume, stop):
-        ran.append(item["id"])
-        return 1
-
-    with pytest.raises(RuntimeError, match="q1: still RUNNING"):
-        work(queue, tmp_path / "w", api_slots=1, runner=runner, settle=settle)
-    # No further trials start while the query may still run.
-    assert ran == ["a"]
-    assert not queue.names("done")
+        monkeypatch.setattr("pyathena_bench.__main__.stack_resources", stack_resources)
+        monkeypatch.setattr("pyathena_bench.__main__.session", lambda settings: None)
+        monkeypatch.setattr("pyathena_bench.__main__.client", lambda *a: FakeS3())
+        monkeypatch.setattr(
+            "pyathena_bench.__main__.work", lambda queue, *a, **k: queues.append(queue) or []
+        )
+        argv = ["--config", str(config), "worker", "--results", "s3://bucket/p/stack/"]
+        assert main([*argv, "--name", "q", "--wait"]) == 0
+        [queue] = queues
+        assert (queue.bucket, queue.prefix) == ("bucket", "p/stack/fleet/q/")

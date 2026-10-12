@@ -138,60 +138,89 @@ class TestReport:
         row = summarize([trials[0], {**failed_listing, "warmup": True}])[0]
         assert row["notes"] == ""
 
+    def test_report_merges_attempts_and_notes_superseded_failures(self, tmp_path):
+        def trial(repetition, status="ok"):
+            return {
+                "trial": f"t{repetition}-{status}",
+                "case_id": "case",
+                "scale": "small",
+                "repetition": repetition,
+                "warmup": False,
+                "status": status,
+                "queries": [{"total_seconds": 1}],
+                "successful_queries_per_second": 1,
+                "rss_peak_bytes": 1,
+                "max_threads": 1,
+            }
 
-def test_report_merges_attempts_and_drops_superseded_failures(tmp_path):
-    def trial(repetition, status="ok"):
-        return {
-            "trial": f"t{repetition}-{status}",
+        first = tmp_path / "attempt-1"
+        second = tmp_path / "attempt-2"
+        first.mkdir()
+        second.mkdir()
+        (first / "trials.jsonl").write_text(
+            json.dumps(trial(0))
+            + "\n"
+            + json.dumps({**trial(1, "interrupted"), "queries": []})
+            + "\n"
+        )
+        # The interrupted attempt also started a trial that it never recorded.
+        start = {"event": "trial_start", "trial": "lost", "case_id": "case", "scale": "small"}
+        (first / "events.jsonl").write_text(json.dumps({**start, "repetition": 2}) + "\n")
+        (second / "trials.jsonl").write_text(
+            json.dumps(trial(1)) + "\n" + json.dumps(trial(2)) + "\n"
+        )
+        report(tmp_path)
+        with (tmp_path / "summary.csv").open() as stream:
+            row = next(csv.DictReader(stream))
+        assert (row["successful_trials"], row["failed_trials"]) == ("3", "0")
+        # The superseded failures stay visible in the notes: the interrupted and the
+        # unrecorded trial.
+        assert "Superseded: interrupted" in row["notes"]
+        assert "Superseded: Trial started without a final record" in row["notes"]
+
+    def test_report_counts_a_repetition_recorded_by_two_attempts_once(self, tmp_path):
+        record = {
             "case_id": "case",
             "scale": "small",
-            "repetition": repetition,
+            "repetition": 0,
             "warmup": False,
-            "status": status,
+            "status": "ok",
             "queries": [{"total_seconds": 1}],
             "successful_queries_per_second": 1,
             "rss_peak_bytes": 1,
             "max_threads": 1,
         }
+        for attempt in (1, 2):
+            directory = tmp_path / f"attempt-{attempt}"
+            directory.mkdir()
+            (directory / "trials.jsonl").write_text(
+                json.dumps({**record, "trial": f"t{attempt}"}) + "\n"
+            )
+        report(tmp_path)
+        with (tmp_path / "summary.csv").open() as stream:
+            assert next(csv.DictReader(stream))["successful_trials"] == "1"
 
-    first = tmp_path / "attempt-1"
-    second = tmp_path / "attempt-2"
-    first.mkdir()
-    second.mkdir()
-    (first / "trials.jsonl").write_text(
-        json.dumps(trial(0)) + "\n" + json.dumps({**trial(1, "interrupted"), "queries": []}) + "\n"
-    )
-    # The interrupted attempt also started a trial that it never recorded.
-    start = {"event": "trial_start", "trial": "lost", "case_id": "case", "scale": "small"}
-    (first / "events.jsonl").write_text(json.dumps({**start, "repetition": 2}) + "\n")
-    (second / "trials.jsonl").write_text(json.dumps(trial(1)) + "\n" + json.dumps(trial(2)) + "\n")
-    report(tmp_path)
-    with (tmp_path / "summary.csv").open() as stream:
-        row = next(csv.DictReader(stream))
-    assert (row["successful_trials"], row["failed_trials"]) == ("3", "0")
-    # The superseded failures stay visible: the interrupted and the unrecorded trial.
-    assert row["superseded_failures"] == "2"
-    assert "Superseded: interrupted" in row["notes"]
-
-
-def test_report_counts_a_repetition_recorded_by_two_attempts_once(tmp_path):
-    record = {
-        "case_id": "case",
-        "scale": "small",
-        "repetition": 0,
-        "warmup": False,
-        "status": "ok",
-        "queries": [{"total_seconds": 1}],
-        "successful_queries_per_second": 1,
-        "rss_peak_bytes": 1,
-        "max_threads": 1,
-    }
-    for attempt in (1, 2):
-        directory = tmp_path / f"attempt-{attempt}"
-        directory.mkdir()
-        (directory / "trials.jsonl").write_text(
-            json.dumps({**record, "trial": f"t{attempt}"}) + "\n"
-        )
-    report(tmp_path)
-    with (tmp_path / "summary.csv").open() as stream:
-        assert next(csv.DictReader(stream))["successful_trials"] == "1"
+    def test_report_reads_the_checkpoint_of_an_attempt(self, tmp_path):
+        record = {
+            "trial": "t0",
+            "case_id": "case",
+            "scale": "small",
+            "repetition": 0,
+            "warmup": False,
+            "status": "ok",
+            "queries": [{"total_seconds": 1}],
+            "successful_queries_per_second": 1,
+            "rss_peak_bytes": 1,
+            "max_threads": 1,
+        }
+        checkpoint = tmp_path / "attempt-1" / "checkpoint"
+        checkpoint.mkdir(parents=True)
+        # The host died after recording one trial and starting another.
+        (checkpoint / "t0.json").write_text(json.dumps(record))
+        start = {"event": "trial_start", "trial": "t1", "case_id": "case", "scale": "small"}
+        (checkpoint / "t1-start.json").write_text(json.dumps({**start, "repetition": 1}))
+        (checkpoint / "t0-start.json").write_text(json.dumps({**start, "trial": "t0"}))
+        report(tmp_path)
+        with (tmp_path / "summary.csv").open() as stream:
+            row = next(csv.DictReader(stream))
+        assert (row["successful_trials"], row["failed_trials"]) == ("1", "1")

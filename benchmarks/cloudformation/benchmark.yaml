@@ -349,42 +349,48 @@ Resources:
               - Key: Name
                 Value: !Sub '${AWS::StackName}-benchmark'
         UserData:
-          Fn::Base64: !Sub |
-            #!/bin/bash
-            set -euo pipefail
-            dnf install -y git aws-cfn-bootstrap
-            trap '/opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource Fleet --region ${AWS::Region}' EXIT
-            curl --proto '=https' --tlsv1.2 -LsSf https://astral.sh/uv/${UvVersion}/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
-            git clone https://github.com/pyathena-dev/PyAthena.git /opt/pyathena
-            git -C /opt/pyathena fetch origin ${GitCommit}
-            git -C /opt/pyathena checkout --detach ${GitCommit}
-            export UV_PYTHON_INSTALL_DIR=/opt/uv-python
-            uv python install ${PythonVersion}
-            uv sync --directory /opt/pyathena/benchmarks --locked --no-dev --python ${PythonVersion}
-            chmod -R a+rX /opt/uv-python
-            chown -R ec2-user:ec2-user /opt/pyathena
-            printf '%s\n' '${AWS::StackId}' > /opt/pyathena/benchmarks/stack-id.txt
-            sudo -u ec2-user mkdir -p /opt/pyathena/benchmarks/results
-            if [ -n '${QueueName}' ]; then
-            cat > /etc/systemd/system/pyathena-bench-worker.service <<'UNIT'
-            [Unit]
-            Description=PyAthena benchmark fleet worker
-            Wants=network-online.target
-            After=network-online.target
-            [Service]
-            User=ec2-user
-            WorkingDirectory=/opt/pyathena/benchmarks
-            Environment=AWS_DEFAULT_REGION=${AWS::Region}
-            ExecStart=/opt/pyathena/.venv/bin/python -m pyathena_bench worker --stack ${AWS::StackId} --name ${QueueName} --api-slots ${ApiSlots} --wait --terminate-host
-            StandardOutput=append:/opt/pyathena/benchmarks/results/worker.log
-            StandardError=inherit
-            [Install]
-            WantedBy=multi-user.target
-            UNIT
-            systemctl daemon-reload
-            systemctl enable --now pyathena-bench-worker.service
-            fi
-            printf '%s\n' 'Setup complete. Run preflight and prepare manually.'
+          Fn::Base64: !Sub
+            - |
+              #!/bin/bash
+              set -euo pipefail
+              dnf install -y git aws-cfn-bootstrap
+              trap '/opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource Fleet --region ${AWS::Region}' EXIT
+              curl --proto '=https' --tlsv1.2 -LsSf https://astral.sh/uv/${UvVersion}/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
+              git clone https://github.com/pyathena-dev/PyAthena.git /opt/pyathena
+              git -C /opt/pyathena fetch origin ${GitCommit}
+              git -C /opt/pyathena checkout --detach ${GitCommit}
+              export UV_PYTHON_INSTALL_DIR=/opt/uv-python
+              uv python install ${PythonVersion}
+              uv sync --directory /opt/pyathena/benchmarks --locked --no-dev --python ${PythonVersion}
+              chmod -R a+rX /opt/uv-python
+              chown -R ec2-user:ec2-user /opt/pyathena
+              printf '%s\n' '${AWS::StackId}' > /opt/pyathena/benchmarks/stack-id.txt
+              printf '%s\n' '${Results}' > /opt/pyathena/benchmarks/results-location.txt
+              sudo -u ec2-user mkdir -p /opt/pyathena/benchmarks/results
+              if [ -n '${QueueName}' ]; then
+              cat > /etc/systemd/system/pyathena-bench-worker.service <<'UNIT'
+              [Unit]
+              Description=PyAthena benchmark fleet worker
+              Wants=network-online.target
+              After=network-online.target
+              [Service]
+              User=ec2-user
+              WorkingDirectory=/opt/pyathena/benchmarks
+              Environment=AWS_DEFAULT_REGION=${AWS::Region}
+              ExecStart=/opt/pyathena/.venv/bin/python -m pyathena_bench worker --results ${Results} --name ${QueueName} --api-slots ${ApiSlots} --wait --terminate-host
+              StandardOutput=append:/opt/pyathena/benchmarks/results/worker.log
+              StandardError=inherit
+              [Install]
+              WantedBy=multi-user.target
+              UNIT
+              systemctl daemon-reload
+              systemctl enable --now pyathena-bench-worker.service
+              fi
+              printf '%s\n' 'Setup complete. Run preflight and prepare manually.'
+            - Results: !If
+                - HasResultsBucket
+                - !Sub s3://${ResultsBucket}/${ResultsPrefix}/${AWS::StackName}/
+                - !Sub s3://${Bucket}/
   Fleet:
     Type: AWS::AutoScaling::AutoScalingGroup
     DependsOn: [Route, RouteAssociation, RouteAssociation2, RouteAssociation3]

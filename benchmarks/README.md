@@ -109,7 +109,6 @@ The supplied template assumes ordinary IAM access and SSE-S3 source objects; Lak
 
 The fleet queues, reports, and Athena trial outputs go to the stack's results location, the `Results` stack output.
 With `ResultsBucket` set to an existing bucket, the results location is `s3://<ResultsBucket>/<ResultsPrefix>/<stack name>/`, and the instance role can read and write objects only below it, while it can list the whole bucket, because S3 answers a read of a missing key with 403 instead of 404 without that permission; with `ResultsBucket` empty, the default, it is the scratch bucket.
-A stack created from an earlier template has no `Results` output and keeps everything in the scratch bucket.
 Input snapshots, initialization fixtures, and scratch tables stay in the scratch bucket and database either way.
 This repository's CI test bucket, which `AWS_ATHENA_S3_STAGING_DIR` names in CI, expires every object one day after it is written, at the following midnight UTC (`cloudformation/github_actions_oidc.yaml`).
 As the results location, it removes leftovers by itself, but reports must be recovered within that day.
@@ -286,6 +285,7 @@ uv run --no-sync python -m pyathena_bench run \
 
 There is no automatic continuation of a partially recorded trial; rerun the selected comparison with the same manifest.
 `run --resume` names the output directories of earlier attempts and skips the measured trials that they recorded as successful, after running its own warmups, which a fleet worker uses to continue an interrupted job.
+A fleet worker also passes `--checkpoint`, with which the run writes each trial's start and record to S3 between trials and writes no summary of its own; the job's summary merges its attempts.
 Large API row cases may exceed the default one-hour timeout: 10 million rows require at least 10,000 pages with arraysize 1000, or 100,000 pages with arraysize 100.
 Choose the timeout using a smaller-scale pilot before the full run.
 Do not run two orchestrators concurrently on the same dedicated host.
@@ -312,7 +312,7 @@ With `--split-pages`, a job whose single trial needs at least that many pages be
 `queue --jobs` accepts several job files, rejects duplicate job IDs, and orders the combined jobs as `jobs` orders one selection.
 
 Deploy a new stack with the fleet size under its own name; changing `FleetSize` on an existing stack does not wait for the added hosts to finish bootstrap.
-`QueueName` names the queue that every host consumes: after bootstrap, each host starts a worker that waits for the stack's outputs and then until a queue of that name is published, including the hosts that the group launches later to replace interrupted Spot Instances.
+`QueueName` names the queue that every host consumes: after bootstrap, each host starts a worker with the stack's results location from its user data, also written to `results-location.txt` next to `stack-id.txt`, and the worker waits until a queue of that name is published; this includes the hosts that the group launches later to replace interrupted Spot Instances.
 `ApiSlots` sets their `--api-slots`.
 `ResultsBucket` selects the results location; the commands below use this repository's CI test bucket, whose objects expire after a day.
 Then open a session on one of its hosts:
@@ -416,7 +416,7 @@ For a queue with another name, start a worker on every host with SSM; a second w
 ```bash
 uv run --env-file ../.env --locked aws ssm send-command --targets "Key=tag:aws:autoscaling:groupName,Values=$BENCHMARK_GROUP" \
   --document-name AWS-RunShellScript \
-  --parameters 'commands=["sudo -iu ec2-user bash -lc \"cd /opt/pyathena/benchmarks && mkdir -p results && (nohup uv run --no-sync python -m pyathena_bench worker --stack $(cat /opt/pyathena/benchmarks/stack-id.txt) --name large-2 --terminate-host > results/worker-large-2.log 2>&1 &)\""]'
+  --parameters 'commands=["sudo -iu ec2-user bash -lc \"cd /opt/pyathena/benchmarks && mkdir -p results && (nohup uv run --no-sync python -m pyathena_bench worker --results $(cat /opt/pyathena/benchmarks/results-location.txt) --name large-2 --terminate-host > results/worker-large-2.log 2>&1 &)\""]'
 ```
 
 A worker claims a job by creating `claims/<job>` with an S3 conditional write, so exactly one host runs each job.
@@ -426,8 +426,8 @@ A worker releases a slot by overwriting its lease as released, never by deleting
 A worker whose claim was taken over, or whose renewals failed until the claim expired, stops the attempt, quiesces its queries as after a failed job, and records nothing for the job; the new owner continues it, and the first `done` marker of a job is never replaced.
 If that worker cannot confirm that the queries stopped, it raises an error and keeps its host, because the job may have no other worker.
 A lost API slot does not stop the job; the `done` marker lists it under `lost_slots`.
-Each attempt of a job writes to `results/<job>/attempt-<n>/`, and the worker uploads its trial records within seconds of each trial's start and end, so a lost host loses only its running trial.
-A trial whose start was not uploaded before its host died is not quiesced by the next attempt; its queries write to their own trial prefix and are cancelled by `cleanup`.
+Each attempt of a job writes to `results/<job>/attempt-<n>/`; between trials, its run writes each trial's start and record below `checkpoint/` there, so a lost host loses only its running trial, and the worker uploads the attempt's files when it ends.
+A trial whose start checkpoint could not be written, which the run logs, is not quiesced by the next attempt; its queries write to their own trial prefix and are cancelled by `cleanup`.
 After a job, the worker uploads the attempt's output directory and its log to `logs/`, renews its claim conditionally to confirm that it still owns the job, writes `job-summary.csv` and `job-summary.md` from every attempt into its attempt directory, and then creates `done/<job>` with the exit code, attempt, host, times, and the summary's attempt directory under `summary`.
 A failed trial stops only its own job; `status` lists jobs with a non-zero exit code, the claims of running jobs, and the slots in use, each with its host, attempt, and whether its lease has expired.
 After a failed job, the worker stops the job's reported queries and every queued or running query in the workgroup that writes under the job's trial output prefixes, which also covers queries whose IDs were never reported before a trial process died.
@@ -438,18 +438,18 @@ Each worker checks instance metadata for a Spot interruption notice (`spot/insta
 On a notice, the worker interrupts the running trial with SIGINT, which cancels the trial's reported queries, uploads the attempt, releases its claim as `interrupted` and its slots, and exits without terminating the host.
 A separate thread watches for the notice, so slow S3 requests do not delay it.
 The group replaces the reclaimed instance, and the new host's worker takes over the interrupted claim as the next attempt: it downloads the earlier attempts, quiesces their trials as after a failed job, and runs its own warmups and then only the measured repetitions that they did not record as successful, through `run --resume`.
-The job's summary merges the attempts and counts a failed or incomplete trial whose repetition succeeded in a later attempt as `superseded_failures` instead of `failed_trials`, with its reason in the notes, so it reports the trials of an uninterrupted run without hiding failures.
+The job's summary merges the attempts and leaves a failed or incomplete trial whose repetition succeeded in a later attempt out of `failed_trials`, noting its reason as `Superseded: ...`, so it reports the trials of an uninterrupted run without hiding failures.
 `report results/recovered/fleet/<name>/results/<job>` produces the same merged summary from the recovered attempts.
 Rebalance recommendations are not acted on; an interruption does not always follow them, and the notice leaves enough time to stop a trial.
 
-Workers exit when no job is left to claim and every other unfinished job's claim has been renewed since they found nothing to claim and is still fresh, which takes up to a renewal interval.
-A claim whose worker died is never renewed, so workers keep waiting until it expires and one of them takes it over; `status` marks a claim that has missed renewals as `stale`.
+Workers exit when no job is left to claim.
+A claim whose worker died expires and is taken over by a worker that is still running; `status` marks it as expired.
 With `--terminate-host`, a worker first suspends the group's `AZRebalance` process, which would otherwise let the group launch a host in one zone and terminate a busy host in another when Spot capacity or retired hosts leave the zones uneven; the process stays suspended until the stack is deleted.
 A worker with `--terminate-host` that returns normally records its jobs, instance type, Availability Zone, and purchase option under `hosts/<instance-id>.json` and terminates its host through the group with a lower desired capacity, so no replacement starts and finished hosts stop costing money while others still run.
 This includes a worker that stopped after unconfirmed queries, whose errors are already in the `done` marker.
 A worker that raises an error, for example for a job wider than `--api-slots`, keeps its host.
 To keep a host after its worker finishes, tag it with `KeepHost=true` (`aws ec2 create-tags --resources <instance-id> --tags Key=KeepHost,Value=true`); the worker reads the tag from instance metadata.
-A job whose last worker exited without finishing it, for example after a host error, stays claimed until its lease expires; then a worker started for the same queue takes it over.
+A job whose worker died after the other workers exited, or after a host error, stays claimed until its lease expires; then a worker started for the same queue, as below, takes it over.
 To retry failed jobs, wait until all workers have exited, run `cleanup --trials-only --execute` for the manifest, and publish the selected jobs under a new queue name with the same manifest.
 
 ### Pilot with a simulated interruption
@@ -475,7 +475,7 @@ uv run --no-sync python -m pyathena_bench queue \
   --stack "$(cat stack-id.txt)" --name pilot-1 --jobs results/jobs-pilot.json --manifest results/input-pilot.json
 ```
 
-When `status` shows the job claimed and `results/<job>/attempt-1/trials.jsonl` has a trial, create the file `/opt/pyathena/benchmarks/interruption-notice`, which a worker treats as an interruption notice and removes when it starts.
+When `status` shows the job claimed and `results/<job>/attempt-1/checkpoint/` has a trial record, create the file `interruption-notice` in the worker's directory, `/opt/pyathena/benchmarks/results/fleet/pilot-1/`, which the worker treats as an interruption notice and removes when it starts.
 As after a real notice, the worker exits and leaves its host running, so terminate the host as below.
 Check that the claim is `interrupted`, then terminate the host without lowering the desired capacity, as EC2 does when it reclaims a Spot Instance:
 
@@ -486,7 +486,7 @@ BENCHMARK_INSTANCE=$(uv run --env-file ../.env --locked aws autoscaling describe
   --auto-scaling-group-names "$BENCHMARK_GROUP" --query 'AutoScalingGroups[0].Instances[0].InstanceId' --output text)
 uv run --env-file ../.env --locked aws ssm send-command --instance-ids "$BENCHMARK_INSTANCE" \
   --document-name AWS-RunShellScript \
-  --parameters 'commands=["sudo -u ec2-user touch /opt/pyathena/benchmarks/interruption-notice"]'
+  --parameters 'commands=["sudo -u ec2-user touch /opt/pyathena/benchmarks/results/fleet/pilot-1/interruption-notice"]'
 uv run --env-file ../.env --locked python -m pyathena_bench status --stack "$BENCHMARK_STACK" --name pilot-1
 uv run --env-file ../.env --locked aws autoscaling terminate-instance-in-auto-scaling-group \
   --instance-id "$BENCHMARK_INSTANCE" --no-should-decrement-desired-capacity

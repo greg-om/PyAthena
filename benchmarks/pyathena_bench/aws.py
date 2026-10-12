@@ -37,10 +37,6 @@ def client(session_: Any, service: str) -> Any:
     )
 
 
-class IncompleteStackError(ValueError):
-    """The stack's outputs are incomplete while an operation on it is in progress."""
-
-
 def split_location(location: str) -> tuple[str, str]:
     """Split an ``s3://bucket/prefix/`` location.
 
@@ -59,6 +55,25 @@ def split_location(location: str) -> tuple[str, str]:
     return bucket, prefix
 
 
+def run_locations(resources: dict[str, str], run_id: str) -> dict[str, str]:
+    """Return the S3 prefixes of a prepared run.
+
+    Args:
+        resources: Stack resources from :func:`stack_resources`.
+        run_id: Run ID of the manifest.
+
+    Returns:
+        ``scratch``, below which inputs and fixtures are, and ``results``, below
+        which trial outputs are (``trials/<trial>/``); both ``s3://`` prefixes
+        ending with a slash, the same when the results location is the scratch
+        bucket.
+    """
+    return {
+        "scratch": f"s3://{resources['Bucket']}/runs/{run_id}/",
+        "results": f"{resources['Results']}runs/{run_id}/",
+    }
+
+
 def stack_resources(session_: Any, stack: str) -> dict[str, str]:
     data = client(session_, "cloudformation").describe_stacks(StackName=stack)["Stacks"][0]
     tags = {item["Key"]: item["Value"] for item in data.get("Tags", [])}
@@ -74,13 +89,10 @@ def stack_resources(session_: Any, stack: str) -> dict[str, str]:
         "SourceTable",
         "WorkGroup",
         "AutoScalingGroup",
+        "Results",
     }
     if not required <= result.keys():
-        if data.get("StackStatus", "").endswith("_IN_PROGRESS"):
-            raise IncompleteStackError("Stack outputs are incomplete")
         raise ValueError("Stack outputs are incomplete")
-    # A stack from a template before the Results output keeps everything in the scratch bucket.
-    result.setdefault("Results", f"s3://{result['Bucket']}/")
     if (
         result["SourceBucket"] == result["Bucket"]
         or result["ScratchDatabase"] == result["SourceDatabase"]
@@ -366,14 +378,8 @@ def cleanup(
     resources = validate_manifest(settings, manifest)
     session_ = session(settings)
     run_id = manifest["run_id"]
-    results_bucket, results_prefix = split_location(resources["Results"])
-    locations = sorted(
-        {
-            (resources["Bucket"], f"runs/{run_id}/"),
-            (results_bucket, f"{results_prefix}runs/{run_id}/"),
-        }
-    )
-    roots = tuple(f"s3://{bucket}/{root}" for bucket, root in locations)
+    roots = tuple(sorted(set(run_locations(resources, run_id).values())))
+    locations = [split_location(root) for root in roots]
     athena = client(session_, "athena")
     # Discover queries whose worker died before returning its query ID.
     # The query prefix is checked against live Athena output metadata.

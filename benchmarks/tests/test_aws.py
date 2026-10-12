@@ -11,9 +11,9 @@ from types import SimpleNamespace
 import pytest
 from botocore.exceptions import ClientError
 from pyathena_bench.aws import (
-    IncompleteStackError,
     cleanup,
     prepare,
+    run_locations,
     split_location,
     stack_resources,
     validate_inputs,
@@ -350,32 +350,28 @@ def test_split_location_rejects_invalid_locations(location):
         split_location(location)
 
 
-@pytest.mark.parametrize(
-    ("status", "outputs", "error"),
-    [
-        ("CREATE_IN_PROGRESS", {}, IncompleteStackError),
-        ("CREATE_COMPLETE", {}, ValueError),
-        (
-            "CREATE_COMPLETE",
-            {k: v for k, v in RESOURCES.items() if k not in {"StackId", "Results"}},
-            None,
-        ),
-    ],
-    ids=["creating", "complete_without_outputs", "earlier_template"],
-)
-def test_stack_resources_waits_only_while_in_progress(monkeypatch, status, outputs, error):
+def test_stack_resources_require_the_results_output(monkeypatch):
+    outputs = {k: v for k, v in RESOURCES.items() if k != "StackId"}
     stack = {
         "StackId": "arn:stack",
-        "StackStatus": status,
         "Tags": [{"Key": "Purpose", "Value": "pyathena-benchmark"}],
         "Outputs": [{"OutputKey": k, "OutputValue": v} for k, v in outputs.items()],
     }
     fake = SimpleNamespace(describe_stacks=lambda **kwargs: {"Stacks": [stack]})
     monkeypatch.setattr("pyathena_bench.aws.client", lambda *args: fake)
-    if error is None:
-        # A stack from a template before the Results output keeps results in the scratch bucket.
-        assert stack_resources(None, "stack")["Results"] == "s3://temporary/"
-        return
-    with pytest.raises(error) as raised:
+    assert stack_resources(None, "stack")["Results"] == "s3://temporary/"
+    stack["Outputs"] = [o for o in stack["Outputs"] if o["OutputKey"] != "Results"]
+    with pytest.raises(ValueError, match="Stack outputs are incomplete"):
         stack_resources(None, "stack")
-    assert (type(raised.value) is IncompleteStackError) is (error is IncompleteStackError)
+
+
+@pytest.mark.parametrize(
+    ("results", "expected"),
+    [
+        ("s3://temporary/", f"s3://temporary/runs/{RUN}/"),
+        ("s3://results/bench/stack/", f"s3://results/bench/stack/runs/{RUN}/"),
+    ],
+)
+def test_run_locations(results, expected):
+    locations = run_locations({**RESOURCES, "Results": results}, RUN)
+    assert locations == {"scratch": f"s3://temporary/runs/{RUN}/", "results": expected}

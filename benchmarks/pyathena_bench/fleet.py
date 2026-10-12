@@ -20,7 +20,6 @@ import subprocess
 import sys
 import threading
 import time
-import urllib.error
 import urllib.request
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
@@ -34,7 +33,7 @@ from botocore.exceptions import ClientError
 from pyathena_bench.aws import active_queries, client, session
 from pyathena_bench.cases import Case, matrix
 from pyathena_bench.config import Settings
-from pyathena_bench.report import report
+from pyathena_bench.report import read_trial_starts, report
 
 # Row cursors page through GetQueryResults, which has an account-wide request-rate quota;
 # so does read_sql_query() through the REST driver.
@@ -42,10 +41,13 @@ API_FAMILIES = {"cursor", "dict", "sqla_rest"}
 QUEUE_ROOT = "fleet"
 # An instance tag with the value "true" keeps a host running after its worker exits.
 KEEP_HOST_TAG = "KeepHost"
-# A file that a worker treats like a Spot interruption notice, to rehearse interruptions.
-SIMULATED_NOTICE = Path("interruption-notice")
+# A file in a worker's directory that it treats like a Spot interruption notice, to
+# rehearse interruptions.
+SIMULATED_NOTICE = "interruption-notice"
 METADATA_URL = "http://169.254.169.254/latest"
 _logger = logging.getLogger(__name__)
+# Errors of an instance metadata request, including a missing path (HTTP 404).
+METADATA_ERRORS = (OSError, http.client.HTTPException)
 # S3 errors of a conditional write whose condition failed.
 PRECONDITION_ERRORS = {"PreconditionFailed", "ConditionalRequestConflict"}
 
@@ -252,8 +254,7 @@ class Lease:
     ``interrupted``, or ``released``), and the times of the last write
     (``renewed``) and of the expiry, as Unix times. A worker renews its leases
     while it runs a job; another worker may take over a lease that has expired
-    or was released. Objects without an expiry, written by earlier versions,
-    never expire.
+    or was ended.
     """
 
     key: str
@@ -267,31 +268,9 @@ class Lease:
             at: Current Unix time.
 
         Returns:
-            True if the lease was interrupted or expired before ``at``.
+            True if the lease was ended or expired before ``at``.
         """
-        expires = self.body.get("expires")
-        return self.body.get("state") in {"interrupted", "released"} or (
-            expires is not None and expires < at
-        )
-
-    def stale(self, at: float) -> bool:
-        """Return whether a running lease missed renewals but has not expired yet.
-
-        A live worker renews a lease ten times per lease period, so a lease
-        that has gone a fifth of its period without renewal belongs to a
-        worker that has probably died.
-
-        Args:
-            at: Current Unix time.
-
-        Returns:
-            True if the lease is running, not takeable, and overdue for renewal.
-        """
-        renewed = self.body.get("renewed")
-        expires = self.body.get("expires")
-        if renewed is None or expires is None or self.takeable(at):
-            return False
-        return at - renewed > (expires - renewed) / 5
+        return self.body["state"] != "running" or self.body["expires"] < at
 
 
 class Queue:
@@ -317,7 +296,7 @@ class Queue:
         """
         return self.prefix + "/".join(parts)
 
-    def put(self, key: str, body: dict[str, Any], **condition: str) -> str | None:
+    def put(self, key: str, body: Any, **condition: str) -> str | None:
         """Write a JSON object, optionally only if a condition holds.
 
         Args:
@@ -397,7 +376,7 @@ class Queue:
         return None
 
     def acquire(self, key: str, owner: dict[str, Any], lease_seconds: float) -> Lease | None:
-        """Take a lease on an object that is absent, expired, or interrupted.
+        """Take a lease on an object that is absent, expired, or ended.
 
         Creation and takeover are conditional writes, so exactly one worker
         obtains each lease. A takeover increments the attempt number.
@@ -410,7 +389,22 @@ class Queue:
         Returns:
             The lease, or None if another worker holds it.
         """
-        current = self.read_lease(key)
+        return self.take(key, self.read_lease(key), owner, lease_seconds)
+
+    def take(
+        self, key: str, current: Lease | None, owner: dict[str, Any], lease_seconds: float
+    ) -> Lease | None:
+        """Take a lease given the object that :meth:`read_lease` returned for it.
+
+        Args:
+            key: Object key of the claim or slot.
+            current: The object as read, or None if it did not exist.
+            owner: Description of the worker and job.
+            lease_seconds: Seconds until the lease expires unless renewed.
+
+        Returns:
+            The lease, or None if another worker holds it or wrote it since.
+        """
         at = time.time()
         body = {
             **owner,
@@ -420,11 +414,10 @@ class Queue:
             "expires": at + lease_seconds,
         }
         if current is None:
-            # Exactly one worker creates the object; another one leaves it.
             return self.put_lease(key, body, IfNoneMatch="*")
         if not current.takeable(at):
             return None
-        body["attempt"] = current.body.get("attempt", 1) + 1
+        body["attempt"] = current.body["attempt"] + 1
         return self.put_lease(key, body, IfMatch=current.etag)
 
     def renew(self, lease: Lease, lease_seconds: float, **changes: Any) -> bool:
@@ -445,17 +438,6 @@ class Queue:
             return False
         lease.body, lease.etag = written.body, written.etag
         return True
-
-    def release_lease(self, lease: Lease) -> bool:
-        """Release a lease that this worker still holds; see :meth:`end_lease`.
-
-        Args:
-            lease: Lease to release.
-
-        Returns:
-            False if another worker took over the lease.
-        """
-        return self.end_lease(lease, "released")
 
     def end_lease(self, lease: Lease, state: str) -> bool:
         """End a lease that this worker still holds, so another worker can take it.
@@ -514,7 +496,8 @@ class Queue:
     ) -> list[Lease] | None:
         """Take API slots that bound simultaneous GetQueryResults paging.
 
-        A slot whose lease expired, because its worker died, is taken over.
+        Every slot is read first, and slots are written only when enough are
+        free; a slot whose lease expired, because its worker died, is free.
 
         Args:
             slots: Number of API slots in the fleet.
@@ -532,20 +515,29 @@ class Queue:
         needed = max(count, 1)
         if needed > slots:
             raise ValueError(f"A job needs {needed} API slots, but only {slots} exist")
+        at = time.time()
+        free = []
+        for index in range(slots):
+            key = self.key("slots", str(index))
+            current = self.read_lease(key)
+            if current is None or current.takeable(at):
+                free.append((key, current))
+        if len(free) < needed:
+            return None
         taken: list[Lease] = []
         try:
-            for index in range(slots):
-                lease = self.acquire(self.key("slots", str(index)), owner, lease_seconds)
+            for key, current in free:
+                lease = self.take(key, current, owner, lease_seconds)
                 if lease is not None:
                     taken.append(lease)
                     if len(taken) == needed:
                         return taken
         except BaseException:
             for lease in taken:
-                self.release_lease(lease)
+                self.end_lease(lease, "released")
             raise
         for lease in taken:
-            self.release_lease(lease)
+            self.end_lease(lease, "released")
         return None
 
     def exists(self, *parts: str) -> bool:
@@ -601,9 +593,7 @@ class Queue:
         for name in names:
             path = directory / name
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(
-                self.s3.get_object(Bucket=self.bucket, Key=source + name)["Body"].read()
-            )
+            self.s3.download_file(self.bucket, source + name, str(path))
         return names
 
 
@@ -631,11 +621,7 @@ def submit(queue: Queue, jobs: list[dict[str, Any]], config: Path, manifest: Pat
             raise ValueError("Queue already exists; choose a new name")
         for name, path in (("config.toml", config), ("manifest.json", manifest)):
             queue.s3.upload_file(str(path), queue.bucket, queue.key(name))
-        queue.s3.put_object(
-            Bucket=queue.bucket,
-            Key=queue.key("jobs.json"),
-            Body=json.dumps(jobs, indent=1).encode(),
-        )
+        queue.put(queue.key("jobs.json"), jobs)
         # Workers start only after this marker.
         if not queue.put_if_absent(queue.key("queue.json"), {"created": now(), "jobs": len(jobs)}):
             raise ValueError("Queue already exists; choose a new name")
@@ -651,6 +637,7 @@ def run_job(
     output: Path,
     resume: list[Path],
     stop: threading.Event,
+    checkpoint: str,
 ) -> int:
     """Run one job attempt as a separate orchestrator process.
 
@@ -667,6 +654,7 @@ def run_job(
         resume: Output directories of earlier attempts whose completed trials
             are not repeated.
         stop: Event that interrupts the attempt.
+        checkpoint: The attempt's ``s3://`` prefix for per-trial checkpoints.
 
     Returns:
         Process exit code.
@@ -674,7 +662,8 @@ def run_job(
     (workdir / "logs").mkdir(parents=True, exist_ok=True)
     command = [
         sys.executable, "-m", "pyathena_bench", "--config", str(workdir / "config.toml"),
-        "run", "--manifest", str(workdir / "manifest.json"), "--out", str(output), *job["args"],
+        "run", "--manifest", str(workdir / "manifest.json"), "--out", str(output),
+        "--checkpoint", checkpoint, *job["args"],
     ]  # fmt: skip
     if resume:
         command += ["--resume", *map(str, resume)]
@@ -701,7 +690,8 @@ def trial_evidence(output: Path) -> tuple[set[str], tuple[str, ...]]:
     """Collect the query IDs and output prefixes that a job's trials used.
 
     Args:
-        output: Job output directory with ``events.jsonl``.
+        output: Job output directory with ``events.jsonl`` or the checkpoint
+            of a fleet attempt.
 
     Returns:
         Reported query IDs and the S3 output prefixes of started trials; both
@@ -709,18 +699,15 @@ def trial_evidence(output: Path) -> tuple[set[str], tuple[str, ...]]:
     """
     events = output / "events.jsonl"
     ids: set[str] = set()
-    prefixes: set[str] = set()
-    if not events.exists():
-        return ids, ()
-    for line in events.read_text().splitlines():
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if event.get("event") == "query" and event.get("query_id"):
-            ids.add(event["query_id"])
-        elif event.get("event") == "trial_start" and event.get("output"):
-            prefixes.add(event["output"])
+    if events.exists():
+        for line in events.read_text().splitlines():
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if event.get("event") == "query" and event.get("query_id"):
+                ids.add(event["query_id"])
+    prefixes = {e["output"] for e in read_trial_starts(output) if e.get("output")}
     return ids, tuple(sorted(prefixes))
 
 
@@ -778,43 +765,40 @@ class SpotInterruptionError(Exception):
 
 
 class JobWatch:
-    """Renew a running job's leases, upload its progress, and watch for interruption.
+    """Renew a running job's leases and watch for an interruption notice.
 
     One thread checks every ``poll_seconds`` for an interruption notice and
-    for the claim's expiry, without S3 requests. Another calls ``progress``
-    every ``poll_seconds`` and renews the leases every ``renew_seconds``.
-    ``stop_requested`` is set on a notice (with ``interrupted``) and when the
-    claim, the first lease, is lost: another worker took it over, or
-    renewals failed or stalled until it expired. A lost lease is listed in
-    ``lost`` and no longer renewed; losing an API slot does not stop the job.
-    ``upload_lock`` serializes uploads of the attempt's files.
+    for the claim's expiry, without S3 requests; another renews the claim and
+    the API slots ten times per lease period. ``interrupted`` is set on a
+    notice, and ``claim_lost`` when another worker took over the claim or
+    renewals failed or stalled until it expired; ``stop`` is set with either
+    and stops the runner. A lost slot is listed in ``lost_slots`` and does not
+    stop the job.
     """
 
     def __init__(
         self,
         queue: Queue,
-        leases: list[Lease],
+        claim: Lease,
+        slots: list[Lease],
         lease_seconds: float,
-        renew_seconds: float,
-        progress: Callable[[], None],
         notice: Callable[[], bool],
         poll_seconds: float = 5.0,
     ) -> None:
         self.queue = queue
-        self.claim = leases[0]
-        self.leases = list(leases)
+        self.claim = claim
+        self.slots = list(slots)
         self.lease_seconds = lease_seconds
-        self.renew_seconds = renew_seconds
-        self.progress = progress
         self.notice = notice
-        self.poll_seconds = min(poll_seconds, renew_seconds)
+        self.renew_seconds = lease_seconds / 10
+        self.poll_seconds = min(poll_seconds, self.renew_seconds)
         self.interrupted = threading.Event()
-        self.stop_requested = threading.Event()
-        self.lost: list[str] = []
-        self.upload_lock = threading.Lock()
+        self.claim_lost = threading.Event()
+        self.stop_event = threading.Event()
+        self.lost_slots: list[str] = []
         self._stopped = threading.Event()
         self._threads = [
-            threading.Thread(target=self._watch_notice, daemon=True),
+            threading.Thread(target=self._watch, daemon=True),
             threading.Thread(target=self._renew, daemon=True),
         ]
 
@@ -829,9 +813,9 @@ class JobWatch:
         exc: BaseException | None,
         traceback: TracebackType | None,
     ) -> None:
-        # After a notice or a lost lease, a renewal stuck in S3 must not delay the
-        # release of the slots; a late renewal fails against the changed ETags.
-        self.stop(10 if self.stop_requested.is_set() else None)
+        # After a stop, a renewal stuck in S3 must not delay the release of the
+        # slots; a late renewal fails against the changed ETags.
+        self.stop(10 if self.stop_event.is_set() else None)
 
     def stop(self, timeout: float | None = None) -> None:
         """Stop the threads and wait for them.
@@ -845,49 +829,38 @@ class JobWatch:
             if thread.is_alive():
                 thread.join(timeout)
 
-    def _watch_notice(self) -> None:
+    def _watch(self) -> None:
         while not self._stopped.wait(self.poll_seconds):
             if check_notice(self.notice):
                 self.interrupted.set()
-                self.stop_requested.set()
+                self.stop_event.set()
                 return
             if time.time() >= self.claim.body["expires"]:
-                # Renewals failed or stalled; another worker may own the job now.
-                self.stop_requested.set()
+                self._lose_claim()
                 return
 
     def _renew(self) -> None:
-        renew_at = time.monotonic() + self.renew_seconds
-        while not self._stopped.wait(self.poll_seconds):
-            # Renewals come first, so that a slow upload does not delay them.
-            if time.monotonic() >= renew_at:
-                renew_at = time.monotonic() + self.renew_seconds
-                self._renew_leases()
-            try:
-                with self.upload_lock:
-                    self.progress()
-            except Exception:
-                # The next poll uploads again.
-                _logger.warning("Could not upload the attempt's progress", exc_info=True)
+        while not self._stopped.wait(self.renew_seconds):
+            if not self.claim_lost.is_set() and not self._renew_lease(self.claim):
+                self._lose_claim()
+            for slot in list(self.slots):
+                if not self._renew_lease(slot):
+                    self.slots.remove(slot)
+                    self.lost_slots.append(slot.key)
 
-    def _renew_leases(self) -> None:
-        for lease in list(self.leases):
-            try:
-                if self.queue.renew(lease, self.lease_seconds):
-                    continue
-            except Exception:
-                if time.time() < lease.body["expires"]:
-                    # The lease has time left for a retry.
-                    continue
-            self.leases.remove(lease)
-            self.lost.append(lease.key)
-            if lease is self.claim:
-                self.stop_requested.set()
+    def _renew_lease(self, lease: Lease) -> bool:
+        try:
+            return self.queue.renew(lease, self.lease_seconds)
+        except Exception:
+            # The lease has time left for a retry until it expires.
+            return time.time() < lease.body["expires"]
+
+    def _lose_claim(self) -> None:
+        self.claim_lost.set()
+        self.stop_event.set()
 
 
-def pending_jobs(
-    queue: Queue, jobs: list[dict[str, Any]]
-) -> tuple[list[dict[str, Any]], dict[str, Lease]]:
+def pending_jobs(queue: Queue, jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Return the jobs that are neither done nor held by a live claim.
 
     Args:
@@ -896,23 +869,21 @@ def pending_jobs(
 
     Returns:
         Jobs without a ``done`` marker whose claim is absent, expired, or
-        released, in queue order, and the claims of the other unfinished jobs.
+        ended, in queue order.
     """
     done = queue.names("done")
     claimed = queue.names("claims")
     at = time.time()
     pending = []
-    running: dict[str, Lease] = {}
     for job in jobs:
         if job["id"] in done:
             continue
         if job["id"] in claimed:
             lease = queue.read_lease(queue.key("claims", job["id"]))
             if lease is not None and not lease.takeable(at):
-                running[job["id"]] = lease
                 continue
         pending.append(job)
-    return pending, running
+    return pending
 
 
 @dataclass(frozen=True)
@@ -938,19 +909,19 @@ def run_attempt(
     runner: Callable[..., int],
     settle: Callable[[Path], list[str]],
     lease_seconds: float,
-    renew_seconds: float,
     notice: Callable[[], bool],
 ) -> Outcome:
     """Run one attempt of a claimed job and record its outcome.
 
-    The attempt writes to ``results/<job>/attempt-<n>/``. A takeover (attempt
-    2 or later) first downloads the earlier attempts, quiesces their trials,
+    The attempt writes to ``results/<job>/attempt-<n>/``, and its orchestrator
+    writes per-trial checkpoints there between trials. A takeover (attempt 2
+    or later) first downloads the earlier attempts, quiesces their trials,
     and passes them to the runner so that completed trials are not repeated.
-    Trial records are uploaded within seconds of each trial's start and end. An interruption
-    notice or a lost claim stops the runner; after a notice, the attempt is
-    uploaded and the claim released as interrupted. Otherwise, after a
-    conditional renewal confirms that the claim is still held, the job's
-    report merges every attempt into ``job-summary.csv`` and
+    An interruption notice or a lost claim stops the runner: after a notice,
+    the attempt is uploaded and the claim released as interrupted; after a
+    lost claim, the attempt's queries are quiesced and nothing is recorded.
+    Otherwise, after a conditional renewal confirms that the claim is still
+    held, the job's report merges every attempt into ``job-summary.csv`` and
     ``job-summary.md`` of this attempt, and the first ``done`` marker of the
     job records the exit code and names that attempt.
 
@@ -963,7 +934,6 @@ def run_attempt(
         runner: Function that runs the attempt; see :func:`run_job`.
         settle: Function that quiesces an output directory and returns errors.
         lease_seconds: Seconds a lease lasts without renewal.
-        renew_seconds: Seconds between renewals.
         notice: Function that returns whether an interruption notice exists.
 
     Returns:
@@ -974,41 +944,19 @@ def run_attempt(
     output = job_dir / f"attempt-{attempt}"
     remote = ("results", job["id"], output.name)
     log = workdir / "logs" / f"{job['id']}-{output.name}.log"
-    checked: dict[str, int] = {}
 
-    def progress() -> None:
-        # Upload at trial boundaries: when a trial starts (its output prefix is
-        # needed to quiesce it) and when it is recorded (needed to resume). A
-        # boundary stays pending until its upload succeeds.
-        events, trials = output / "events.jsonl", output / "trials.jsonl"
-        if events.exists():
-            with events.open("rb") as stream:
-                stream.seek(checked.get("events", 0))
-                if b'"trial_start"' in stream.read():
-                    checked["pending"] = 1
-                checked["events"] = stream.tell()
-        if trials.exists() and trials.stat().st_size != checked.get("trials"):
-            checked["trials"] = trials.stat().st_size
-            checked["pending"] = 1
-        if checked.get("pending"):
-            for path in (events, trials):
-                if path.exists():
-                    queue.s3.upload_file(str(path), queue.bucket, queue.key(*remote, path.name))
-            checked["pending"] = 0
+    def upload_attempt() -> None:
+        queue.upload_tree(output, *remote)
+        if log.exists():
+            queue.s3.upload_file(str(log), queue.bucket, queue.key("logs", log.name))
 
-    with JobWatch(queue, [claim, *slots], lease_seconds, renew_seconds, progress, notice) as watch:
+    def safe_settle(path: Path) -> list[str]:
+        try:
+            return settle(path)
+        except Exception as exc:
+            return [f"Could not quiesce {path.name}: {type(exc).__name__}: {exc}"]
 
-        def upload_attempt(timeout: float = -1) -> None:
-            # A checkpoint stuck in S3 holds the lock; it uploads the same files.
-            if not watch.upload_lock.acquire(timeout=timeout):
-                return
-            try:
-                queue.upload_tree(output, *remote)
-                if log.exists():
-                    queue.s3.upload_file(str(log), queue.bucket, queue.key("logs", log.name))
-            finally:
-                watch.upload_lock.release()
-
+    with JobWatch(queue, claim, slots, lease_seconds, notice) as watch:
         start = now()
         resume = [
             job_dir / f"attempt-{earlier}"
@@ -1017,83 +965,65 @@ def run_attempt(
                 job_dir / f"attempt-{earlier}", "results", job["id"], f"attempt-{earlier}"
             )
         ]
-        errors: list[str] = []
-        for earlier_output in resume:
-            try:
-                errors += settle(earlier_output)
-            except Exception as exc:
-                errors.append(
-                    f"Could not quiesce {earlier_output.name}: {type(exc).__name__}: {exc}"
-                )
+        errors = [error for earlier in resume for error in safe_settle(earlier)]
         code = 1
-        if not errors and not watch.stop_requested.is_set():
-            code = runner(job, workdir, output, resume, watch.stop_requested)
-        if watch.stop_requested.is_set():
+        if not errors and not watch.stop_event.is_set():
+            code = runner(
+                job,
+                workdir,
+                output,
+                resume,
+                watch.stop_event,
+                f"s3://{queue.bucket}/{queue.key(*remote)}/",
+            )
+        if watch.interrupted.is_set():
             watch.stop(timeout=10)
             # Upload before releasing the claim, so that the next attempt resumes
             # from every recorded trial; both are small within a notice's two minutes.
-            upload_attempt(timeout=10)
-            if not watch.interrupted.is_set():
-                # The claim was lost; another worker continues the job. This
-                # attempt's queries are stopped before this worker claims another.
-                try:
-                    errors += settle(output)
-                except Exception as exc:
-                    errors.append(f"Could not quiesce the job: {type(exc).__name__}: {exc}")
-                return Outcome("lost", tuple(errors))
+            upload_attempt()
             queue.end_lease(claim, "interrupted")
             return Outcome("interrupted")
-        if not errors:
-            try:
-                errors = settle(output) if code else []
-            except Exception as exc:
-                errors = [f"Could not quiesce the job: {type(exc).__name__}: {exc}"]
+        if code and not errors:
+            # A failed or stopped run can leave queries running.
+            errors = safe_settle(output)
         upload_attempt()
-        report_error = None
-        try:
-            report(job_dir)
-        except Exception as exc:
-            # A job without trials, or with unreadable records, still gets its done marker.
-            report_error = f"{type(exc).__name__}: {exc}"
-        watch.stop()
-        # Renewing the claim conditionally proves that this worker still owns the
-        # job and leaves at least --lease-seconds for the few seconds of publication.
-        if (
-            claim.key in watch.lost
-            or (watch.stop_requested.is_set() and not watch.interrupted.is_set())
-            or not queue.renew(claim, lease_seconds)
-        ):
-            # The claim was taken over or expired; its new owner records the job.
-            return Outcome("lost", tuple(errors))
-        if report_error is None:
-            # The job's summary goes below this attempt, which the done marker names,
-            # so a former owner's late upload cannot replace the recorded summary.
-            for name in ("summary.csv", "summary.md"):
-                queue.s3.upload_file(
-                    str(job_dir / name), queue.bucket, queue.key(*remote, f"job-{name}")
-                )
-        if time.time() >= claim.body["expires"]:
-            # Publication outlasted the renewed claim, which another worker may own now.
-            return Outcome("lost", tuple(errors))
-        # The first done marker of a job is never replaced.
-        recorded = queue.put_lease(
-            queue.key("done", job["id"]),
-            {
-                "exit_code": code,
-                "host": socket.gethostname(),
-                "attempt": attempt,
-                "start": start,
-                "end": now(),
-                "quiesce_errors": errors,
-                "report_error": report_error,
-                "summary": None if report_error else "/".join(remote[1:]),
-                "lost_slots": [key for key in watch.lost if key != claim.key],
-            },
-            IfNoneMatch="*",
-        )
-        if recorded is None:
-            return Outcome("lost", tuple(errors))
-    return Outcome("done", tuple(errors))
+    lost = Outcome("lost", tuple(errors))
+    # The conditional renewal proves that this worker still owns the job, so a
+    # former owner never records it, and leaves at least --lease-seconds for
+    # the few seconds of publication.
+    if watch.claim_lost.is_set() or not queue.renew(claim, lease_seconds):
+        return lost
+    report_error = None
+    try:
+        report(job_dir)
+        # The job's summary goes below this attempt, which the done marker names,
+        # so a former owner's late upload cannot replace the recorded summary.
+        for name in ("summary.csv", "summary.md"):
+            queue.s3.upload_file(
+                str(job_dir / name), queue.bucket, queue.key(*remote, f"job-{name}")
+            )
+    except Exception as exc:
+        # A job without trials, or with unreadable records, still gets its done marker.
+        report_error = f"{type(exc).__name__}: {exc}"
+    if time.time() >= claim.body["expires"]:
+        # Publication outlasted the renewed claim, which another worker may own now.
+        return lost
+    recorded = queue.put_lease(
+        queue.key("done", job["id"]),
+        {
+            "exit_code": code,
+            "host": socket.gethostname(),
+            "attempt": attempt,
+            "start": start,
+            "end": now(),
+            "quiesce_errors": errors,
+            "report_error": report_error,
+            "summary": None if report_error else "/".join(remote[1:]),
+            "lost_slots": watch.lost_slots,
+        },
+        IfNoneMatch="*",
+    )
+    return lost if recorded is None else Outcome("done", tuple(errors))
 
 
 def work(
@@ -1104,8 +1034,7 @@ def work(
     runner: Callable[..., int] = run_job,
     settle: Callable[[Path], list[str]] | None = None,
     lease_seconds: float = 600.0,
-    renew_seconds: float = 60.0,
-    notice: Callable[[], bool] = lambda: False,
+    notice: Callable[[], bool] | None = None,
     wait: bool = False,
 ) -> list[str]:
     """Claim and run queued jobs until no job is left to claim.
@@ -1113,11 +1042,9 @@ def work(
     Each host runs one worker, so jobs on a host never overlap. A claim and
     each API slot are leases that the worker renews while the job runs; a job
     or slot whose lease expired, because its worker died, returns to the
-    fleet. Before exiting, the worker waits until every other unfinished
-    job's claim has been renewed, so a job whose worker died is taken over.
-    An API-heavy job starts only after the worker takes one shared slot per
-    simultaneous paging query; while it waits, no later API-heavy job takes
-    slots. After a failed job, the worker
+    fleet: a running worker takes it over. An API-heavy job starts only after
+    the worker takes one shared slot per simultaneous paging query; while it
+    waits, no later API-heavy job takes slots. After a failed job, the worker
     cancels the job's observed queries and waits until they stop before
     claiming another job.
 
@@ -1131,9 +1058,12 @@ def work(
         settle: Function that quiesces a failed job, given its output
             directory, and returns errors; defaults to :func:`quiesce` with the
             queued configuration.
-        lease_seconds: Seconds a claim or slot lasts without renewal.
-        renew_seconds: Seconds between renewals.
-        notice: Function that returns whether a Spot interruption notice exists.
+        lease_seconds: Seconds a claim or slot lasts without renewal; the
+            worker renews its leases ten times per period.
+        notice: Function that returns whether a Spot interruption notice
+            exists; defaults to :func:`interruption_notice` with the
+            rehearsal file ``interruption-notice`` in ``workdir``, which the
+            worker removes when it starts.
         wait: Whether to wait for the queue to be published instead of failing.
 
     Returns:
@@ -1152,6 +1082,14 @@ def work(
             raise ValueError("Queue is missing or incompletely published")
         time.sleep(poll_seconds)
     workdir.mkdir(parents=True, exist_ok=True)
+    if notice is None:
+        rehearsal = workdir / SIMULATED_NOTICE
+        # A rehearsed notice stops one worker; a restarted worker starts clean.
+        rehearsal.unlink(missing_ok=True)
+
+        def notice() -> bool:
+            return interruption_notice(simulated=rehearsal)
+
     for name in ("config.toml", "manifest.json", "jobs.json"):
         (workdir / name).write_bytes(queue.read(name))
     jobs = json.loads((workdir / "jobs.json").read_text())
@@ -1166,31 +1104,12 @@ def work(
 
     host = socket.gethostname()
     completed: list[str] = []
-    # Renewal times of other workers' claims when this worker found nothing to claim.
-    waiting: dict[str, float | None] = {}
     while True:
         if check_notice(notice):
             raise SpotInterruptionError(completed)
-        pending, running = pending_jobs(queue, jobs)
-        if pending:
-            waiting = {}
-        else:
-            at = time.time()
-            for job_id, lease in running.items():
-                waiting.setdefault(job_id, lease.body.get("renewed"))
-            # Exit once every other claim has been renewed since and is still
-            # fresh; a claim whose worker died stops being renewed and is taken
-            # over when it expires.
-            if all(
-                lease.body.get("renewed") is None
-                or (
-                    lease.body["renewed"] != waiting[job_id]
-                    and not lease.stale(at)
-                    and not lease.takeable(at)
-                )
-                for job_id, lease in running.items()
-            ):
-                return completed
+        pending = pending_jobs(queue, jobs)
+        if not pending:
+            return completed
         started = False
         reserved = False
         for job in pending:
@@ -1220,7 +1139,6 @@ def work(
                     runner,
                     settle,
                     lease_seconds,
-                    renew_seconds,
                     notice,
                 )
                 if outcome.state == "interrupted":
@@ -1240,7 +1158,7 @@ def work(
                 break
             finally:
                 for slot in slots:
-                    queue.release_lease(slot)
+                    queue.end_lease(slot, "released")
         if not started:
             time.sleep(poll_seconds)
 
@@ -1286,7 +1204,7 @@ def check_notice(notice: Callable[[], bool]) -> bool:
 
 
 def interruption_notice(
-    metadata: Callable[[str], str] | None = None, simulated: Path = SIMULATED_NOTICE
+    metadata: Callable[[str], str] | None = None, simulated: Path | None = None
 ) -> bool:
     """Return whether this host has a Spot interruption notice.
 
@@ -1298,16 +1216,16 @@ def interruption_notice(
     Args:
         metadata: Function that reads an instance metadata path; defaults to
             :func:`instance_metadata`.
-        simulated: File that counts as a notice.
+        simulated: File that counts as a notice, or None.
 
     Returns:
         True if a notice exists; False also when instance metadata is unavailable.
     """
-    if simulated.exists():
+    if simulated is not None and simulated.exists():
         return True
     try:
         (metadata or instance_metadata)("spot/instance-action")
-    except (urllib.error.URLError, OSError, http.client.HTTPException):
+    except METADATA_ERRORS:
         return False
     return True
 
@@ -1325,7 +1243,7 @@ def keep_host(metadata: Callable[[str], str]) -> bool:
     """
     try:
         return metadata(f"tags/instance/{KEEP_HOST_TAG}").strip().lower() == "true"
-    except (urllib.error.URLError, OSError):
+    except METADATA_ERRORS:
         return False
 
 
@@ -1375,20 +1293,17 @@ def retire_host(
     """
     host = metadata("instance-id")
     kept = keep_host(metadata)
-    queue.s3.put_object(
-        Bucket=queue.bucket,
-        Key=queue.key("hosts", f"{host}.json"),
-        Body=json.dumps(
-            {
-                "host": socket.gethostname(),
-                "instance_type": metadata("instance-type"),
-                "availability_zone": metadata("placement/availability-zone"),
-                "lifecycle": metadata("instance-life-cycle"),
-                "ran": ran,
-                "end": now(),
-                "kept": kept,
-            }
-        ).encode(),
+    queue.put(
+        queue.key("hosts", f"{host}.json"),
+        {
+            "host": socket.gethostname(),
+            "instance_type": metadata("instance-type"),
+            "availability_zone": metadata("placement/availability-zone"),
+            "lifecycle": metadata("instance-life-cycle"),
+            "ran": ran,
+            "end": now(),
+            "kept": kept,
+        },
     )
     if kept:
         return False
@@ -1424,11 +1339,10 @@ def status(queue: Queue) -> dict[str, Any]:
         leases = {}
         for name in sorted(names):
             lease = queue.read_lease(queue.key(folder, name))
-            if lease is not None and lease.body.get("state") != "released":
+            if lease is not None and lease.body["state"] != "released":
                 leases[name] = {
                     **{k: lease.body.get(k) for k in ("host", "job", "attempt", "state")},
-                    "expired": lease.takeable(at) and lease.body.get("state") == "running",
-                    "stale": lease.stale(at),
+                    "expired": lease.body["state"] == "running" and lease.takeable(at),
                 }
         return leases
 
