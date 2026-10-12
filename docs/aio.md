@@ -84,6 +84,9 @@ async with await aio_connect(s3_staging_dir="s3://YOUR_S3_BUCKET/path/to/",
         rows = await cursor.fetchall()
 ```
 
+Leaving the block closes the cursor in a thread without blocking the event loop, and `execute()` and `executemany()` close the previous result the same way.
+Calling `cursor.close()` directly closes it on the calling thread.
+
 You can iterate over results with `async for`:
 
 ```python
