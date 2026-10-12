@@ -74,13 +74,16 @@ class ReadAheadStream(io.RawIOBase):
         super().__init__()
         part_size = self.DEFAULT_PART_SIZE if part_size is None else part_size
         max_parts = self.DEFAULT_MAX_PARTS if max_parts is None else max_parts
-        if part_size < 1 or max_parts < 1:
+        try:
+            if part_size < 1:
+                raise ValueError(f"part_size must be positive, got {part_size}.")
+            if max_parts < 1:
+                raise ValueError(f"max_parts must be positive, got {max_parts}.")
+        except ValueError:
             # Closed as io.RawIOBase, so that finalizing the stream does not call
             # close() of this class, nor on_close.
             super().close()
-            if part_size < 1:
-                raise ValueError(f"part_size must be positive, got {part_size}.")
-            raise ValueError(f"max_parts must be positive, got {max_parts}.")
+            raise
         self._read_range = read_range
         self._size = size
         self._part_size = part_size

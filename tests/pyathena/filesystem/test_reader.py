@@ -17,7 +17,7 @@ from pyathena.filesystem.reader import ReadAheadStream
 from tests.pyathena.util import EVENT_TIMEOUT, ImmediateExecutor
 
 
-class _RecordingFile:
+class _RecordingRangeFile:
     """A file over bytes that records the ranges it reads."""
 
     def __init__(self, data, short=False, error_at=None, gate=None):
@@ -27,7 +27,7 @@ class _RecordingFile:
         self._gate = gate
         self.gated_read_started = threading.Event()
         self.reads = []
-        self.closed = False
+        self.closes = 0
 
     def read_range(self, offset, size):
         self.reads.append((offset, size))
@@ -38,8 +38,12 @@ class _RecordingFile:
             raise OSError("read failed")
         return self._data[offset : offset + size - (1 if self._short else 0)]
 
+    @property
+    def closed(self):
+        return self.closes > 0
+
     def close(self):
-        self.closed = True
+        self.closes += 1
 
     def open_stream(self, **kwargs):
         """Open a stream over the file that closes it."""
@@ -82,7 +86,7 @@ class TestReadAheadStream:
     @pytest.mark.parametrize("read_size", [1, 5, 7, 100])
     def test_read(self, size, read_size):
         data = bytes(range(256))[:size]
-        file = _RecordingFile(data)
+        file = _RecordingRangeFile(data)
         stream = file.open_stream(part_size=7, max_parts=2)
         chunks = []
         while chunk := stream.read(read_size):
@@ -95,30 +99,11 @@ class TestReadAheadStream:
         stream.close()
         assert file.closed
 
-    def test_read_range(self):
-        """A range-read function is called with the offset and size of each part."""
-        data = bytes(range(25))
-        ranges = []
-        closed = []
-
-        def read_range(offset, size):
-            ranges.append((offset, size))
-            return data[offset : offset + size]
-
-        stream = ReadAheadStream(
-            read_range, len(data), part_size=10, max_parts=2, on_close=lambda: closed.append(1)
-        )
-        assert stream.read() == data
-        assert sorted(ranges) == [(0, 10), (10, 10), (20, 5)]
-        stream.close()
-        stream.close()
-        assert closed == [1]
-
     def test_default_part_size(self, monkeypatch):
         monkeypatch.setattr("pyathena.filesystem.reader.ThreadPoolExecutor", ImmediateExecutor)
         monkeypatch.setattr(ReadAheadStream, "DEFAULT_PART_SIZE", 10)
         monkeypatch.setattr(ReadAheadStream, "DEFAULT_MAX_PARTS", 2)
-        file = _RecordingFile(bytes(100))
+        file = _RecordingRangeFile(bytes(100))
         stream = file.open_stream()
         assert stream.read(1) == bytes(1)
         assert file.reads == [(0, 10), (10, 10), (20, 10)]
@@ -144,7 +129,7 @@ class TestReadAheadStream:
     def test_parts_in_flight(self, monkeypatch):
         """At most max_parts parts are requested ahead of the one being consumed."""
         monkeypatch.setattr("pyathena.filesystem.reader.ThreadPoolExecutor", ImmediateExecutor)
-        file = _RecordingFile(bytes(100))
+        file = _RecordingRangeFile(bytes(100))
         stream = file.open_stream(part_size=10, max_parts=3)
         assert file.reads == []
         assert stream.read(1) == bytes(1)
@@ -155,14 +140,14 @@ class TestReadAheadStream:
         stream.close()
 
     def test_short_read(self):
-        stream = _RecordingFile(bytes(20), short=True).open_stream(part_size=10, max_parts=2)
+        stream = _RecordingRangeFile(bytes(20), short=True).open_stream(part_size=10, max_parts=2)
         with pytest.raises(OSError, match="Read 9 bytes of a range of 10 bytes"):
             stream.read(20)
         stream.close()
 
     def test_read_error(self):
         """An error is raised by the read that reaches the failed part."""
-        file = _RecordingFile(bytes(30), error_at=10)
+        file = _RecordingRangeFile(bytes(30), error_at=10)
         stream = file.open_stream(part_size=10, max_parts=2)
         assert stream.read(10) == bytes(10)
         with pytest.raises(OSError, match="read failed"):
@@ -175,7 +160,7 @@ class TestReadAheadStream:
 
     def test_close_before_end(self):
         """Closing cancels the queued reads and closes the file."""
-        file = _RecordingFile(bytes(1000))
+        file = _RecordingRangeFile(bytes(1000))
         stream = file.open_stream(part_size=10, max_parts=2)
         assert stream.read(5) == bytes(5)
         stream.close()
@@ -183,6 +168,8 @@ class TestReadAheadStream:
         assert stream.closed
         assert len(file.reads) <= 3
         stream.close()
+        # The file is closed once.
+        assert file.closes == 1
         with pytest.raises(ValueError, match="I/O operation on closed file"):
             stream.read(5)
 
@@ -192,7 +179,7 @@ class TestReadAheadStream:
             "pyathena.filesystem.reader.ThreadPoolExecutor", _InterruptedWaitExecutor
         )
         data = bytes(range(30))
-        file = _RecordingFile(data)
+        file = _RecordingRangeFile(data)
         stream = file.open_stream(part_size=10, max_parts=2)
         with pytest.raises(KeyboardInterrupt):
             stream.read(10)
@@ -205,7 +192,7 @@ class TestReadAheadStream:
         """An interrupted close leaves the file open, and closing again waits for the
         running reads before closing the file."""
         gate = threading.Event()
-        file = _RecordingFile(bytes(100), gate=gate)
+        file = _RecordingRangeFile(bytes(100), gate=gate)
         stream = file.open_stream(part_size=10, max_parts=2)
         interrupts = [KeyboardInterrupt()]
 
@@ -253,7 +240,7 @@ class TestReadAheadStream:
             lambda max_workers: Executor(max_workers=1),
         )
         gate = threading.Event()
-        file = _RecordingFile(bytes(100), gate=gate)
+        file = _RecordingRangeFile(bytes(100), gate=gate)
         stream = file.open_stream(part_size=10, max_parts=2)
         closer = threading.Thread(target=stream.close, daemon=True)
         try:
@@ -275,7 +262,7 @@ class TestReadAheadStream:
     def test_close_waits_for_running_reads(self):
         """Closing waits for the reads in flight before closing the file."""
         gate = threading.Event()
-        file = _RecordingFile(bytes(100), gate=gate)
+        file = _RecordingRangeFile(bytes(100), gate=gate)
         stream = file.open_stream(part_size=10, max_parts=2)
         closer = threading.Thread(target=stream.close)
         try:
@@ -295,12 +282,9 @@ class TestReadAheadStream:
     def test_csv(self):
         """pyarrow reads a CSV through the stream with its own block size."""
         data = b"a,b\n" + b"".join(f"{i},x{i}\n".encode() for i in range(10_000))
-        file = pa.BufferReader(data)
-        stream = ReadAheadStream(
-            lambda offset, size: file.read_at(size, offset), file.size(), 7, 3, file.close
-        )
+        file = _RecordingRangeFile(data)
         read_options = pa_csv.ReadOptions(block_size=4096)
-        with pa.PythonFile(stream, mode="r") as source:
+        with pa.PythonFile(file.open_stream(part_size=7, max_parts=3), mode="r") as source:
             table = pa_csv.read_csv(source, read_options=read_options)
         assert table.equals(pa_csv.read_csv(pa.BufferReader(data), read_options=read_options))
         assert file.closed
