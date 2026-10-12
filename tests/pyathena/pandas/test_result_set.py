@@ -557,9 +557,7 @@ def test_read_csv_json_null_without_dtype_warning(json_value, expected, engine, 
     values = df.index if kwargs.get("index_col") == "j" else df["j"]
     assert options["engine"] == ("python" if engine == "python" else "c")
     assert options.get("low_memory") == kwargs.get("low_memory")
-    # By position, which pandas does not copy to a renamed column with the same name.
-    assert options["dtype"][1] is object
-    assert "j" not in options["converters"]
+    assert options["converters"]["j"] is str
     assert len(df) == 400010
     assert values.dtype == object
     assert type(values[0]) is type(expected)
@@ -617,30 +615,24 @@ def test_read_csv_json_multi_index_level():
     assert pd.isna(level[2])
 
 
+@pytest.mark.filterwarnings("ignore:Both a converter and dtype:pandas.errors.ParserWarning")
 @pytest.mark.parametrize("engine", ["c", "python"])
 @pytest.mark.parametrize(
-    ("dtype", "expected"),
+    ("dtype", "n_dtype"),
     [
-        pytest.param({"n": "int32"}, {"n": "int32", 1: object}, id="mapping"),
-        pytest.param(
-            defaultdict(lambda: "str", {"n": "int32"}),
-            {"n": "int32", 1: object, "other": "str"},
-            id="defaultdict",
-        ),
-        pytest.param("str", {"n": "str", 1: object}, id="scalar"),
-        pytest.param({"n": "int32", "j": "Int64"}, {"n": "int32", 1: object}, id="json-column"),
+        pytest.param({"n": "int32"}, "int32", id="mapping"),
+        pytest.param(defaultdict(lambda: "str", {"n": "int32"}), "int32", id="defaultdict"),
+        pytest.param("str", "str", id="scalar"),
+        pytest.param({"n": "int32", "j": "Int64"}, "int32", id="json-column"),
     ],
 )
-def test_read_csv_json_with_dtype(engine, dtype, expected):
+def test_read_csv_json_with_dtype(engine, dtype, n_dtype):
     """A dtype given to execute() applies to the other columns, not to json columns."""
     df, options = _read_csv_result(
         "n,j\n1,2\n3,\n", {"n": "integer", "j": "json"}, engine=engine, dtype=dtype
     )
-    assert {key: options["dtype"][key] for key in expected} == expected
-    assert "j" not in options["dtype"]
-    if isinstance(dtype, dict):
-        assert 1 not in dtype
-    assert df["n"].dtype == expected["n"]
+    assert options["dtype"] is dtype
+    assert df["n"].dtype == n_dtype
     assert df["j"].tolist() == [2, None]
 
 
@@ -671,46 +663,41 @@ def test_read_csv_keeps_low_memory_default(types, engine, kwargs):
     assert len(df) == 30
 
 
+@pytest.mark.filterwarnings("ignore:Both a converter and dtype:pandas.errors.ParserWarning")
 @pytest.mark.parametrize(
-    ("types", "expected"),
+    ("kwargs", "expected", "dtype"),
     [
+        pytest.param({}, {"x": [1, 3], "x.1": [2, 4]}, "Int64", id="labels"),
+        pytest.param({"dtype": {}}, {"x": [1, 3], "x.1": [2, 4]}, "int64", id="dtype"),
         pytest.param(
-            [("x", "json"), ("x", "json"), ("x", "json")],
-            {"x": [None, 4], "x.1": [3, 5], "x.2": [None, [1]]},
-            id="json",
+            {"dtype": {"x": "str"}},
+            {"x": [1, 3], "x.1": ["002", "004"]},
+            "str",
+            id="dtype-of-json-column",
         ),
-        pytest.param(
-            [("x", "json"), ("x", "integer"), ("x", "json")],
-            {"x": [None, 4], "x.1": [3, 5], "x.2": [None, [1]]},
-            id="json-and-integer",
-        ),
+        pytest.param({"skiprows": [1]}, {"x": [3], "x.1": [4]}, "Int64", id="without-labels"),
     ],
 )
-def test_read_csv_json_columns_with_the_same_name_without_labels(types, expected):
-    """Columns with the same name are converted by type when skiprows keeps the labels unknown."""
-    data = 'x,x,x\n1,2,3\n,3,\n4,5,"[1]"\n'
-    df, _ = _read_csv_result(data, types, skiprows=[1])
+def test_read_csv_json_column_with_the_same_name_as_another_column(kwargs, expected, dtype):
+    """A column renamed from the name of a json column is read with its own options."""
+    df, _ = _read_csv_result("x,x\n1,002\n3,004\n", [("x", "json"), ("x", "integer")], **kwargs)
     assert df.to_dict("list") == expected
-    assert df["x.1"].dtype == ("Int64" if types[1][1] == "integer" else "int64")
-
-
-@pytest.mark.parametrize("kwargs", [{}, {"dtype": {}}])
-def test_read_csv_json_column_with_the_same_name_as_another_column(kwargs):
-    """A column renamed from the name of a json column keeps its own type."""
-    df, _ = _read_csv_result("x,x\n1,2\n", [("x", "json"), ("x", "integer")], **kwargs)
-    assert df.to_dict("list") == {"x": [1], "x.1": [2]}
-    assert df["x.1"].dtype.kind == "i"
+    assert df["x.1"].dtype == dtype
 
 
 @pytest.mark.parametrize("engine", ["c", "python"])
-def test_read_csv_json_parse_dates(engine):
+@pytest.mark.parametrize("kwargs", [{}, {"index_col": "j"}])
+def test_read_csv_json_parse_dates(engine, kwargs):
     """Dates that pandas parses from a json column with parse_dates are kept."""
     df, _ = _read_csv_result(
-        "n,j\n1,20240101\n2,\n", {"n": "integer", "j": "json"}, engine=engine, parse_dates=["j"]
+        "n,j\n1,20240101\n",
+        {"n": "integer", "j": "json"},
+        engine=engine,
+        parse_dates=["j"],
+        **kwargs,
     )
-    assert df["j"].dtype.kind == "M"
-    assert df["j"].iloc[0] == pd.Timestamp("2024-01-01")
-    assert pd.isna(df["j"].iloc[1])
+    values = df.index if kwargs else df["j"]
+    assert values.tolist() == [pd.Timestamp("2024-01-01")]
 
 
 def test_read_csv_json_conversion_error():

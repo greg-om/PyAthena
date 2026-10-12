@@ -5,7 +5,7 @@ from __future__ import annotations
 import csv
 import importlib
 import logging
-from collections import abc, defaultdict
+from collections import abc
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import ExitStack
 from functools import partial
@@ -195,7 +195,7 @@ class _JSONConverter:
     pandas applies a converter to each internal parser block and infers a dtype from
     the values that it returns in that block, so JSON numbers in a block without NULL
     would become numbers of that block's dtype while a block with NULL kept objects.
-    The json columns are read as text instead, and ``convert()`` converts each
+    pandas reads the json columns as text instead, and ``convert()`` converts each
     DataFrame or chunk as a whole after reading.
     """
 
@@ -233,7 +233,8 @@ class _JSONConverter:
         """Convert json text values.
 
         Args:
-            values: The text values, with NaN for NULL.
+            values: The text values, with NaN for a value that pandas read as missing.
+                Values that pandas already parsed, such as an index or dates, are kept.
             index: The index of the returned values, or None for a default index.
 
         Returns:
@@ -245,10 +246,17 @@ class _JSONConverter:
         if values.dtype.kind in "mM":
             # pandas parsed the text as dates, as parse_dates given to execute() asks.
             return pd.Series(values.array, index=index)
-        # A value that is not text is NULL, which the converter gets as an empty string,
-        # as pandas passes NULL to a converter.
+        # A missing value is NULL, which the converter gets as an empty string, as
+        # pandas passes NULL to a converter.
         converted = pd.Series(
-            [self._converter(v if isinstance(v, str) else "") for v in values.to_numpy()],
+            [
+                self._converter(v)
+                if isinstance(v, str)
+                else self._converter("")
+                if pd.isna(v)
+                else v
+                for v in values.to_numpy()
+            ],
             index=index,
             dtype=object,
         )
@@ -824,7 +832,7 @@ class AthenaPandasResultSet(AthenaResultSet):
         """Get the converter for a column type of the CSV result file.
 
         json columns get a ``_JSONConverter``, which ``_read_json_columns_as_text()``
-        takes out of the converters for ``pandas.read_csv()``, and which converts the
+        replaces in the converters for ``pandas.read_csv()``, and which converts the
         columns after reading.
 
         Args:
@@ -919,7 +927,7 @@ class AthenaPandasResultSet(AthenaResultSet):
                 if labels is not None:
                     # After _configure_binary_csv_read(), which checks for the header row.
                     self._read_csv_header_as_labels(read_csv_kwargs, csv_engine)
-                self._read_json_columns_as_text(read_csv_kwargs, labels)
+                self._read_json_columns_as_text(read_csv_kwargs)
                 # A reader that keeps the file open is closed early by callers, and
                 # closing a prefetching file waits for the block being read.
                 prefetch = not self._returns_csv_reader(read_csv_kwargs)
@@ -977,75 +985,26 @@ class AthenaPandasResultSet(AthenaResultSet):
             _logger.exception(f"Failed to read {location}.")
             raise OperationalError(*e.args) from e
 
-    def _read_json_columns_as_text(
-        self, read_csv_kwargs: dict[str, Any], labels: list[Any] | None
-    ) -> None:
+    def _read_json_columns_as_text(self, read_csv_kwargs: dict[str, Any]) -> None:
         """Read the json columns as text, which ``_finish_csv_frame()`` converts.
 
-        Moves the ``_JSONConverter`` converters out of the converters for
-        ``pandas.read_csv()`` and reads their columns as objects.
+        Replaces the ``_JSONConverter`` converters for ``pandas.read_csv()`` with
+        ``str``, which keeps the text of each value.
 
         Args:
             read_csv_kwargs: The options for ``pandas.read_csv()``, updated in place.
-            labels: The labels from ``_get_csv_column_labels()``.
         """
         converters = read_csv_kwargs.get("converters") or {}
-        json_converters = {
+        self._csv_json_converters = {
             label: converter
             for label, converter in converters.items()
             if isinstance(converter, _JSONConverter)
         }
-        self._csv_json_converters = json_converters
-        if not json_converters:
-            return
-        read_csv_kwargs["converters"] = {
-            label: converter
-            for label, converter in converters.items()
-            if label not in json_converters
-        }
-        renamed_dtypes: dict[Any, Any] = {}
-        description = self.description or []
-        names = [d[0] for d in description]
-        if labels is None and len(set(names)) != len(names):
-            import pandas as pd
-
-            # Without labels, the options are keyed by name. pandas renames a repeated
-            # name in the header, such as x.1, and reads the renamed column with the
-            # dtype of the first column with the name, which would be text.
-            renamed = self._resolve_csv_column_names(names, {}, pd.read_csv)[0]
-            for label, d in zip(renamed, description, strict=True):
-                if label == d[0] or d[0] not in json_converters:
-                    continue
-                if d[1] == "json":
-                    json_converters.setdefault(label, json_converters[d[0]])
-                elif (
-                    "dtype" not in self._kwargs
-                    and (value := self._converter.get_dtype(d[1], d[4], d[5])) is not None
-                ):
-                    renamed_dtypes[label] = value
-        dtype = read_csv_kwargs.get("dtype")
-        if isinstance(dtype, defaultdict):
-            dtype = defaultdict(dtype.default_factory, dtype)
-        elif isinstance(dtype, abc.Mapping):
-            dtype = dict(dtype)
-        elif dtype is not None:
-            # One dtype for every column, which a json converter overrode.
-            column_dtype = dtype
-            dtype = defaultdict(lambda: column_dtype)
-        else:
-            dtype = {}
-        dtype.update(renamed_dtypes)
-        if labels is not None:
-            # By position, as pandas gives a column that it renames, such as x.1, the
-            # dtype of the first column with the name, and not its position. pandas
-            # prefers a dtype keyed by name, which a converter used to override.
-            for i, label in enumerate(labels):
-                if label in json_converters:
-                    dtype.pop(label, None)
-                    dtype[i] = object
-        else:
-            dtype.update(dict.fromkeys(json_converters, object))
-        read_csv_kwargs["dtype"] = dtype
+        if self._csv_json_converters:
+            read_csv_kwargs["converters"] = {
+                label: str if isinstance(converter, _JSONConverter) else converter
+                for label, converter in converters.items()
+            }
 
     @staticmethod
     def _returns_csv_reader(read_csv_kwargs: dict[str, Any]) -> bool:

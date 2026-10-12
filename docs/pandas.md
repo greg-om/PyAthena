@@ -564,7 +564,6 @@ Common performance options:
 
 PandasCursor reads a `json` column as text and applies the converter mapping's `json` function to each result or chunk after pandas parses it, so the column's dtype does not depend on `low_memory` or pandas' internal parser blocks.
 A `json` column with NULL in the result or chunk holds objects, with `None` for NULL; otherwise it has the dtype that pandas infers from the converted values.
-The function receives an empty string for every value that pandas reads as missing under the `na_values`, `keep_default_na`, and `na_filter` options.
 Converters passed to `execute()` replace the converter mapping and are applied by pandas.
 
 With `engine="pyarrow"`, PandasCursor uses the PyArrow engine only when the result is not a tab-separated `.txt` file, pyarrow is installed, no chunksize is set (explicitly or by `auto_optimize_chunksize`), `quoting` is the default, the result has no columns that need a converter (`boolean`, `decimal`, `varbinary`, `json`, `time with time zone`, and `timestamp with time zone` with the default converter), and the result file is at least `AthenaPandasResultSet.PYARROW_MIN_FILE_SIZE_BYTES` bytes.
