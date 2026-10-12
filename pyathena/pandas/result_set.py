@@ -220,8 +220,7 @@ class _JSONConverter:
 
         index = df.index
         if name in df.columns:
-            values = self._convert_values(df[name])
-            df[name] = pd.Series(values.to_numpy(), index=index, dtype=values.dtype)
+            df[name] = self._convert_values(df[name], index)
         elif isinstance(index, pd.MultiIndex) and name in index.names:
             levels = [index.get_level_values(i) for i in range(index.nlevels)]
             i = index.names.index(name)
@@ -230,11 +229,12 @@ class _JSONConverter:
         elif index.name == name:
             df.index = pd.Index(self._convert_values(index), name=name)
 
-    def _convert_values(self, values: Series | Index) -> Series:
+    def _convert_values(self, values: Series | Index, index: Index | None = None) -> Series:
         """Convert json text values.
 
         Args:
             values: The text values, with NaN for NULL.
+            index: The index of the returned values, or None for a default index.
 
         Returns:
             The converted values: objects with None if there is NULL, as a NULL would
@@ -246,6 +246,7 @@ class _JSONConverter:
         # as pandas passes NULL to a converter.
         converted = pd.Series(
             [self._converter(v if isinstance(v, str) else "") for v in values.to_numpy()],
+            index=index,
             dtype=object,
         )
         return converted if converted.isna().any() else converted.infer_objects()
@@ -808,12 +809,12 @@ class AthenaPandasResultSet(AthenaResultSet):
         Raises:
             OperationalError: If converting a json column fails.
         """
-        try:
-            for name, converter in self._csv_json_converters.items():
+        for name, converter in self._csv_json_converters.items():
+            try:
                 converter.convert(df, name)
-        except Exception as e:
-            _logger.exception("Failed to convert the json columns.")
-            raise OperationalError(*e.args) from e
+            except Exception as e:
+                _logger.exception(f"Failed to convert the json column {name!r}.")
+                raise OperationalError(*e.args) from e
         return self._trunc_date(df)
 
     def _get_csv_converter(self, type_: str) -> Callable[[str | None], Any] | _JSONConverter:
@@ -915,7 +916,7 @@ class AthenaPandasResultSet(AthenaResultSet):
                 if labels is not None:
                     # After _configure_binary_csv_read(), which checks for the header row.
                     self._read_csv_header_as_labels(read_csv_kwargs, csv_engine)
-                self._read_json_columns_as_text(read_csv_kwargs)
+                self._read_json_columns_as_text(read_csv_kwargs, labels)
                 # A reader that keeps the file open is closed early by callers, and
                 # closing a prefetching file waits for the block being read.
                 prefetch = not self._returns_csv_reader(read_csv_kwargs)
@@ -973,7 +974,9 @@ class AthenaPandasResultSet(AthenaResultSet):
             _logger.exception(f"Failed to read {location}.")
             raise OperationalError(*e.args) from e
 
-    def _read_json_columns_as_text(self, read_csv_kwargs: dict[str, Any]) -> None:
+    def _read_json_columns_as_text(
+        self, read_csv_kwargs: dict[str, Any], labels: list[Any] | None
+    ) -> None:
         """Read the json columns as text, which ``_finish_csv_frame()`` converts.
 
         Moves the ``_JSONConverter`` converters out of the converters for
@@ -981,20 +984,37 @@ class AthenaPandasResultSet(AthenaResultSet):
 
         Args:
             read_csv_kwargs: The options for ``pandas.read_csv()``, updated in place.
+            labels: The labels from ``_get_csv_column_labels()``.
         """
         converters = read_csv_kwargs.get("converters") or {}
-        self._csv_json_converters = {
+        json_converters = {
             label: converter
             for label, converter in converters.items()
             if isinstance(converter, _JSONConverter)
         }
-        if not self._csv_json_converters:
+        self._csv_json_converters = json_converters
+        if not json_converters:
             return
         read_csv_kwargs["converters"] = {
             label: converter
             for label, converter in converters.items()
-            if label not in self._csv_json_converters
+            if label not in json_converters
         }
+        renamed_dtypes = {}
+        if labels is None:
+            # Without labels, the options are keyed by name. pandas renames a repeated
+            # name in the header, such as x.1, and reads the renamed column with the
+            # dtype of the first column with the name, which would be text.
+            seen: dict[Any, int] = {}
+            for d in self.description or []:
+                count = seen[d[0]] = seen.get(d[0], -1) + 1
+                if count == 0 or d[0] not in json_converters:
+                    continue
+                label = f"{d[0]}.{count}"
+                if d[1] == "json":
+                    json_converters.setdefault(label, json_converters[d[0]])
+                elif "dtype" not in self._kwargs:
+                    renamed_dtypes[label] = self._converter.get_dtype(d[1], d[4], d[5])
         dtype = read_csv_kwargs.get("dtype")
         if isinstance(dtype, defaultdict):
             dtype = defaultdict(dtype.default_factory, dtype)
@@ -1006,7 +1026,8 @@ class AthenaPandasResultSet(AthenaResultSet):
             dtype = defaultdict(lambda: column_dtype)
         else:
             dtype = {}
-        dtype.update(dict.fromkeys(self._csv_json_converters, object))
+        dtype.update({label: value for label, value in renamed_dtypes.items() if value is not None})
+        dtype.update(dict.fromkeys(json_converters, object))
         read_csv_kwargs["dtype"] = dtype
 
     @staticmethod

@@ -467,7 +467,11 @@ def _read_unload_result(tmp_path, tables, chunksize, write_statistics=True, **kw
 
 
 def _read_csv_result(data, types, engine="c", chunksize=None, **kwargs):
-    """Read an in-memory CSV through the result set and the real pandas parser."""
+    """Read an in-memory CSV through the result set and the real pandas parser.
+
+    ``types`` maps column names to Athena types, or lists (name, type) pairs for
+    columns with the same name.
+    """
     result_set = AthenaPandasResultSet.__new__(AthenaPandasResultSet)
     result_set._converter = DefaultPandasTypeConverter()
     result_set._keep_default_na = False
@@ -483,7 +487,8 @@ def _read_csv_result(data, types, engine="c", chunksize=None, **kwargs):
     result_set._cache_type = None
     result_set._fs = MagicMock()
     result_set._fs.open.return_value = io.BytesIO(data.encode())
-    description = [(name, type_, None, None, 0, 0, "UNKNOWN") for name, type_ in types.items()]
+    pairs = types.items() if isinstance(types, dict) else types
+    description = [(name, type_, None, None, 0, 0, "UNKNOWN") for name, type_ in pairs]
     with (
         patch.object(
             AthenaPandasResultSet,
@@ -663,14 +668,40 @@ def test_read_csv_keeps_low_memory_default(types, engine, kwargs):
     assert len(df) == 30
 
 
-@pytest.mark.parametrize("kwargs", [{}, {"chunksize": 1}])
-def test_read_csv_json_conversion_error(kwargs):
+@pytest.mark.parametrize(
+    ("types", "expected"),
+    [
+        pytest.param(
+            [("x", "json"), ("x", "json"), ("x", "json")],
+            {"x": [None, 4], "x.1": [3, 5], "x.2": [None, [1]]},
+            id="json",
+        ),
+        pytest.param(
+            [("x", "json"), ("x", "integer"), ("x", "json")],
+            {"x": [None, 4], "x.1": [3, 5], "x.2": [None, [1]]},
+            id="json-and-integer",
+        ),
+    ],
+)
+def test_read_csv_json_columns_with_the_same_name_without_labels(types, expected):
+    """Columns with the same name are converted by type when skiprows keeps the labels unknown."""
+    data = 'x,x,x\n1,2,3\n,3,\n4,5,"[1]"\n'
+    df, _ = _read_csv_result(data, types, skiprows=[1])
+    assert df.to_dict("list") == expected
+    assert df["x.1"].dtype == ("Int64" if types[1][1] == "integer" else "int64")
+
+
+def test_read_csv_json_conversion_error():
     """A json value that the converter cannot convert raises OperationalError."""
     with pytest.raises(OperationalError, match="Expecting property name"):
-        result, _ = _read_csv_result("n,j\n1,{\n", {"n": "integer", "j": "json"}, **kwargs)
-        if not isinstance(result, pd.DataFrame):
-            with result:
-                next(result)
+        _read_csv_result("n,j\n1,{\n", {"n": "integer", "j": "json"})
+
+
+def test_read_csv_json_conversion_error_in_chunk():
+    """A json value in a chunk that the converter cannot convert raises OperationalError."""
+    result, _ = _read_csv_result("n,j\n1,{\n", {"n": "integer", "j": "json"}, chunksize=1)
+    with result, pytest.raises(OperationalError, match="Expecting property name"):
+        next(result)
 
 
 @pytest.mark.parametrize("converters", [{}, {"j": int}])
