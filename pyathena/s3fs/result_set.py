@@ -117,8 +117,7 @@ class AthenaS3FSResultSet(AthenaResultSet):
         pre_fetched_rows = list(self._rows)
         self._rows.clear()
         self._arraysize = arraysize
-        self._block_size_given = bool(block_size)
-        self._block_size = block_size if block_size else self.DEFAULT_BLOCK_SIZE
+        self._block_size = block_size
         self._csv_reader_class: CSVReaderType = csv_reader or AthenaCSVReader
         self._filesystem_class: type[AbstractFileSystem] = filesystem_class or S3FileSystem
         self._fs = self._create_s3_file_system()
@@ -143,7 +142,7 @@ class AthenaS3FSResultSet(AthenaResultSet):
         # released with the result set.
         return self._filesystem_class(
             connection=self.connection,
-            default_block_size=self._block_size,
+            default_block_size=self._block_size or self.DEFAULT_BLOCK_SIZE,
             skip_instance_cache=True,
         )
 
@@ -160,7 +159,7 @@ class AthenaS3FSResultSet(AthenaResultSet):
         Returns:
             The keyword arguments for the filesystem's ``_open()``.
         """
-        if self._block_size_given or not isinstance(self._fs, S3FileSystem):
+        if self._block_size or not isinstance(self._fs, S3FileSystem):
             return {}
         return {
             "block_size": self.CSV_BLOCK_SIZE,
@@ -209,7 +208,10 @@ class AthenaS3FSResultSet(AthenaResultSet):
         except Exception as e:
             _logger.exception(f"Failed to open {path}.")
             if csv_file is not None:
-                csv_file.close()
+                try:
+                    csv_file.close()
+                except Exception:
+                    _logger.exception(f"Failed to close {path}.")
             raise OperationalError(*e.args) from e
 
     @override

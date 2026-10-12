@@ -241,6 +241,9 @@ class TestReadAheadStream:
         assert stream.read(10) == bytes(10)
         with pytest.raises(OSError, match="read failed"):
             stream.read(10)
+        # A later read does not continue past the failed part.
+        with pytest.raises(OSError, match="read failed"):
+            stream.read(10)
         stream.close()
         assert file.closed
 

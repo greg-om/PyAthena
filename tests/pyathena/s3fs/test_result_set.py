@@ -85,10 +85,10 @@ class _FailingCSVReader(_TupleCSVReader):
 
 class TestAthenaS3FSResultSet:
     @pytest.mark.parametrize(
-        ("block_size_given", "filesystem", "expected"),
+        ("block_size", "filesystem", "expected"),
         [
             (
-                False,
+                None,
                 MagicMock(spec=S3FileSystem),
                 {
                     "block_size": 32 * 2**20,
@@ -96,15 +96,15 @@ class TestAthenaS3FSResultSet:
                     "cache_options": {"maxblocks": 2},
                 },
             ),
-            (True, MagicMock(spec=S3FileSystem), {}),
-            (False, MagicMock(), {}),
+            (5 * 2**20, MagicMock(spec=S3FileSystem), {}),
+            (None, MagicMock(), {}),
         ],
         ids=["default", "block_size", "other_filesystem"],
     )
-    def test_get_csv_open_options(self, block_size_given, filesystem, expected):
+    def test_get_csv_open_options(self, block_size, filesystem, expected):
         """PyAthena's filesystem prefetches the CSV result unless block_size is given."""
         result_set = AthenaS3FSResultSet.__new__(AthenaS3FSResultSet)
-        result_set._block_size_given = block_size_given
+        result_set._block_size = block_size
         result_set._fs = filesystem
         assert result_set._get_csv_open_options() == expected
 

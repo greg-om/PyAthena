@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from contextlib import nullcontext
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -249,9 +248,12 @@ class AthenaArrowResultSet(AthenaResultSet):
         """
         import pyarrow as pa
 
-        stream = ReadAheadStream(
-            self._fs.open_input_file(location), self.CSV_READ_PART_SIZE, self.CSV_READ_PARTS
-        )
+        file = self._fs.open_input_file(location)
+        try:
+            stream = ReadAheadStream(file, self.CSV_READ_PART_SIZE, self.CSV_READ_PARTS)
+        except BaseException:
+            file.close()
+            raise
         return pa.PythonFile(stream, mode="r")
 
     def _read_csv(self) -> Table:
@@ -343,11 +345,7 @@ class AthenaArrowResultSet(AthenaResultSet):
             return pa.Table.from_pydict({})
 
         try:
-            with (
-                self._open_csv(location)
-                if data is None
-                else nullcontext(pa.BufferReader(data)) as source
-            ):
+            with self._open_csv(location) if data is None else pa.BufferReader(data) as source:
                 table = csv.read_csv(
                     source,
                     read_options=read_opts,

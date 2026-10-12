@@ -221,7 +221,7 @@ class ReadAheadStream(io.RawIOBase):
     order, and at most ``max_parts`` parts plus the one being consumed are held
     in memory. A read that returns fewer bytes than requested raises
     ``OSError``, and an error from ``read_at()`` is raised by the read that
-    reaches its part.
+    reaches its part; every later read raises the same error.
 
     Closing the stream cancels the queued reads, waits for the running ones,
     and closes the file.
@@ -243,15 +243,16 @@ class ReadAheadStream(io.RawIOBase):
         """
         super().__init__()
         self._file = file
-        self._size: int = file.size()
         self._part_size = part_size
         self._max_parts = max_parts
-        parts = -(-self._size // part_size)
-        self._executor = ThreadPoolExecutor(max_workers=max(1, min(max_parts, parts)))
+        self._executor = ThreadPoolExecutor(max_workers=max_parts)
         self._parts: deque[tuple[int, Future[bytes]]] = deque()
         self._next_offset = 0
         self._position = 0
         self._buffer = memoryview(b"")
+        self._error: BaseException | None = None
+        # Last, so that close() works if it fails.
+        self._size: int = file.size()
 
     @override
     def readable(self) -> bool:
@@ -305,13 +306,20 @@ class ReadAheadStream(io.RawIOBase):
         Raises:
             OSError: If the part has fewer bytes than requested.
         """
+        if self._error is not None:
+            raise self._error
         self._read_ahead()
         if not self._parts:
             return False
         expected, part = self._parts.popleft()
-        data = part.result()
-        if len(data) != expected:
-            raise OSError(f"Read {len(data)} bytes of a range of {expected} bytes.")
+        try:
+            data = part.result()
+            if len(data) != expected:
+                raise OSError(f"Read {len(data)} bytes of a range of {expected} bytes.")
+        except BaseException as e:
+            # The part is gone, so a later read must not continue past it.
+            self._error = e
+            raise
         self._buffer = memoryview(data)
         self._read_ahead()
         return True
