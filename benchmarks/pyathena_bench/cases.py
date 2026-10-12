@@ -14,6 +14,20 @@ from dataclasses import dataclass, replace
 from pyathena_bench.config import Settings
 
 FAMILIES = ("cursor", "dict", "s3fs", "pandas", "arrow", "polars")
+# The cursor families that read result files as DataFrames or tables, also from UNLOAD.
+RESULT_FILE_FAMILIES = ("pandas", "arrow", "polars")
+# pandas.read_sql_query() through a SQLAlchemy engine, by the PyAthena driver it uses.
+# A driver's cursor takes the options of the cursor family of the same name; the rest
+# driver's Cursor takes those of no family in particular.
+SQLALCHEMY_FAMILIES = {
+    "sqla_rest": "rest",
+    "sqla_pandas": "pandas",
+    "sqla_arrow": "arrow",
+    "sqla_polars": "polars",
+    "sqla_s3fs": "s3fs",
+}
+ALL_FAMILIES = (*FAMILIES, "wrangler", *SQLALCHEMY_FAMILIES)
+SHAPES = ("flat", "nested", "json")
 
 
 @dataclass(frozen=True)
@@ -28,45 +42,71 @@ class Case:
     concurrency: int = 1
     suite: str = "single"
     unsupported: str | None = None
+    # The pandas.read_csv()/read_parquet() dtype_backend given to execute().
+    dtype_backend: str | None = None
 
     @property
     def id(self) -> str:
+        backend = f"-{self.dtype_backend}" if self.dtype_backend else ""
         return (
             f"{self.suite}-{self.family}-{self.api}-{self.transport}-{self.output}-"
-            f"a{self.arraysize}-c{self.chunksize or 0}-{self.shape}-n{self.concurrency}"
+            f"a{self.arraysize}-c{self.chunksize or 0}{backend}-{self.shape}-n{self.concurrency}"
         )
 
 
 def matrix(settings: Settings, suite: str, shape: str) -> list[Case]:
-    if suite not in {"single", "concurrent", "init"} or shape not in {"flat", "nested"}:
+    """Return every case of a suite and result shape, including unsupported ones.
+
+    The ``json`` shape adds a ``json`` column to the flat projection and covers
+    the native pandas and Wrangler reads in the single-query suite. Their UNLOAD
+    and CTAS reads are marked unsupported, because Parquet cannot hold the
+    ``json`` type; the initialization suite, which prepares UNLOAD fixtures too,
+    has no json cases.
+
+    Args:
+        settings: Configuration with the arraysizes, chunk sizes, and concurrency.
+        suite: ``single``, ``concurrent``, or ``init``.
+        shape: ``flat``, ``nested``, or ``json``.
+
+    Returns:
+        The cases in a stable order.
+
+    Raises:
+        ValueError: If the suite or shape is unknown.
+    """
+    if suite not in {"single", "concurrent", "init"} or shape not in SHAPES:
         raise ValueError("Unknown suite or shape")
+    if shape == "json" and suite != "single":
+        return []
     cases: list[Case] = []
     arraysizes = settings.arraysizes if suite == "single" else [1000]
     for family in FAMILIES:
         for api in ("sync", "thread", "aio"):
             cases.extend(Case(family, api, arraysize=a, shape=shape) for a in arraysizes)
-            if family in {"pandas", "arrow", "polars"}:
+            if family in RESULT_FILE_FAMILIES:
                 for transport in ("csv", "unload"):
                     chunks: list[int | None] = (
                         [None] if family == "arrow" else [None, *settings.chunksizes]
                     )
-                    for chunk in chunks:
-                        reason = None
-                        if family == "pandas" and transport == "unload" and chunk:
-                            reason = (
-                                "Pandas UNLOAD reads all Parquet; chunksize does not bound memory"
-                            )
-                        cases.append(
-                            Case(
-                                family,
-                                api,
-                                transport,
-                                "native",
-                                chunksize=chunk,
-                                shape=shape,
-                                unsupported=reason,
-                            )
+                    # Single queries also measure pandas UNLOAD reads with pyarrow dtypes.
+                    backends: tuple[str | None, ...] = (
+                        (None, "pyarrow")
+                        if suite == "single" and family == "pandas" and transport == "unload"
+                        else (None,)
+                    )
+                    cases.extend(
+                        Case(
+                            family,
+                            api,
+                            transport,
+                            "native",
+                            chunksize=chunk,
+                            shape=shape,
+                            dtype_backend=backend,
                         )
+                        for chunk in chunks
+                        for backend in backends
+                    )
                 cases.extend(
                     Case(family, api, "unload", arraysize=a, shape=shape) for a in arraysizes
                 )
@@ -87,6 +127,22 @@ def matrix(settings: Settings, suite: str, shape: str) -> list[Case]:
                     unsupported=reason,
                 )
             )
+    if suite == "single":
+        for family, driver in SQLALCHEMY_FAMILIES.items():
+            transports = ["csv", "unload"] if driver in RESULT_FILE_FAMILIES else ["csv"]
+            cases.extend(
+                Case(family, transport=transport, output="native", chunksize=chunk, shape=shape)
+                for transport in transports
+                for chunk in (None, *settings.chunksizes)
+            )
+    if shape == "json":
+        cases = [
+            c
+            if c.transport == "csv"
+            else replace(c, unsupported="Athena cannot write the json type to Parquet")
+            for c in cases
+            if c.family in {"pandas", "wrangler"} and c.output == "native"
+        ]
     if suite == "concurrent":
         # Keep the scaling suite bounded; chunk and arraysize sweeps belong to single.
         cases = [
@@ -98,7 +154,7 @@ def matrix(settings: Settings, suite: str, shape: str) -> list[Case]:
             and c.transport == "csv"
             and (
                 (c.family in {"cursor", "dict", "s3fs"} and c.output == "rows")
-                or (c.family in {"pandas", "arrow", "polars"} and c.output == "native")
+                or (c.family in RESULT_FILE_FAMILIES and c.output == "native")
             )
             for n in settings.concurrency
         ]
@@ -112,7 +168,7 @@ def matrix(settings: Settings, suite: str, shape: str) -> list[Case]:
             and c.family != "wrangler"
             and (
                 (c.family in {"cursor", "dict", "s3fs"} and c.output == "rows")
-                or (c.family in {"pandas", "arrow", "polars"} and c.output == "native")
+                or (c.family in RESULT_FILE_FAMILIES and c.output == "native")
             )
             for api in ("direct", "to_thread")
         ]

@@ -27,8 +27,9 @@ from pyathena_bench.aws import active_queries, client, session
 from pyathena_bench.cases import Case, matrix
 from pyathena_bench.config import Settings
 
-# Row cursors page through GetQueryResults, which has an account-wide request-rate quota.
-API_FAMILIES = {"cursor", "dict"}
+# Row cursors page through GetQueryResults, which has an account-wide request-rate quota;
+# so does read_sql_query() through the REST driver.
+API_FAMILIES = {"cursor", "dict", "sqla_rest"}
 QUEUE_ROOT = "fleet"
 # A host with this file keeps running after its worker exits, for inspection.
 KEEP_HOST = Path("results/keep-host")
@@ -44,6 +45,8 @@ class Filters:
     transport: list[str] | None = None
     output_kind: str | None = None
     arraysize: list[int] | None = None
+    # Chunk sizes to keep, with 0 for reads without chunks.
+    chunksize: list[int] | None = None
 
     def select(self, cases: Iterable[Case]) -> list[Case]:
         """Return the cases that match every configured filter.
@@ -62,6 +65,7 @@ class Filters:
             and (not self.transport or c.transport in self.transport)
             and (not self.output_kind or c.output == self.output_kind)
             and (not self.arraysize or c.arraysize in self.arraysize)
+            and (not self.chunksize or (c.chunksize or 0) in self.chunksize)
         ]
 
 
@@ -127,7 +131,8 @@ def expand_jobs(
     """Split a selection into independent ``run`` invocations.
 
     A job covers one suite, scale, shape, family, API, transport, and output
-    kind, and additionally one arraysize for row output. Jobs that page through
+    kind, and additionally one arraysize for row output. With a chunk size
+    filter, each job runs and names the chunk sizes of its group's cases. Jobs that page through
     GetQueryResults are marked with the number of simultaneous paging queries
     so workers can bound the fleet's request rate. When one trial of such a job
     needs at least ``split_pages`` pages, each measured repetition becomes a
@@ -170,6 +175,12 @@ def expand_jobs(
                     if arraysize is not None:
                         base += f"-a{arraysize}"
                         args += ["--arraysize", str(arraysize)]
+                    if filters.chunksize:
+                        # The job runs its group's chunk sizes, which its ID names in
+                        # order, so equal selections share an ID.
+                        chunks = [str(c) for c in sorted({c.chunksize or 0 for c in cases})]
+                        base += "-c" + "_".join(chunks)
+                        args += ["--chunksize", *chunks]
                     runnable = [c for c in cases if c.unsupported is None]
                     pages = max((api_pages(c, rows) for c in runnable), default=0)
                     api_weight = max(

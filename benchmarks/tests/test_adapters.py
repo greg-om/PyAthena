@@ -27,8 +27,20 @@ from pyathena_bench.adapters import (
     measure_query,
     run_adapter,
 )
-from pyathena_bench.cases import Case, matrix
+from pyathena_bench.cases import (
+    FAMILIES,
+    RESULT_FILE_FAMILIES,
+    SQLALCHEMY_FAMILIES,
+    Case,
+    matrix,
+)
 from pyathena_bench.config import Settings
+
+from pyathena.arrow.cursor import ArrowCursor
+from pyathena.cursor import Cursor as PyAthenaCursor
+from pyathena.pandas.cursor import PandasCursor
+from pyathena.polars.cursor import PolarsCursor
+from pyathena.s3fs.cursor import S3FSCursor
 
 
 class Rows:
@@ -131,7 +143,7 @@ class TestAdapter:
         )
         settings = Settings(executor_workers=3)
         for case in matrix(settings, "single", "flat"):
-            if case.family == "wrangler" or case.unsupported:
+            if case.family not in FAMILIES or case.unsupported:
                 continue
             adapter = Adapter(settings, case, session, "scratch", "s3://out/", "temp")
             with adapter.connection() as connection:
@@ -142,6 +154,131 @@ class TestAdapter:
                 if case.family in {"pandas", "polars"}:
                     assert cursor._s3_max_workers == 3
                 cursor.close()
+
+    def test_sqlalchemy_engines_create_cursors_with_the_case_options(self, monkeypatch):
+        def unexpected_request(*args, **kwargs):
+            pytest.fail("Connecting the engine made an AWS request")
+
+        monkeypatch.setattr(BaseClient, "_make_api_call", unexpected_request)
+        session = boto3.Session(
+            aws_access_key_id="testing", aws_secret_access_key="testing", region_name="us-west-2"
+        )
+        settings = Settings(executor_workers=3, poll_interval=0.5)
+        expected = {
+            "sqla_rest": PyAthenaCursor,
+            "sqla_s3fs": S3FSCursor,
+            "sqla_pandas": PandasCursor,
+            "sqla_arrow": ArrowCursor,
+            "sqla_polars": PolarsCursor,
+        }
+        cases = [c for c in matrix(settings, "single", "flat") if c.family in SQLALCHEMY_FAMILIES]
+        for case in cases:
+            engine = Adapter(settings, case, session, "scratch", "s3://out/", "temp").engine()
+            try:
+                with engine.connect() as connection:
+                    raw = connection.connection.dbapi_connection
+                    assert raw.work_group == settings.workgroup
+                    assert raw.s3_staging_dir == "s3://out/"
+                    assert raw.schema_name == "scratch"
+                    assert raw.poll_interval == 0.5
+                    assert raw.result_reuse_enable is False
+                    cursor = raw.cursor()
+                    assert type(cursor) is expected[case.family]
+                    assert cursor.arraysize == 1000
+                    driver = SQLALCHEMY_FAMILIES[case.family]
+                    if driver in RESULT_FILE_FAMILIES:
+                        assert cursor._unload is (case.transport == "unload")
+                    if driver in {"pandas", "polars"}:
+                        assert cursor._chunksize == case.chunksize
+                        assert cursor._s3_max_workers == 3
+                    cursor.close()
+            finally:
+                engine.dispose()
+
+    async def test_read_sql_query_consumes_frames_and_chunks(self, monkeypatch):
+        calls = []
+
+        def read_sql_query(sql, connection, chunksize=None):
+            calls.append((sql, chunksize))
+            if chunksize is None:
+                return pd.DataFrame({"a": range(5)})
+            return (pd.DataFrame({"a": range(n)}) for n in (2, 2, 1))
+
+        monkeypatch.setattr(pd, "read_sql_query", read_sql_query)
+        for chunksize in (None, 2):
+            adapter = Adapter(
+                Settings(),
+                Case("sqla_pandas", output="native", chunksize=chunksize),
+                None,
+                "scratch",
+                "s3://out/",
+                "temp",
+            )
+            result = await measure_query(adapter, "connection", "SELECT a", 5)
+            assert result["status"] == "ok", result
+            assert result["rows"] == 5
+        assert calls == [("SELECT a", None), ("SELECT a", 2)]
+
+    async def test_read_sql_query_connects_during_setup(self, monkeypatch):
+        events = []
+
+        class Connection:
+            def close(self):
+                events.append("close")
+
+        class Engine:
+            def connect(self):
+                events.append("connect")
+                return Connection()
+
+            def dispose(self):
+                events.append("dispose")
+
+        async def measure(adapter, cursor, sql, expected):
+            assert isinstance(cursor, Connection)
+            events.append("measure")
+            return {"status": "ok", "rows": expected}
+
+        monkeypatch.setattr(Adapter, "engine", lambda self: Engine())
+        monkeypatch.setattr("pyathena_bench.adapters.measure_query", measure)
+        adapter = Adapter(
+            Settings(), Case("sqla_rest", output="native"), None, "scratch", "s3://out/", "temp"
+        )
+        result = await run_adapter(adapter, "SELECT a", 5)
+        assert result["status"] == "ok"
+        assert events == ["connect", "measure", "close", "dispose"]
+
+    async def test_failed_sqlalchemy_connect_disposes_the_engine(self, monkeypatch):
+        events = []
+
+        class Engine:
+            def connect(self):
+                raise OSError("connect failed")
+
+            def dispose(self):
+                events.append("dispose")
+
+        monkeypatch.setattr(Adapter, "engine", lambda self: Engine())
+        adapter = Adapter(
+            Settings(), Case("sqla_rest", output="native"), None, "scratch", "s3://out/", "temp"
+        )
+        with pytest.raises(OSError, match="connect failed"):
+            await run_adapter(adapter, "SELECT a", 5)
+        assert events == ["dispose"]
+
+    def test_pandas_dtype_backend_is_an_execute_option(self):
+        adapter = Adapter(
+            Settings(),
+            Case("pandas", transport="unload", output="native", dtype_backend="pyarrow"),
+            None,
+            "scratch",
+            "s3://out/",
+            "temp",
+        )
+        disabled = {"cache_size": 0, "result_reuse_enable": False}
+        assert adapter.execute_kwargs() == {**disabled, "dtype_backend": "pyarrow"}
+        plain = Adapter(Settings(), Case("pandas"), None, "s", "s3://o/", "t")
+        assert plain.execute_kwargs() == disabled
 
     @pytest.mark.parametrize("api", ["sync", "thread", "aio"])
     async def test_real_api_cursors_consume_stubbed_athena_results(self, api):
