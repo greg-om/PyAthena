@@ -22,6 +22,7 @@ from pyathena.pandas.converter import DefaultPandasTypeConverter
 from pyathena.pandas.result_set import (
     AthenaPandasResultSet,
     PandasDataFrameIterator,
+    _JSONConverter,
     _no_trunc_date,
     _read_csv_with_pyarrow,
 )
@@ -557,7 +558,7 @@ def test_read_csv_json_null_without_dtype_warning(json_value, expected, engine, 
     values = df.index if kwargs.get("index_col") == "j" else df["j"]
     assert options["engine"] == ("python" if engine == "python" else "c")
     assert options.get("low_memory") == kwargs.get("low_memory")
-    assert options["converters"]["j"] is str
+    assert options["converters"]["j"] is _JSONConverter.keep_text
     assert len(df) == 400010
     assert values.dtype == object
     assert type(values[0]) is type(expected)
@@ -698,6 +699,19 @@ def test_read_csv_json_parse_dates(engine, kwargs):
     )
     values = df.index if kwargs else df["j"]
     assert values.tolist() == [pd.Timestamp("2024-01-01")]
+
+
+@pytest.mark.parametrize("engine", ["c", "python"])
+def test_read_csv_single_json_column_with_null(engine):
+    """NULL in a result with only a json column, an empty line, is None."""
+    df, _ = _read_csv_result("j\n1\n\n", {"j": "json"}, engine=engine)
+    assert df["j"].tolist() == [1, None]
+
+
+def test_read_csv_json_name_in_multi_index_columns():
+    """Columns read with a header of several rows are left as pandas reads them."""
+    df, _ = _read_csv_result("j,n\n1,2\n3,4\n", {"j": "json", "n": "integer"}, header=[0, 1])
+    assert df.to_dict("list") == {("j", "1"): [3], ("n", "2"): [4]}
 
 
 def test_read_csv_json_conversion_error():

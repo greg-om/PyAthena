@@ -209,6 +209,19 @@ class _JSONConverter:
         """
         self._converter = converter
 
+    @staticmethod
+    def keep_text(value: str | None) -> str | None:
+        """Return the text of a value, as the converter that ``pandas.read_csv()`` applies.
+
+        Args:
+            value: The text of the value, or None for a field that the python engine
+                adds to a short row.
+
+        Returns:
+            The same value.
+        """
+        return value
+
     def convert(self, df: DataFrame, name: Any) -> None:
         """Convert the json text of a column in a DataFrame that ``read_csv()`` returned.
 
@@ -220,7 +233,10 @@ class _JSONConverter:
 
         index = df.index
         if name in df.columns:
-            df[name] = self._convert_values(df[name], index)
+            values = df[name]
+            if isinstance(values, pd.Series):
+                # Not a partial label of MultiIndex columns.
+                df[name] = self._convert_values(values, index)
         elif isinstance(index, pd.MultiIndex) and name in index.names:
             levels = [index.get_level_values(i) for i in range(index.nlevels)]
             i = index.names.index(name)
@@ -989,7 +1005,7 @@ class AthenaPandasResultSet(AthenaResultSet):
         """Read the json columns as text, which ``_finish_csv_frame()`` converts.
 
         Replaces the ``_JSONConverter`` converters for ``pandas.read_csv()`` with
-        ``str``, which keeps the text of each value.
+        ``_JSONConverter.keep_text()``.
 
         Args:
             read_csv_kwargs: The options for ``pandas.read_csv()``, updated in place.
@@ -1002,7 +1018,9 @@ class AthenaPandasResultSet(AthenaResultSet):
         }
         if self._csv_json_converters:
             read_csv_kwargs["converters"] = {
-                label: str if isinstance(converter, _JSONConverter) else converter
+                label: _JSONConverter.keep_text
+                if isinstance(converter, _JSONConverter)
+                else converter
                 for label, converter in converters.items()
             }
 
