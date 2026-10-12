@@ -1495,7 +1495,8 @@ class AthenaPandasResultSet(AthenaResultSet):
             len(self._data_manifest),
         )
         try:
-            # When a read fails, map() cancels the reads that have not started.
+            # When the failure of a read reaches map()'s iterator, it cancels the reads
+            # that have not started.
             with ThreadPoolExecutor(max_workers=workers) as executor:
                 footers = list(executor.map(self._read_parquet_footer, self._data_manifest))
         except Exception as e:

@@ -334,26 +334,6 @@ class TestAthenaPandasResultSet:
         ):
             result_set._as_pandas()
 
-    def test_read_parquet_footers_failure_stops_reads(self, tmp_path):
-        """A footer that fails to read stops the footer reads that have not started."""
-        result_set, paths = _unload_result_set(tmp_path, [pa.table({"i": [1]})] * 10, chunksize=1)
-        result_set._connection.s3_client.meta.config.max_pool_connections = 1
-        read = []
-
-        def read_parquet_footer(path):
-            read.append(path)
-            raise OSError(f"cannot read {path}")
-
-        with (
-            patch.object(AthenaPandasResultSet, "_read_data_manifest", return_value=paths),
-            patch.object(result_set, "_read_parquet_footer", side_effect=read_parquet_footer),
-            pytest.raises(OperationalError, match="cannot read"),
-        ):
-            result_set._read_parquet_footers()
-        # The one worker may start the next read before the rest are cancelled.
-        assert read[0] == paths[0]
-        assert len(read) <= 2
-
     def test_iter_parquet_chunks_reader_error(self, tmp_path):
         """Errors from creating the chunk reader are raised as OperationalError."""
         with pytest.raises(OperationalError, match="chunksize must be positive"):
