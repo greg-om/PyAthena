@@ -5,7 +5,7 @@
 #
 # SPDX-License-Identifier: MIT
 
-"""Asyncio helpers for retrying AWS API calls."""
+"""Asyncio helpers for retrying AWS API calls and closing resources in a thread."""
 
 from __future__ import annotations
 
@@ -44,3 +44,17 @@ async def async_retry_api_call(
     return await asyncio.to_thread(
         retry_api_call, func, config, logger, *args, stop_on=stop_on, **kwargs
     )
+
+
+async def close_in_thread(close: Callable[[], Any]) -> None:
+    """Run a blocking close in the event loop's default executor.
+
+    The close is submitted at once and awaited through ``asyncio.shield()``, so
+    it runs to completion even if the caller is cancelled before or while it
+    runs. ``asyncio.to_thread()`` would drop a close that is still queued when
+    the caller is cancelled.
+
+    Args:
+        close: The blocking function that closes the resource.
+    """
+    await asyncio.shield(asyncio.get_running_loop().run_in_executor(None, close))

@@ -145,7 +145,7 @@ class AioCursor(WithAsyncFetch):
             Self reference for method chaining.
         """
         self._validate_execute_kwargs(kwargs)
-        self._reset_state()
+        await self._async_reset_state()
         options = ExecuteOptions.resolve(
             options,
             work_group=work_group,
