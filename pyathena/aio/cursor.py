@@ -9,7 +9,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from collections.abc import Callable
 from typing import Any, cast
@@ -146,7 +145,7 @@ class AioCursor(WithAsyncFetch):
             Self reference for method chaining.
         """
         self._validate_execute_kwargs(kwargs)
-        await asyncio.to_thread(self._reset_state)
+        await self._async_reset_state()
         options = ExecuteOptions.resolve(
             options,
             work_group=work_group,

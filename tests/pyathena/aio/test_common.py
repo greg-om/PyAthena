@@ -16,6 +16,7 @@ from pyathena.aio.pandas.cursor import AioPandasCursor
 from pyathena.aio.polars.cursor import AioPolarsCursor
 from pyathena.aio.s3fs.cursor import AioS3FSCursor
 from pyathena.error import OperationalError, ProgrammingError
+from tests.pyathena.util import EVENT_TIMEOUT
 
 _ALL_CURSOR_CLASSES = [
     AioCursor,
@@ -27,37 +28,31 @@ _ALL_CURSOR_CLASSES = [
 ]
 
 
-def _result_set_closing_after(released: threading.Event, closes: list[tuple[int, bool]]):
-    """Return a result set whose ``close()`` waits until ``released`` is set.
+def _result_set_closing_after_loop_responds() -> tuple[MagicMock, list[bool]]:
+    """Return a result set whose ``close()`` waits for a callback on the running loop.
 
-    Each close records its thread and whether ``released`` was set within
-    five seconds. A close on the event loop's thread cannot observe a
-    callback scheduled on that loop, so it times out.
-
-    Args:
-        released: Event that a callback on the event loop sets.
-        closes: List that receives one ``(thread_id, released)`` record per close.
+    Each close schedules a callback on the event loop, waits for it, and records
+    whether it ran. A close on the event loop's thread blocks the loop, so the
+    callback cannot run and the record is False.
 
     Returns:
-        A mock result set that is open until closed.
+        The mock result set, which is open until closed, and the list of records.
     """
+    loop = asyncio.get_running_loop()
+    closes: list[bool] = []
+
+    def close():
+        responded = threading.Event()
+        loop.call_soon_threadsafe(responded.set)
+        closes.append(responded.wait(EVENT_TIMEOUT))
+
     result_set = MagicMock(is_closed=False)
-    result_set.close.side_effect = lambda: closes.append((threading.get_ident(), released.wait(5)))
-    return result_set
+    result_set.close.side_effect = close
+    return result_set, closes
 
 
 class TestWithAsyncFetch:
-    @pytest.mark.parametrize(
-        "cursor_class",
-        [
-            AioCursor,
-            AioDictCursor,
-            AioArrowCursor,
-            AioPandasCursor,
-            AioPolarsCursor,
-            AioS3FSCursor,
-        ],
-    )
+    @pytest.mark.parametrize("cursor_class", _ALL_CURSOR_CLASSES)
     def test_sync_iteration_raises(self, cursor_class):
         cursor = cursor_class(
             connection=MagicMock(), converter=None, formatter=None, retry_config=None
@@ -109,17 +104,7 @@ class TestWithAsyncFetch:
             with pytest.raises(ProgrammingError, match=r"No result set\."):
                 await fetch()
 
-    @pytest.mark.parametrize(
-        "cursor_class",
-        [
-            AioCursor,
-            AioDictCursor,
-            AioArrowCursor,
-            AioPandasCursor,
-            AioPolarsCursor,
-            AioS3FSCursor,
-        ],
-    )
+    @pytest.mark.parametrize("cursor_class", _ALL_CURSOR_CLASSES)
     async def test_async_iteration(self, cursor_class):
         cursor = cursor_class(
             connection=MagicMock(), converter=None, formatter=None, retry_config=None
@@ -139,56 +124,65 @@ class TestWithAsyncFetch:
 
     @pytest.mark.parametrize("cursor_class", _ALL_CURSOR_CLASSES)
     async def test_context_exit_closes_off_event_loop(self, cursor_class):
-        released = threading.Event()
-        closes: list[tuple[int, bool]] = []
+        result_set, closes = _result_set_closing_after_loop_responds()
         async with cursor_class(
             connection=MagicMock(), converter=None, formatter=None, retry_config=None
         ) as cursor:
-            cursor.result_set = _result_set_closing_after(released, closes)
-            asyncio.get_running_loop().call_soon(released.set)
+            cursor.result_set = result_set
 
-        assert len(closes) == 1
-        thread, released_during_close = closes[0]
-        assert thread != threading.get_ident()
-        # The event loop ran the callback while the close waited.
-        assert released_during_close
+        # The event loop ran a callback while the close waited.
+        assert closes == [True]
 
     @pytest.mark.parametrize("cursor_class", _ALL_CURSOR_CLASSES)
     async def test_execute_closes_previous_result_set_off_event_loop(self, cursor_class):
         cursor = cursor_class(
             connection=MagicMock(), converter=None, formatter=None, retry_config=None
         )
-        released = threading.Event()
-        closes: list[tuple[int, bool]] = []
-        cursor.result_set = _result_set_closing_after(released, closes)
+        cursor.result_set, closes = _result_set_closing_after_loop_responds()
         cursor._execute = AsyncMock(side_effect=OperationalError("stop"))
-        asyncio.get_running_loop().call_soon(released.set)
 
         with pytest.raises(OperationalError, match="stop"):
             await cursor.execute("SELECT 1")
 
-        assert len(closes) == 1
-        thread, released_during_close = closes[0]
-        assert thread != threading.get_ident()
-        assert released_during_close
+        assert closes == [True]
         assert cursor.result_set is None
+
+    @pytest.mark.parametrize("cursor_class", _ALL_CURSOR_CLASSES)
+    async def test_execute_cancelled_during_close_leaves_cursor_reset(self, cursor_class):
+        cursor = cursor_class(
+            connection=MagicMock(), converter=None, formatter=None, retry_config=None
+        )
+        closing = threading.Event()
+        released = threading.Event()
+        result_set = MagicMock(is_closed=False)
+        result_set.close.side_effect = lambda: (closing.set(), released.wait(EVENT_TIMEOUT))
+        cursor.result_set = result_set
+        cursor.query_id = "previous"
+        cursor._execute = AsyncMock(side_effect=OperationalError("stop"))
+
+        task = asyncio.create_task(cursor.execute("SELECT 1"))
+        assert await asyncio.to_thread(closing.wait, EVENT_TIMEOUT)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        # The cursor no longer refers to the result set that is still closing.
+        assert cursor.result_set is None
+        assert cursor.query_id is None
+        assert cursor.rowcount == -1
+        released.set()
+        cursor._execute.assert_not_called()
 
     @pytest.mark.parametrize("cursor_class", _ALL_CURSOR_CLASSES)
     async def test_executemany_closes_previous_result_set_off_event_loop(self, cursor_class):
         cursor = cursor_class(
             connection=MagicMock(), converter=None, formatter=None, retry_config=None
         )
-        released = threading.Event()
-        closes: list[tuple[int, bool]] = []
-        cursor.result_set = _result_set_closing_after(released, closes)
-        asyncio.get_running_loop().call_soon(released.set)
+        cursor.result_set, closes = _result_set_closing_after_loop_responds()
 
         await cursor.executemany("SELECT 1", [])
 
-        assert len(closes) == 1
-        thread, released_during_close = closes[0]
-        assert thread != threading.get_ident()
-        assert released_during_close
+        assert closes == [True]
         assert cursor.result_set is None
         assert cursor.rowcount == 0
 
@@ -197,24 +191,19 @@ class TestWithAsyncFetch:
         cursor = cursor_class(
             connection=MagicMock(), converter=None, formatter=None, retry_config=None
         )
-        released = threading.Event()
-        closes: list[tuple[int, bool]] = []
+        result_set, closes = _result_set_closing_after_loop_responds()
+        result_set.rowcount = 1
 
         async def execute(operation, parameters, **kwargs):
-            cursor.result_set = _result_set_closing_after(released, closes)
-            cursor.result_set.rowcount = 1
+            cursor.result_set = result_set
 
         def parameters():
             yield None
-            asyncio.get_running_loop().call_soon(released.set)
             raise ValueError("bad parameters")
 
         cursor.execute = execute
         with pytest.raises(ValueError, match="bad parameters"):
             await cursor.executemany("SELECT 1", parameters())
 
-        assert len(closes) == 1
-        thread, released_during_close = closes[0]
-        assert thread != threading.get_ident()
-        assert released_during_close
+        assert closes == [True]
         assert cursor.result_set is None

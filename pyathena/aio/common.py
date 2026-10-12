@@ -744,7 +744,7 @@ class WithAsyncFetch(WithResultSet, AioBaseCursor, CursorIterator):
                 An empty parameter list makes no ``execute()`` call, so it does
                 not report unsupported keyword names.
         """
-        await asyncio.to_thread(self._reset_state)
+        await self._async_reset_state()
         rowcount = 0
         try:
             for parameters in seq_of_parameters:
@@ -753,11 +753,28 @@ class WithAsyncFetch(WithResultSet, AioBaseCursor, CursorIterator):
                 rowcount = rowcount + count if rowcount >= 0 and count >= 0 else -1
         except BaseException:
             # Keep the query ID available for diagnostics and explicit cancellation.
-            await asyncio.to_thread(self.close)
-            self.result_set = None
+            self._rowcount = -1
+            await self._async_close_result_set()
             raise
-        await asyncio.to_thread(self._reset_state)
+        await self._async_reset_state()
         self._rowcount = rowcount
+
+    async def _async_reset_state(self) -> None:
+        """Reset the execution state, closing the result set in a thread."""
+        self._rowcount = -1
+        self.query_id = None
+        await self._async_close_result_set()
+
+    async def _async_close_result_set(self) -> None:
+        """Detach the result set from the cursor and close it in a thread.
+
+        The cursor drops the result set before the close starts, so a caller
+        cancelled during the close leaves a cursor without it, and the close
+        finishing later cannot affect the next query's result set.
+        """
+        result_set, self.result_set = self.result_set, None
+        if result_set is not None and not result_set.is_closed:
+            await asyncio.to_thread(result_set.close)
 
     async def cancel(self) -> None:
         """Cancel the currently executing query.

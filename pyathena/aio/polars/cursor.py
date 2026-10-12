@@ -161,7 +161,7 @@ class AioPolarsCursor(WithAsyncFetch):
         Returns:
             Self reference for method chaining.
         """
-        await asyncio.to_thread(self._reset_state)
+        await self._async_reset_state()
         options = ExecuteOptions.resolve(
             options,
             work_group=work_group,
