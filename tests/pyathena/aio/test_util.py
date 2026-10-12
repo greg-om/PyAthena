@@ -6,6 +6,7 @@
 # SPDX-License-Identifier: MIT
 import asyncio
 import contextvars
+import gc
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
@@ -63,6 +64,37 @@ async def test_create_in_thread_cancelled_during_construction():
     assert await asyncio.to_thread(created[0].closed.wait, EVENT_TIMEOUT)
     assert created[0].closed_in is not None
     assert created[0].closed_in != threading.get_ident()
+
+
+async def test_create_in_thread_cancelled_construction_error():
+    """A construction that fails after the caller was cancelled reports nothing."""
+    loop = asyncio.get_running_loop()
+    errors = []
+    loop.set_exception_handler(lambda _, context: errors.append(context))
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+
+    def factory():
+        started.set()
+        assert release.wait(EVENT_TIMEOUT)
+        finished.set()
+        raise OSError("read failed")
+
+    task = asyncio.create_task(create_in_thread(factory))
+    assert await asyncio.to_thread(started.wait, EVENT_TIMEOUT)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    release.set()
+    assert await asyncio.to_thread(finished.wait, EVENT_TIMEOUT)
+    # Let the executor future complete and be collected.
+    for _ in range(3):
+        await asyncio.sleep(0)
+    await asyncio.to_thread(lambda: None)
+    gc.collect()
+    await asyncio.sleep(0)
+    assert errors == []
 
 
 async def test_create_in_thread_cancelled_after_construction(monkeypatch):

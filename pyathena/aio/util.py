@@ -114,6 +114,8 @@ async def create_in_thread(
     except asyncio.CancelledError:
         with lock:
             cancelled.set()
+        # Retrieve a later construction error, which nobody else awaits.
+        future.add_done_callback(lambda f: f.cancelled() or f.exception())
         if constructed:
             threading.Thread(target=constructed[0].close, name="create_in_thread-close").start()
         raise
