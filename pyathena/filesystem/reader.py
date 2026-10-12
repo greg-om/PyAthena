@@ -12,7 +12,7 @@ from __future__ import annotations
 import io
 from collections import deque
 from collections.abc import Callable
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from typing import TYPE_CHECKING, Any
 
 from pyathena.util import override
@@ -173,7 +173,8 @@ class ReadAheadStream(io.RawIOBase):
             **kwargs: Additional arguments passed to ``fs.open()``, such as
                 ``version_id`` or ``s3_additional_kwargs``. Unless ``max_workers``
                 is given, the file is opened with ``max_workers=1``, so that each
-                part is read with one GetObject request.
+                part is read with one GetObject request. The file is opened without
+                a cache, whatever ``cache_type`` is given.
 
         Returns:
             The stream over the object.
@@ -188,6 +189,9 @@ class ReadAheadStream(io.RawIOBase):
             # Each part is read with one request, not split into parallel ones on
             # a thread pool of the file.
             kwargs["max_workers"] = 1
+        # The parts bypass the cache of the file, which would only add reads, such
+        # as the whole object that the "all" cache reads when the file is opened.
+        kwargs["cache_type"] = "none"
         file = fs.open(path, "rb", **kwargs)
         try:
             return cls(
@@ -247,7 +251,10 @@ class ReadAheadStream(io.RawIOBase):
         """
         if self.closed:
             return
-        self._executor.shutdown(wait=True, cancel_futures=True)
+        self._executor.shutdown(wait=False, cancel_futures=True)
+        # The running reads are awaited by their futures, not by joining the threads,
+        # which an interrupt can leave marked as finished on Python 3.11.
+        wait([part for _, part in self._parts])
         self._parts.clear()
         self._buffer = memoryview(b"")
         try:

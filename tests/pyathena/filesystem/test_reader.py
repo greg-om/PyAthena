@@ -8,14 +8,14 @@
 import gc
 import threading
 import uuid
-from concurrent.futures import Future
+from concurrent.futures import Future, wait
 from unittest.mock import MagicMock
 
 import pyarrow as pa
 import pyarrow.csv as pa_csv
 import pytest
 
-from pyathena.filesystem.read_ahead import ReadAheadStream
+from pyathena.filesystem.reader import ReadAheadStream
 from pyathena.filesystem.s3 import S3FileSystem
 from tests import ENV
 from tests.pyathena.conftest import connect
@@ -79,20 +79,6 @@ class _InterruptedWaitExecutor(ImmediateExecutor):
         return _InterruptedFuture()
 
 
-class _InterruptedShutdownExecutor(ImmediateExecutor):
-    """An executor that runs each call when it is submitted, whose first shutdown is
-    interrupted."""
-
-    def __init__(self, max_workers=None):
-        super().__init__(max_workers)
-        self.interrupted = False
-
-    def shutdown(self, wait=True, cancel_futures=False):
-        if not self.interrupted:
-            self.interrupted = True
-            raise KeyboardInterrupt
-
-
 class TestReadAheadStream:
     """Tests for reading a file sequentially with parallel range reads."""
 
@@ -133,7 +119,7 @@ class TestReadAheadStream:
         assert closed == [1]
 
     def test_default_part_size(self, monkeypatch):
-        monkeypatch.setattr("pyathena.filesystem.read_ahead.ThreadPoolExecutor", ImmediateExecutor)
+        monkeypatch.setattr("pyathena.filesystem.reader.ThreadPoolExecutor", ImmediateExecutor)
         monkeypatch.setattr(ReadAheadStream, "DEFAULT_PART_SIZE", 10)
         monkeypatch.setattr(ReadAheadStream, "DEFAULT_MAX_PARTS", 2)
         file = _RecordingRandomAccessFile(bytes(100))
@@ -173,7 +159,7 @@ class TestReadAheadStream:
 
     def test_parts_in_flight(self, monkeypatch):
         """At most max_parts parts are requested ahead of the one being consumed."""
-        monkeypatch.setattr("pyathena.filesystem.read_ahead.ThreadPoolExecutor", ImmediateExecutor)
+        monkeypatch.setattr("pyathena.filesystem.reader.ThreadPoolExecutor", ImmediateExecutor)
         file = _RecordingRandomAccessFile(bytes(100))
         stream = ReadAheadStream.from_arrow_file(file, part_size=10, max_parts=3)
         assert file.reads == []
@@ -221,7 +207,7 @@ class TestReadAheadStream:
     def test_interrupted_wait(self, monkeypatch):
         """An interrupt while waiting for a part leaves the part to the next read."""
         monkeypatch.setattr(
-            "pyathena.filesystem.read_ahead.ThreadPoolExecutor", _InterruptedWaitExecutor
+            "pyathena.filesystem.reader.ThreadPoolExecutor", _InterruptedWaitExecutor
         )
         data = bytes(range(30))
         file = _RecordingRandomAccessFile(data)
@@ -234,17 +220,37 @@ class TestReadAheadStream:
         stream.close()
 
     def test_interrupted_close(self, monkeypatch):
-        """An interrupted close leaves the file open until the stream is closed again."""
-        monkeypatch.setattr(
-            "pyathena.filesystem.read_ahead.ThreadPoolExecutor", _InterruptedShutdownExecutor
-        )
-        file = _RecordingRandomAccessFile(bytes(30))
+        """An interrupted close leaves the file open, and closing again waits for the
+        running reads before closing the file."""
+        gate = threading.Event()
+        file = _RecordingRandomAccessFile(bytes(100), gate=gate)
         stream = ReadAheadStream.from_arrow_file(file, part_size=10, max_parts=2)
-        with pytest.raises(KeyboardInterrupt):
-            stream.close()
-        assert not file.closed
-        assert not stream.closed
-        stream.close()
+        interrupts = [KeyboardInterrupt()]
+
+        def interrupted_wait(futures, *args, **kwargs):
+            if interrupts:
+                raise interrupts.pop()
+            return wait(futures, *args, **kwargs)
+
+        monkeypatch.setattr("pyathena.filesystem.reader.wait", interrupted_wait)
+        closer = threading.Thread(target=stream.close)
+        try:
+            assert stream.read(10) == bytes(10)
+            assert file.gated_read_started.wait(EVENT_TIMEOUT)
+            with pytest.raises(KeyboardInterrupt):
+                stream.close()
+            assert not file.closed
+            assert not stream.closed
+            closer.start()
+            closer.join(0.2)
+            # A read of a later part is still blocked, so the retried close has not
+            # closed the file.
+            assert closer.is_alive()
+            assert not file.closed
+        finally:
+            gate.set()
+            if closer.is_alive():
+                closer.join(EVENT_TIMEOUT)
         assert file.closed
         assert stream.closed
 
@@ -287,16 +293,23 @@ class TestReadAheadStream:
 
     @pytest.mark.parametrize(
         ("kwargs", "max_workers"),
-        [({}, 1), ({"max_workers": None}, 1), ({"max_workers": 4}, 4)],
-        ids=["default", "none", "given"],
+        [
+            ({}, 1),
+            ({"max_workers": None}, 1),
+            ({"max_workers": 4}, 4),
+            ({"cache_type": "all"}, 1),
+        ],
+        ids=["default", "none", "given", "cache_type"],
     )
-    def test_from_s3_max_workers(self, kwargs, max_workers):
-        """The object is opened with one worker, which reads each part with one request,
-        unless the number of workers is given."""
+    def test_from_s3_open_options(self, kwargs, max_workers):
+        """The object is opened without a cache and with one worker, which reads each
+        part with one request, unless the number of workers is given."""
         fs = MagicMock()
         fs.open.return_value.size = 0
         ReadAheadStream.from_s3(fs, "s3://bucket/key", part_size=10, **kwargs).close()
-        fs.open.assert_called_once_with("s3://bucket/key", "rb", max_workers=max_workers)
+        fs.open.assert_called_once_with(
+            "s3://bucket/key", "rb", max_workers=max_workers, cache_type="none"
+        )
         fs.open.return_value.close.assert_called_once_with()
 
     @pytest.fixture(scope="class")

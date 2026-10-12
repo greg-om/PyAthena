@@ -14,7 +14,7 @@ from pyathena import OperationalError
 from pyathena.arrow.converter import _to_timestamp
 from pyathena.arrow.util import to_column_info
 from pyathena.converter import Converter, _to_default
-from pyathena.filesystem.read_ahead import ReadAheadStream
+from pyathena.filesystem.reader import ReadAheadStream
 from pyathena.model import AthenaQueryExecution
 from pyathena.result_set import AthenaResultSet
 from pyathena.util import RetryConfig, override, parse_output_location
@@ -234,7 +234,7 @@ class AthenaArrowResultSet(AthenaResultSet):
 
         The file is read in parts with several parts read ahead in parallel
         through the pyarrow S3 filesystem; see
-        :class:`~pyathena.filesystem.read_ahead.ReadAheadStream`.
+        :class:`~pyathena.filesystem.reader.ReadAheadStream`.
 
         Args:
             location: The bucket and key of the file.
