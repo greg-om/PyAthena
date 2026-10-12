@@ -375,6 +375,28 @@ cursor.execute("SELECT * FROM many_rows")
 df = pl.concat(list(cursor.iter_chunks()))
 ```
 
+(polars-s3-read-options)=
+
+### S3 read options
+
+The `block_size` and `cache_type` options set the default block size and {ref}`fsspec cache type <filesystem-read-caching>` of PyAthena's S3 filesystem, such as `"none"`, `"bytes"`, `"readahead"`, `"blockcache"`, or `"background"`.
+They can be given to the cursor, in `cursor_kwargs`, or to `execute()` for one query.
+
+```python
+from pyathena import connect
+from pyathena.polars.cursor import PolarsCursor
+
+cursor = connect(s3_staging_dir="s3://YOUR_S3_BUCKET/path/to/",
+                 region_name="us-west-2",
+                 cursor_class=PolarsCursor).cursor(block_size=16 * 2**20,
+                                                   cache_type="readahead")
+df = cursor.execute("SELECT * FROM many_rows").as_polars()
+```
+
+They apply to the reads through PyAthena's filesystem: CSV results read without the chunksize option, which use `"bytes"` and 5 MiB blocks by default, and the Parquet files of UNLOAD results read with the chunksize option when pyarrow is installed and `execute()` is given no Polars read options.
+Without `cache_type`, a Parquet file of the latter larger than 32 MiB is read with the `"none"` cache, which requests only the ranges that pyarrow reads; a smaller file is read at once.
+With `storage_options` given to `execute()`, the given options replace PyAthena's S3 settings, and `block_size` and `cache_type` do not apply.
+
 (async-polars-cursor)=
 
 ## AsyncPolarsCursor

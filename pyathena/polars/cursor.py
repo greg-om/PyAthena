@@ -100,8 +100,11 @@ class PolarsCursor(WithFetch):
             result_reuse_enable: Enable Athena query result reuse.
             result_reuse_minutes: Minutes to reuse cached results.
             block_size: S3 read block size.
-            cache_type: S3 caching strategy. Without ``cache_type``, PyAthena's filesystem reads a
-                Parquet file of a chunked UNLOAD result that is larger than 32 MiB without a cache.
+            cache_type: The default fsspec cache type of the S3 filesystem that reads the results,
+                such as ``"none"``, ``"bytes"``, ``"readahead"``, ``"blockcache"``, or
+                ``"background"``; see ``S3FileSystem``. Without ``cache_type``, PyAthena's
+                filesystem reads a Parquet file of a chunked UNLOAD result that is larger than
+                32 MiB without a cache.
             s3_max_workers: Maximum worker threads for parallel S3 operations.
             chunksize: Number of rows per chunk for memory-efficient processing.
                       If specified, data is loaded lazily in chunks for all data

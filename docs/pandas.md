@@ -576,6 +576,30 @@ It also changes the values of a column with a string dtype whose values all look
 Apart from PandasCursor's own options such as `engine` and `chunksize`, an option passed here replaces the value PyAthena sets for the same pandas.read_csv() argument.
 For example, `dtype` replaces the whole column type mapping, and `parse_dates` replaces the list of date, time, and timestamp columns.
 
+(pandas-s3-read-options)=
+
+### S3 read options
+
+PandasCursor reads the result files with PyAthena's S3 filesystem.
+The `block_size` and `cache_type` options set the filesystem's default block size and {ref}`fsspec cache type <filesystem-read-caching>`, such as `"none"`, `"bytes"`, `"readahead"`, `"blockcache"`, or `"background"`.
+They can be given to the cursor, in `cursor_kwargs`, or to `execute()` for one query.
+
+```python
+from pyathena import connect
+from pyathena.pandas.cursor import PandasCursor
+
+cursor = connect(s3_staging_dir="s3://YOUR_S3_BUCKET/path/to/",
+                 region_name="us-west-2",
+                 cursor_class=PandasCursor).cursor(block_size=16 * 2**20,
+                                                   cache_type="readahead")
+df = cursor.execute("SELECT * FROM many_rows").as_pandas()
+```
+
+Without `block_size` or `cache_type`, a CSV result file is read in 32 MiB blocks with the `"background"` cache, which reads the next block while pandas parses the current one and keeps two blocks.
+With either option, the file is read with the given values and the filesystem's defaults for the other, `"bytes"` and 5 MiB blocks.
+Without `cache_type`, a Parquet file larger than 32 MiB of an UNLOAD result read in chunks of `chunksize` rows is read with the `"none"` cache, which requests only the ranges that pyarrow reads; a smaller file is read at once.
+With `storage_options` given to `execute()`, the CSV result file is opened through fsspec with those options instead, and `block_size` and `cache_type` do not apply to it.
+
 ### Unload options
 
 PandasCursor also supports the unload option, as does {ref}`arrow-cursor`.

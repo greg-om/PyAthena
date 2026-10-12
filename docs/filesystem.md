@@ -171,6 +171,49 @@ with fs.open("s3://YOUR_S3_BUCKET/path/to/encrypted.csv", "rb", **sse_c) as f:
     data = f.read()
 ```
 
+(filesystem-read-caching)=
+
+## Read caching
+
+A file opened for reading fetches its data through an fsspec cache, chosen by the
+`cache_type` argument of `open` or by the `default_cache_type` argument of
+`S3FileSystem`, and `"bytes"` by default. The value is the name of a cache registered in
+`fsspec.caching.caches`, so the available names depend on the installed fsspec version.
+The common ones are:
+
+- `"none"`: keeps nothing; each read requests the bytes it reads.
+- `"bytes"`: reads one block beyond each read and keeps one contiguous range, which
+  later reads extend.
+- `"readahead"`: reads one block beyond each read and keeps only the last range read,
+  which suits many small sequential reads.
+- `"blockcache"`: requests whole blocks and keeps the most recently used ones, up to
+  `maxblocks` (32 by default).
+- `"background"`: like `"blockcache"`, and also reads the next block in a thread while
+  the current one is consumed.
+
+The block size is the `block_size` argument of `open` or the filesystem's
+`default_block_size` (5 MiB by default). Options of the cache, such as `maxblocks`, are
+given in the `cache_options` argument of `open`. See
+[Read Buffering](https://filesystem-spec.readthedocs.io/en/latest/api.html#read-buffering)
+in the fsspec documentation for the other cache types.
+
+```python
+fs = S3FileSystem(default_cache_type="readahead")
+with fs.open(
+    "s3://YOUR_S3_BUCKET/path/to/data.csv",
+    "rb",
+    block_size=32 * 2**20,
+    cache_type="background",
+    cache_options={"maxblocks": 2},
+) as f:
+    data = f.read()
+```
+
+The `cache_type` option of PandasCursor and PolarsCursor sets the `default_cache_type`
+of the filesystem that reads their results; see {ref}`pandas-s3-read-options` and
+{ref}`polars-s3-read-options`. For the cache that S3FSCursor uses, see
+{ref}`s3fs-s3-read-options`.
+
 ## Error translation
 
 S3 error responses are translated into standard Python exceptions, so filesystem

@@ -185,8 +185,16 @@ class S3FileSystem(AbstractFileSystem):
                 in ``kwargs``.
             default_block_size: The block size for reads and writes; defaults to
                 ``DEFAULT_BLOCK_SIZE``.
-            default_cache_type: The fsspec cache type for reads; defaults to
-                ``"bytes"``.
+            default_cache_type: The fsspec cache type for reads, the name of a
+                cache in ``fsspec.caching.caches``; defaults to ``"bytes"``. The
+                available names depend on the installed fsspec version. Common
+                ones are ``"none"``, which keeps nothing and requests the bytes
+                of each read; ``"bytes"``, which reads one block beyond each
+                read and keeps one contiguous range; ``"readahead"``, which
+                reads one block beyond each read and keeps only the last range
+                read; ``"blockcache"``, which requests whole blocks and keeps
+                the most recently used ones; and ``"background"``, which is like
+                ``"blockcache"`` and also reads the next block in a thread.
             max_workers: The number of threads for parallel transfers.
             s3_additional_kwargs: Extra arguments for the object requests of
                 ``open()`` and ``pipe_file()``; listings and other requests do
@@ -2754,7 +2762,8 @@ class S3File(AbstractBufferedFile):
             block_size: The block size for reads and writes. Must be between
                 ``S3Core.MULTIPART_UPLOAD_MIN_PART_SIZE`` and
                 ``S3Core.MULTIPART_UPLOAD_MAX_PART_SIZE``, inclusive, unless reading.
-            cache_type: The fsspec cache type for reads.
+            cache_type: The fsspec cache type for reads; see
+                ``S3FileSystem.__init__()``.
             autocommit: Whether to commit the written data when the file is
                 closed. If False, :meth:`commit` must be called.
             cache_options: Options for the fsspec cache.

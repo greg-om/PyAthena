@@ -78,9 +78,11 @@ class AioPolarsCursor(WithAsyncFetch):
             result_reuse_enable: Whether to enable Athena query result reuse.
             result_reuse_minutes: Maximum age of a reused query result in minutes.
             block_size: Default block size of the S3 filesystem that reads the results.
-            cache_type: Default cache type of the S3 filesystem that reads the results. Without
-                ``cache_type``, PyAthena's filesystem reads a Parquet file of a chunked UNLOAD
-                result that is larger than 32 MiB without a cache.
+            cache_type: The default fsspec cache type of the S3 filesystem that reads the results,
+                such as ``"none"``, ``"bytes"``, ``"readahead"``, ``"blockcache"``, or
+                ``"background"``; see ``S3FileSystem``. Without ``cache_type``, PyAthena's
+                filesystem reads a Parquet file of a chunked UNLOAD result that is larger than
+                32 MiB without a cache.
             s3_max_workers: Maximum number of workers of the S3 filesystem.
             chunksize: Number of rows per chunk. If set, result files in S3 are read
                 lazily in chunks of this size.
