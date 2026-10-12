@@ -1,14 +1,35 @@
+import threading
 from datetime import datetime
 from decimal import Decimal
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import sqlalchemy
 from sqlalchemy import cast, literal, select, text, types
 from sqlalchemy.sql.schema import Column, MetaData, Table
+from sqlalchemy.util.concurrency import greenlet_spawn
 
+from pyathena.aio.sqlalchemy.base import AsyncAdapt_pyathena_cursor
 from pyathena.sqlalchemy.types import AthenaArray
 from tests import ENV
 from tests.pyathena.util import throttle_metadata_api
+
+
+class TestAsyncAdaptPyathenaCursor:
+    async def test_execute_closes_cursor_off_event_loop_when_fetch_fails(self):
+        cursor = MagicMock()
+        cursor.execute = AsyncMock(return_value=cursor)
+        cursor.description = [("col", "varchar", None, None, None, None, None)]
+        cursor.fetchall = AsyncMock(side_effect=ValueError("conversion failed"))
+        closes = []
+        cursor.close.side_effect = lambda: closes.append(threading.get_ident())
+        adapted = AsyncAdapt_pyathena_cursor(cursor)
+
+        with pytest.raises(ValueError, match="conversion failed"):
+            await greenlet_spawn(adapted.execute, "SELECT 1")
+
+        assert len(closes) == 1
+        assert closes[0] != threading.get_ident()
 
 
 class TestAsyncSQLAlchemyAthena:

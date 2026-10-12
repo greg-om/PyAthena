@@ -6,6 +6,7 @@
 # SPDX-License-Identifier: MIT
 import asyncio
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -172,6 +173,39 @@ class TestWithAsyncFetch:
         assert cursor.rowcount == -1
         released.set()
         cursor._execute.assert_not_called()
+
+    @pytest.mark.parametrize("cursor_class", _ALL_CURSOR_CLASSES)
+    async def test_execute_cancelled_before_close_starts_still_closes(self, cursor_class):
+        loop = asyncio.get_running_loop()
+        # One busy worker keeps the close queued until the caller is cancelled.
+        executor = ThreadPoolExecutor(max_workers=1)
+        loop.set_default_executor(executor)
+        busy = threading.Event()
+        try:
+            blocker = loop.run_in_executor(None, busy.wait, EVENT_TIMEOUT)
+            cursor = cursor_class(
+                connection=MagicMock(), converter=None, formatter=None, retry_config=None
+            )
+            closed = threading.Event()
+            result_set = MagicMock(is_closed=False)
+            result_set.close.side_effect = closed.set
+            cursor.result_set = result_set
+            cursor._execute = AsyncMock(side_effect=OperationalError("stop"))
+
+            task = asyncio.create_task(cursor.execute("SELECT 1"))
+            await asyncio.sleep(0)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            busy.set()
+            await blocker
+
+            # The worker runs the queued close before this wait.
+            assert await loop.run_in_executor(None, closed.wait, EVENT_TIMEOUT)
+            assert cursor.result_set is None
+        finally:
+            busy.set()
+            executor.shutdown(wait=True)
 
     @pytest.mark.parametrize("cursor_class", _ALL_CURSOR_CLASSES)
     async def test_executemany_closes_previous_result_set_off_event_loop(self, cursor_class):

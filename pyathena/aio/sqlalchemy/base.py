@@ -20,6 +20,7 @@ from sqlalchemy.util.concurrency import await_only
 import pyathena
 from pyathena.aio.connection import AioConnection
 from pyathena.aio.cursor import AioCursor
+from pyathena.aio.util import close_in_thread
 from pyathena.cursor import Cursor
 from pyathena.error import (
     DatabaseError,
@@ -85,7 +86,8 @@ class AsyncAdapt_pyathena_cursor:
 
         When the statement produces a result set (the cursor has a
         ``description``), every row is fetched and buffered so that the fetch
-        methods can return rows without awaiting.
+        methods can return rows without awaiting. If fetching fails, the
+        wrapped cursor is closed in a thread before the error propagates.
 
         Args:
             operation: The SQL statement to execute.
@@ -98,7 +100,13 @@ class AsyncAdapt_pyathena_cursor:
         """
         result = await_only(self._cursor.execute(operation, parameters, **kwargs))
         if self._cursor.description:
-            self._rows = deque(await_only(self._cursor.fetchall()))
+            try:
+                self._rows = deque(await_only(self._cursor.fetchall()))
+            except BaseException:
+                # Close the partly read result here, off the event loop: SQLAlchemy
+                # closes the cursor with the synchronous close() after the error.
+                await_only(close_in_thread(self._cursor.close))
+                raise
         else:
             self._rows.clear()
         return result

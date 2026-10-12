@@ -9,7 +9,7 @@ from typing import Any, NoReturn, TypeVar, cast
 
 from botocore.exceptions import BotoCoreError, ClientError
 
-from pyathena.aio.util import async_retry_api_call
+from pyathena.aio.util import async_retry_api_call, close_in_thread
 from pyathena.common import BaseCursor, CursorIterator
 from pyathena.error import DatabaseError, OperationalError, ProgrammingError
 from pyathena.glue import GlueMetadataClient
@@ -774,7 +774,7 @@ class WithAsyncFetch(WithResultSet, AioBaseCursor, CursorIterator):
         """
         result_set, self.result_set = self.result_set, None
         if result_set is not None and not result_set.is_closed:
-            await asyncio.to_thread(result_set.close)
+            await close_in_thread(result_set.close)
 
     async def cancel(self) -> None:
         """Cancel the currently executing query.
@@ -872,4 +872,4 @@ class WithAsyncFetch(WithResultSet, AioBaseCursor, CursorIterator):
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        await asyncio.to_thread(self.close)
+        await close_in_thread(self.close)
