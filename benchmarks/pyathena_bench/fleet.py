@@ -9,7 +9,11 @@
 
 from __future__ import annotations
 
+import contextlib
+import http.client
 import json
+import logging
+import os
 import signal
 import socket
 import subprocess
@@ -40,6 +44,7 @@ KEEP_HOST_TAG = "KeepHost"
 # A file that a worker treats like a Spot interruption notice, to rehearse interruptions.
 SIMULATED_NOTICE = Path("interruption-notice")
 METADATA_URL = "http://169.254.169.254/latest"
+_logger = logging.getLogger(__name__)
 # S3 errors of a conditional write whose condition failed.
 PRECONDITION_ERRORS = {"PreconditionFailed", "ConditionalRequestConflict"}
 
@@ -394,6 +399,7 @@ class Queue:
         Returns:
             The lease, or None if another worker holds it.
         """
+        current = self.read_lease(key)
         at = time.time()
         body = {
             **owner,
@@ -402,11 +408,10 @@ class Queue:
             "renewed": at,
             "expires": at + lease_seconds,
         }
-        lease = self.put_lease(key, body, IfNoneMatch="*")
-        if lease is not None:
-            return lease
-        current = self.read_lease(key)
-        if current is None or not current.takeable(time.time()):
+        if current is None:
+            # Exactly one worker creates the object; another one leaves it.
+            return self.put_lease(key, body, IfNoneMatch="*")
+        if not current.takeable(at):
             return None
         body["attempt"] = current.body.get("attempt", 1) + 1
         return self.put_lease(key, body, IfMatch=current.etag)
@@ -640,7 +645,9 @@ def run_job(
 
     When ``stop`` is set, the orchestrator receives SIGINT, which stops the
     running trial, cancels its reported queries, and records the trial as
-    interrupted; it is killed if it has not exited a minute later.
+    interrupted; it is killed if it has not exited a minute later. The
+    orchestrator runs in its own process group, which is killed when it
+    ends, so no trial process outlives it.
 
     Args:
         job: Job dictionary.
@@ -661,16 +668,22 @@ def run_job(
     if resume:
         command += ["--resume", *map(str, resume)]
     with (workdir / "logs" / f"{job['id']}-{output.name}.log").open("w") as stream:
-        process = subprocess.Popen(command, stdout=stream, stderr=subprocess.STDOUT)
-        while process.poll() is None:
-            if stop.wait(1):
-                process.send_signal(signal.SIGINT)
-                try:
-                    return process.wait(timeout=60)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    return process.wait()
-        return process.returncode
+        process = subprocess.Popen(
+            command, stdout=stream, stderr=subprocess.STDOUT, start_new_session=True
+        )
+        try:
+            while process.poll() is None:
+                if stop.wait(1):
+                    process.send_signal(signal.SIGINT)
+                    try:
+                        return process.wait(timeout=60)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        return process.wait()
+            return process.returncode
+        finally:
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(process.pid, signal.SIGKILL)
 
 
 def trial_evidence(output: Path) -> tuple[set[str], tuple[str, ...]]:
@@ -823,7 +836,7 @@ class JobWatch:
 
     def _watch_notice(self) -> None:
         while not self._stopped.wait(self.poll_seconds):
-            if self.notice():
+            if check_notice(self.notice):
                 self.interrupted.set()
                 self.stop_requested.set()
                 return
@@ -835,27 +848,30 @@ class JobWatch:
     def _renew(self) -> None:
         renew_at = time.monotonic() + self.renew_seconds
         while not self._stopped.wait(self.poll_seconds):
+            # Renewals come first, so that a slow upload does not delay them.
+            if time.monotonic() >= renew_at:
+                renew_at = time.monotonic() + self.renew_seconds
+                self._renew_leases()
             try:
                 with self.upload_lock:
                     self.progress()
             except Exception:
                 # The next poll uploads again.
-                pass
-            if time.monotonic() < renew_at:
-                continue
-            renew_at = time.monotonic() + self.renew_seconds
-            for lease in list(self.leases):
-                try:
-                    if self.queue.renew(lease, self.lease_seconds):
-                        continue
-                except Exception:
-                    if time.time() < lease.body["expires"]:
-                        # The lease has time left for a retry.
-                        continue
-                self.leases.remove(lease)
-                self.lost.append(lease.key)
-                if lease is self.claim:
-                    self.stop_requested.set()
+                _logger.warning("Could not upload the attempt's progress", exc_info=True)
+
+    def _renew_leases(self) -> None:
+        for lease in list(self.leases):
+            try:
+                if self.queue.renew(lease, self.lease_seconds):
+                    continue
+            except Exception:
+                if time.time() < lease.body["expires"]:
+                    # The lease has time left for a retry.
+                    continue
+            self.leases.remove(lease)
+            self.lost.append(lease.key)
+            if lease is self.claim:
+                self.stop_requested.set()
 
 
 def pending_jobs(
@@ -919,7 +935,7 @@ def run_attempt(
     The attempt writes to ``results/<job>/attempt-<n>/``. A takeover (attempt
     2 or later) first downloads the earlier attempts, quiesces their trials,
     and passes them to the runner so that completed trials are not repeated.
-    Changed trial records are uploaded every few seconds. An interruption
+    Trial records are uploaded within seconds of each trial's start and end. An interruption
     notice or a lost claim stops the runner; after a notice, the attempt is
     uploaded and the claim released as interrupted. Otherwise, after a
     conditional renewal confirms that the claim is still held, the job's
@@ -947,14 +963,25 @@ def run_attempt(
     output = job_dir / f"attempt-{attempt}"
     remote = ("results", job["id"], output.name)
     log = workdir / "logs" / f"{job['id']}-{output.name}.log"
-    uploaded: dict[str, int] = {}
+    checked: dict[str, int] = {}
 
     def progress() -> None:
-        for path in sorted(output.glob("*.jsonl")):
-            size = path.stat().st_size
-            if uploaded.get(path.name) != size:
-                queue.s3.upload_file(str(path), queue.bucket, queue.key(*remote, path.name))
-                uploaded[path.name] = size
+        # Upload at trial boundaries: when a trial starts (its output prefix is
+        # needed to quiesce it) and when it is recorded (needed to resume).
+        events, trials = output / "events.jsonl", output / "trials.jsonl"
+        boundary = False
+        if events.exists():
+            with events.open("rb") as stream:
+                stream.seek(checked.get("events", 0))
+                boundary = b'"trial_start"' in stream.read()
+                checked["events"] = stream.tell()
+        if trials.exists() and trials.stat().st_size != checked.get("trials"):
+            checked["trials"] = trials.stat().st_size
+            boundary = True
+        if boundary:
+            for path in (events, trials):
+                if path.exists():
+                    queue.s3.upload_file(str(path), queue.bucket, queue.key(*remote, path.name))
 
     with JobWatch(queue, [claim, *slots], lease_seconds, renew_seconds, progress, notice) as watch:
 
@@ -994,8 +1021,13 @@ def run_attempt(
             # from every recorded trial; both are small within a notice's two minutes.
             upload_attempt(timeout=10)
             if not watch.interrupted.is_set():
-                # The claim was lost; another worker continues the job.
-                return Outcome("lost")
+                # The claim was lost; another worker continues the job. This
+                # attempt's queries are stopped before this worker claims another.
+                try:
+                    errors += settle(output)
+                except Exception as exc:
+                    errors.append(f"Could not quiesce the job: {type(exc).__name__}: {exc}")
+                return Outcome("lost", tuple(errors))
             queue.end_lease(claim, "interrupted")
             return Outcome("interrupted")
         if not errors:
@@ -1122,7 +1154,7 @@ def work(
     # Renewal times of other workers' claims when this worker found nothing to claim.
     waiting: dict[str, float | None] = {}
     while True:
-        if notice():
+        if check_notice(notice):
             raise SpotInterruptionError(completed)
         pending, running = pending_jobs(queue, jobs)
         if pending:
@@ -1180,9 +1212,9 @@ def work(
                     raise SpotInterruptionError(completed)
                 if outcome.state == "done":
                     completed.append(job["id"])
-                    if outcome.errors:
-                        # Unconfirmed queries could overlap later trials on this host.
-                        return completed
+                if outcome.errors:
+                    # Unconfirmed queries could overlap later trials on this host.
+                    return completed
                 started = True
                 break
             finally:
@@ -1216,6 +1248,22 @@ def instance_metadata(path: str, timeout: float = 2.0) -> str:
         return response.read().decode()
 
 
+def check_notice(notice: Callable[[], bool]) -> bool:
+    """Call a notice check, treating an unexpected error as no notice.
+
+    Args:
+        notice: Function that returns whether an interruption notice exists.
+
+    Returns:
+        The result, or False if the check raised.
+    """
+    try:
+        return notice()
+    except Exception:
+        _logger.warning("Could not check for an interruption notice", exc_info=True)
+        return False
+
+
 def interruption_notice(
     metadata: Callable[[str], str] | None = None, simulated: Path = SIMULATED_NOTICE
 ) -> bool:
@@ -1238,7 +1286,7 @@ def interruption_notice(
         return True
     try:
         (metadata or instance_metadata)("spot/instance-action")
-    except (urllib.error.URLError, OSError):
+    except (urllib.error.URLError, OSError, http.client.HTTPException):
         return False
     return True
 

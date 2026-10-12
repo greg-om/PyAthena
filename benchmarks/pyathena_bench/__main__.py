@@ -33,6 +33,7 @@ from pyathena_bench.aws import (
 from pyathena_bench.cases import FAMILIES, matrix
 from pyathena_bench.config import Settings, read_json
 from pyathena_bench.fleet import (
+    SIMULATED_NOTICE,
     Filters,
     Queue,
     SpotInterruptionError,
@@ -125,7 +126,9 @@ def parser() -> argparse.ArgumentParser:
         "Scaling group when no job is left to claim",
     )
     consume.add_argument(
-        "--wait", action="store_true", help="Wait for the queue to be published instead of failing"
+        "--wait",
+        action="store_true",
+        help="Wait for the stack's outputs and for the queue to be published instead of failing",
     )
     consume.add_argument(
         "--lease-seconds",
@@ -233,6 +236,8 @@ def main(argv: list[str] | None = None) -> int:
             if args.lease_seconds < 300:
                 raise ValueError("--lease-seconds must be at least 300")
             autoscaling = client(session_, "autoscaling")
+            # A rehearsed notice applies to one worker; a restarted worker starts clean.
+            SIMULATED_NOTICE.unlink(missing_ok=True)
             if args.terminate_host:
                 suspend_rebalance(autoscaling)
             try:
@@ -246,7 +251,8 @@ def main(argv: list[str] | None = None) -> int:
                     wait=args.wait,
                 )
             except SpotInterruptionError as interrupted:
-                # The host is being reclaimed; its group launches a replacement.
+                # The host is being reclaimed, and its group launches a replacement; after
+                # a rehearsed notice, the operator terminates the host the same way.
                 sys.stdout.write(
                     json.dumps({"ran": interrupted.ran, "interrupted": True}, indent=2) + "\n"
                 )

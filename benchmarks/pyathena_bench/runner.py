@@ -333,13 +333,14 @@ def completed_trials(directories: list[Path]) -> set[tuple[str, str, int | None]
         directories: Output directories of earlier attempts.
 
     Returns:
-        ``(scale, case_id, repetition)`` for successful trials, and
-        ``(scale, case_id, None)`` for cases recorded as unsupported.
+        ``(scale, case_id, repetition)`` for successful measured trials, and
+        ``(scale, case_id, None)`` for cases recorded as unsupported. Warmups
+        are not included: each attempt runs its own before its measured trials.
     """
     completed: set[tuple[str, str, int | None]] = set()
     for directory in directories:
         for trial in read_records(directory / "trials.jsonl"):
-            if trial["status"] == "ok":
+            if trial["status"] == "ok" and not trial.get("warmup"):
                 completed.add((trial["scale"], trial["case_id"], trial["repetition"]))
             elif trial["status"] == "unsupported":
                 completed.add((trial["scale"], trial["case_id"], None))
@@ -363,7 +364,8 @@ def run(
         scales: Scales to run.
         output: New output directory.
         completed: Trials from :func:`completed_trials` to skip, so that a
-            resumed job runs only the missing repetitions.
+            resumed job runs only the missing measured repetitions, after its
+            own warmups; a case without missing repetitions is skipped.
 
     Returns:
         True if every trial succeeded.
@@ -391,8 +393,14 @@ def run(
                     },
                 )
                 continue
+            if all(
+                (scale, case.id, repetition) in completed
+                for repetition in range(settings.repetitions)
+            ):
+                continue
             for repetition in range(-settings.warmups, settings.repetitions):
-                if (scale, case.id, repetition) in completed:
+                # Warmups run again on this host; measured trials are not repeated.
+                if repetition >= 0 and (scale, case.id, repetition) in completed:
                     continue
                 trial = uuid.uuid4().hex
                 payload = {

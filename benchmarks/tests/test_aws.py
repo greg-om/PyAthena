@@ -11,9 +11,11 @@ from types import SimpleNamespace
 import pytest
 from botocore.exceptions import ClientError
 from pyathena_bench.aws import (
+    IncompleteStackError,
     cleanup,
     prepare,
     split_location,
+    stack_resources,
     validate_inputs,
     validate_manifest,
 )
@@ -346,3 +348,34 @@ def test_split_location(location, expected):
 def test_split_location_rejects_invalid_locations(location):
     with pytest.raises(ValueError, match="Invalid S3 location"):
         split_location(location)
+
+
+@pytest.mark.parametrize(
+    ("status", "outputs", "error"),
+    [
+        ("CREATE_IN_PROGRESS", {}, IncompleteStackError),
+        ("CREATE_COMPLETE", {}, ValueError),
+        (
+            "CREATE_COMPLETE",
+            {k: v for k, v in RESOURCES.items() if k not in {"StackId", "Results"}},
+            None,
+        ),
+    ],
+    ids=["creating", "complete_without_outputs", "earlier_template"],
+)
+def test_stack_resources_waits_only_while_in_progress(monkeypatch, status, outputs, error):
+    stack = {
+        "StackId": "arn:stack",
+        "StackStatus": status,
+        "Tags": [{"Key": "Purpose", "Value": "pyathena-benchmark"}],
+        "Outputs": [{"OutputKey": k, "OutputValue": v} for k, v in outputs.items()],
+    }
+    fake = SimpleNamespace(describe_stacks=lambda **kwargs: {"Stacks": [stack]})
+    monkeypatch.setattr("pyathena_bench.aws.client", lambda *args: fake)
+    if error is None:
+        # A stack from a template before the Results output keeps results in the scratch bucket.
+        assert stack_resources(None, "stack")["Results"] == "s3://temporary/"
+        return
+    with pytest.raises(error) as raised:
+        stack_resources(None, "stack")
+    assert (type(raised.value) is IncompleteStackError) is (error is IncompleteStackError)

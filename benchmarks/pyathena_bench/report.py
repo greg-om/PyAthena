@@ -72,6 +72,8 @@ def summarize(trials: list[dict[str, Any]]) -> list[dict[str, Any]]:
             if trial["status"] == "ok":
                 continue
             prefix = "Warmup: " if trial.get("warmup") else ""
+            if trial.get("superseded"):
+                prefix = "Superseded: "
             failures = [q for q in trial.get("queries", []) if q["status"] != "ok"]
             if failures:
                 for query in failures:
@@ -87,7 +89,11 @@ def summarize(trials: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "scale": scale,
                 "case": case_id,
                 "successful_trials": len(good),
-                "failed_trials": sum(t["status"] not in {"ok", "unsupported"} for t in measured),
+                "failed_trials": sum(
+                    t["status"] not in {"ok", "unsupported"} and not t.get("superseded")
+                    for t in measured
+                ),
+                "superseded_failures": sum(bool(t.get("superseded")) for t in measured),
                 "failed_warmups": sum(
                     t.get("warmup", False) and t["status"] != "ok" for t in group
                 ),
@@ -150,9 +156,10 @@ def collect_trials(directory: Path) -> list[dict[str, Any]]:
     A fleet job keeps each attempt in an ``attempt-<n>`` subdirectory; their
     trials are merged.
     A started trial without a final record is reported as incomplete. A failed
-    or incomplete trial is dropped when another attempt recorded the same
-    repetition as successful, so a resumed job reports the trials of an
-    uninterrupted run; so is a second successful record of a repetition.
+    or incomplete trial is marked ``superseded`` when another attempt recorded
+    the same measured repetition as successful, so a resumed job counts the
+    trials of an uninterrupted run while its failures stay visible; a second
+    successful record of a repetition is dropped.
 
     Args:
         directory: Output directory of a run, or a job directory with attempts.
@@ -170,7 +177,9 @@ def collect_trials(directory: Path) -> list[dict[str, Any]]:
         if event["event"] == "trial_start" and event["trial"] not in recorded
     )
     succeeded = {
-        (t["scale"], t["case_id"], t.get("repetition")) for t in trials if t["status"] == "ok"
+        (t["scale"], t["case_id"], t.get("repetition"))
+        for t in trials
+        if t["status"] == "ok" and not t.get("warmup")
     }
     merged = []
     kept: set[tuple[Any, ...]] = set()
@@ -182,8 +191,8 @@ def collect_trials(directory: Path) -> list[dict[str, Any]]:
             if len(sources) > 1 and key in kept:
                 continue
             kept.add(key)
-        elif trial["status"] != "unsupported" and key in succeeded:
-            continue
+        elif trial["status"] != "unsupported" and key in succeeded and not trial.get("warmup"):
+            trial = {**trial, "superseded": True}
         merged.append(trial)
     return merged
 

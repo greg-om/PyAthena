@@ -6,6 +6,7 @@
 # SPDX-License-Identifier: MIT
 
 import csv
+import http.client
 import io
 import json
 import signal
@@ -27,6 +28,7 @@ from pyathena_bench.fleet import (
     Lease,
     Queue,
     SpotInterruptionError,
+    check_notice,
     expand_jobs,
     interruption_notice,
     merge_jobs,
@@ -736,7 +738,9 @@ class TestInterruption:
             notice.set()
             assert stop.wait(5)
             with (out / "trials.jsonl").open("a") as stream:
-                stream.write(json.dumps({**ok_trial(1), "status": "interrupted"}) + "\n")
+                interrupted = {**ok_trial(1), "status": "interrupted"}
+                del interrupted["queries"]
+                stream.write(json.dumps(interrupted) + "\n")
             return 1
 
         with pytest.raises(SpotInterruptionError) as raised:
@@ -797,6 +801,9 @@ class TestInterruption:
         summary = s3.objects[summary_key].decode()
         row = next(csv.DictReader(io.StringIO(summary)))
         assert (row["successful_trials"], row["failed_trials"]) == ("3", "0")
+        # The interrupted trial stays visible.
+        assert row["superseded_failures"] == "1"
+        assert "Superseded: interrupted" in row["notes"]
         assert json.loads(queue.read("done", "heavy"))["attempt"] == 2
 
     def test_a_notice_while_quiescing_an_earlier_attempt_skips_the_run(self, tmp_path):
@@ -854,8 +861,11 @@ class TestInterruption:
 class FakeProcess:
     """A child process that runs until it receives SIGINT."""
 
-    def __init__(self, command, stdout, stderr):
+    pid = 4321
+
+    def __init__(self, command, stdout, stderr, start_new_session):
         self.command = command
+        self.start_new_session = start_new_session
         self.signals = []
 
     def poll(self):
@@ -871,11 +881,15 @@ class FakeProcess:
 def test_run_job_resumes_earlier_attempts_and_interrupts_with_sigint(tmp_path, monkeypatch):
     processes = []
 
-    def popen(command, stdout, stderr):
-        processes.append(FakeProcess(command, stdout, stderr))
+    def popen(command, stdout, stderr, start_new_session):
+        processes.append(FakeProcess(command, stdout, stderr, start_new_session))
         return processes[-1]
 
+    killed = []
     monkeypatch.setattr("pyathena_bench.fleet.subprocess.Popen", popen)
+    monkeypatch.setattr(
+        "pyathena_bench.fleet.os.killpg", lambda pid, signum: killed.append((pid, signum))
+    )
     stop = threading.Event()
     stop.set()
     earlier = tmp_path / "results" / "a" / "attempt-1"
@@ -889,6 +903,9 @@ def test_run_job_resumes_earlier_attempts_and_interrupts_with_sigint(tmp_path, m
     assert code == 130
     [process] = processes
     assert process.signals == [signal.SIGINT]
+    # The orchestrator's own process group, including any trial process, is killed.
+    assert process.start_new_session
+    assert killed == [(4321, signal.SIGKILL)]
     assert process.command[-4:] == ["--suite", "single", "--resume", str(earlier)]
     assert (tmp_path / "logs" / "a-attempt-2.log").exists()
 
@@ -921,6 +938,7 @@ class TestLeaseOwnership:
     def test_a_lost_claim_stops_the_attempt_without_recording_the_job(self, tmp_path, monkeypatch):
         s3, queue = queue_with([job("a")], tmp_path)
         stopped = []
+        settled = []
 
         def sleep(seconds):
             # The new owner renews the claim while this worker waits to exit.
@@ -947,9 +965,11 @@ class TestLeaseOwnership:
             api_slots=1,
             poll_seconds=0,
             runner=runner,
-            settle=no_queries,
+            settle=lambda output: settled.append(output.name) or [],
             renew_seconds=0.01,
         )
+        # The stopped attempt's queries are quiesced before the worker goes on.
+        assert settled == ["attempt-1"]
         assert stopped == [True]
         assert ran == []
         assert not queue.names("done")
@@ -1139,3 +1159,76 @@ def test_a_claim_renewed_once_then_stale_does_not_let_the_worker_exit(tmp_path, 
     )
     assert ran == ["a"]
     assert runs == ["attempt-2"]
+
+
+class TestReviewRepairs:
+    def test_acquire_does_not_write_a_live_lease(self, tmp_path):
+        s3, queue = queue_with([], tmp_path)
+        key = queue.key("claims", "a")
+        queue.acquire(key, {"host": "busy"}, 600)
+        attempts = []
+        original = s3.put_object
+        s3.put_object = lambda **kwargs: attempts.append(kwargs["Key"]) or original(**kwargs)
+        assert queue.acquire(key, {"host": "me"}, 600) is None
+        assert attempts == []
+
+    def test_notice_errors_do_not_stop_the_watch_or_the_worker(self, tmp_path):
+        def incomplete(path):
+            raise http.client.IncompleteRead(b"")
+
+        assert not interruption_notice(incomplete, tmp_path / "notice")
+
+        def broken():
+            raise RuntimeError("unexpected")
+
+        assert not check_notice(broken)
+        _, queue = queue_with([job("a")], tmp_path)
+        assert work(queue, tmp_path / "w", api_slots=1, runner=lambda *a: 0, settle=no_queries,
+                    notice=broken) == ["a"]  # fmt: skip
+
+    def test_progress_uploads_at_trial_boundaries(self, tmp_path):
+        s3, queue = queue_with([job("a")], tmp_path)
+        events_key = queue.key("results", "a", "attempt-1", "events.jsonl")
+        uploads = []
+        original = s3.upload_file
+
+        def recording(filename, bucket, key):
+            uploads.append(key)
+            return original(filename, bucket, key)
+
+        s3.upload_file = recording
+
+        def runner(item, workdir, out, resume, stop):
+            out.mkdir(parents=True)
+            events = out / "events.jsonl"
+            events.write_text(json.dumps({"event": "trial_start", "trial": "t"}) + "\n")
+            deadline = time.monotonic() + 5
+            while events_key not in uploads and time.monotonic() < deadline:
+                time.sleep(0.01)
+            started = uploads.count(events_key)
+            with events.open("a") as stream:
+                for _ in range(20):
+                    stream.write(json.dumps({"event": "query", "query_id": "q"}) + "\n")
+                    stream.flush()
+                    time.sleep(0.01)
+            # Query events between trial boundaries are not uploaded.
+            assert uploads.count(events_key) == started == 1
+            return 0
+
+        assert work(queue, tmp_path / "w", api_slots=1, runner=runner, settle=no_queries,
+                    renew_seconds=0.01) == ["a"]  # fmt: skip
+
+    def test_worker_removes_a_rehearsal_notice_when_it_starts(self, tmp_path, monkeypatch):
+        config = tmp_path / "config.toml"
+        config.write_text("[scales]\nsmall = 10000\n")
+        monkeypatch.chdir(tmp_path)
+        Path("interruption-notice").touch()
+        monkeypatch.setattr(
+            "pyathena_bench.__main__.wait_for_stack", lambda *a: {"Results": "s3://bucket/"}
+        )
+        monkeypatch.setattr("pyathena_bench.__main__.session", lambda settings: None)
+        monkeypatch.setattr("pyathena_bench.__main__.client", lambda *a: FakeS3())
+        monkeypatch.setattr("pyathena_bench.__main__.work", lambda *a, **k: [])
+        argv = ["--config", str(config), "worker", "--stack", "s", "--name", "q"]
+        assert main(argv) == 0
+        assert not Path("interruption-notice").exists()

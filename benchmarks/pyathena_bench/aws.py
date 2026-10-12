@@ -38,7 +38,7 @@ def client(session_: Any, service: str) -> Any:
 
 
 class IncompleteStackError(ValueError):
-    """The stack has no complete outputs yet, for example while it is being created."""
+    """The stack's outputs are incomplete while an operation on it is in progress."""
 
 
 def split_location(location: str) -> tuple[str, str]:
@@ -74,10 +74,13 @@ def stack_resources(session_: Any, stack: str) -> dict[str, str]:
         "SourceTable",
         "WorkGroup",
         "AutoScalingGroup",
-        "Results",
     }
     if not required <= result.keys():
-        raise IncompleteStackError("Stack outputs are incomplete")
+        if data.get("StackStatus", "").endswith("_IN_PROGRESS"):
+            raise IncompleteStackError("Stack outputs are incomplete")
+        raise ValueError("Stack outputs are incomplete")
+    # A stack from a template before the Results output keeps everything in the scratch bucket.
+    result.setdefault("Results", f"s3://{result['Bucket']}/")
     if (
         result["SourceBucket"] == result["Bucket"]
         or result["ScratchDatabase"] == result["SourceDatabase"]

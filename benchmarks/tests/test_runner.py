@@ -169,3 +169,38 @@ def test_resumed_run_skips_finished_trials_and_writes_trial_outputs_to_results(
     )
     assert [p["repetition"] for p in payloads] == [1, 2]
     assert all(p["output"].startswith(f"s3://res/p/runs/{'a' * 32}/trials/") for p in payloads)
+
+
+@pytest.mark.parametrize(
+    ("finished", "expected"), [([0], [-1, 1, 2]), ([0, 1, 2], [])], ids=["missing", "complete"]
+)
+def test_resumed_run_repeats_its_warmups_before_missing_repetitions(
+    monkeypatch, tmp_path, finished, expected
+):
+    monkeypatch.setattr(
+        "pyathena_bench.runner.validate_manifest",
+        lambda *args: {"ScratchDatabase": "scratch", "Bucket": "out", "Results": "s3://out/"},
+    )
+    monkeypatch.setattr("pyathena_bench.runner.validate_inputs", lambda *args: None)
+    monkeypatch.setattr("pyathena_bench.runner.environment", lambda *args: {})
+    payloads = []
+    monkeypatch.setattr(
+        "pyathena_bench.runner.supervise",
+        lambda payload, events, settings: payloads.append(payload) or {"status": "ok"},
+    )
+    case = Case("cursor")
+    earlier = tmp_path / "attempt-1"
+    earlier.mkdir()
+    records = [
+        {"scale": "small", "case_id": case.id, "repetition": -1, "warmup": True, "status": "ok"}
+    ]
+    records += [
+        {"scale": "small", "case_id": case.id, "repetition": r, "status": "ok"} for r in finished
+    ]
+    (earlier / "trials.jsonl").write_text("".join(json.dumps(r) + "\n" for r in records))
+    manifest = {"run_id": "a" * 32, "scales": {"small": {"table": "t", "rows": 10}}, "fixtures": {}}
+    settings = replace(Settings(), warmups=1, repetitions=3)
+    assert run(
+        settings, manifest, [case], ["small"], tmp_path / "attempt-2", completed_trials([earlier])
+    )
+    assert [p["repetition"] for p in payloads] == expected

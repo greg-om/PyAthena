@@ -131,7 +131,7 @@ def test_report_merges_attempts_and_drops_superseded_failures(tmp_path):
     first.mkdir()
     second.mkdir()
     (first / "trials.jsonl").write_text(
-        json.dumps(trial(0)) + "\n" + json.dumps(trial(1, "interrupted")) + "\n"
+        json.dumps(trial(0)) + "\n" + json.dumps({**trial(1, "interrupted"), "queries": []}) + "\n"
     )
     # The interrupted attempt also started a trial that it never recorded.
     start = {"event": "trial_start", "trial": "lost", "case_id": "case", "scale": "small"}
@@ -141,6 +141,9 @@ def test_report_merges_attempts_and_drops_superseded_failures(tmp_path):
     with (tmp_path / "summary.csv").open() as stream:
         row = next(csv.DictReader(stream))
     assert (row["successful_trials"], row["failed_trials"]) == ("3", "0")
+    # The superseded failures stay visible: the interrupted and the unrecorded trial.
+    assert row["superseded_failures"] == "2"
+    assert "Superseded: interrupted" in row["notes"]
 
 
 def test_report_counts_a_repetition_recorded_by_two_attempts_once(tmp_path):
