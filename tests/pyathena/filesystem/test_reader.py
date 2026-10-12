@@ -99,6 +99,13 @@ class TestReadAheadStream:
         stream.close()
         assert file.closed
 
+    def test_read_all(self):
+        data = bytes(range(25))
+        file = _RecordingRangeFile(data)
+        with file.open_stream(part_size=7, max_parts=2) as stream:
+            assert stream.read() == data
+        assert file.closed
+
     def test_default_part_size(self, monkeypatch):
         monkeypatch.setattr("pyathena.filesystem.reader.ThreadPoolExecutor", ImmediateExecutor)
         monkeypatch.setattr(ReadAheadStream, "DEFAULT_PART_SIZE", 10)
@@ -110,16 +117,17 @@ class TestReadAheadStream:
         stream.close()
 
     @pytest.mark.parametrize(
-        ("kwargs", "message"),
+        ("kwargs", "error", "message"),
         [
-            ({"part_size": 0}, "part_size must be positive, got 0."),
-            ({"max_parts": 0}, "max_parts must be positive, got 0."),
+            ({"part_size": 0}, ValueError, "part_size must be positive, got 0."),
+            ({"max_parts": 0}, ValueError, "max_parts must be positive, got 0."),
+            ({"part_size": "7"}, TypeError, "not supported between"),
         ],
     )
     @pytest.mark.filterwarnings("error::pytest.PytestUnraisableExceptionWarning")
-    def test_invalid_options(self, kwargs, message):
+    def test_invalid_options(self, kwargs, error, message):
         closed = []
-        with pytest.raises(ValueError, match=message):
+        with pytest.raises(error, match=message):
             ReadAheadStream(lambda o, s: b"", 10, on_close=lambda: closed.append(1), **kwargs)
         # The stream that failed to initialize is closed without an error when it is
         # finalized, and without calling on_close.

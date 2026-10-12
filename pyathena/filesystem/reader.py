@@ -79,7 +79,7 @@ class ReadAheadStream(io.RawIOBase):
                 raise ValueError(f"part_size must be positive, got {part_size}.")
             if max_parts < 1:
                 raise ValueError(f"max_parts must be positive, got {max_parts}.")
-        except ValueError:
+        except BaseException:
             # Closed as io.RawIOBase, so that finalizing the stream does not call
             # close() of this class, nor on_close.
             super().close()
