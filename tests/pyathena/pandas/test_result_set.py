@@ -663,6 +663,16 @@ def test_read_csv_keeps_low_memory_default(types, engine, kwargs):
     assert len(df) == 30
 
 
+@pytest.mark.parametrize("kwargs", [{}, {"chunksize": 1}])
+def test_read_csv_json_conversion_error(kwargs):
+    """A json value that the converter cannot convert raises OperationalError."""
+    with pytest.raises(OperationalError, match="Expecting property name"):
+        result, _ = _read_csv_result("n,j\n1,{\n", {"n": "integer", "j": "json"}, **kwargs)
+        if not isinstance(result, pd.DataFrame):
+            with result:
+                next(result)
+
+
 @pytest.mark.parametrize("converters", [{}, {"j": int}])
 def test_read_csv_json_custom_converters(converters):
     """Converters given to execute() replace the json conversion."""
