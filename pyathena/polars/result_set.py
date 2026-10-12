@@ -234,7 +234,9 @@ class AthenaPolarsResultSet(AthenaResultSet):
             unload: Whether this is an UNLOAD query result.
             unload_location: S3 location for UNLOAD results.
             block_size: Block size for S3 file reading.
-            cache_type: Cache type for S3 file system.
+            cache_type: Cache type for S3 file system. Without ``cache_type``, PyAthena's filesystem
+                reads a Parquet file of a chunked UNLOAD result that is larger than 32 MiB without a
+                cache.
             max_workers: Maximum number of worker threads.
             chunksize: Number of rows per chunk for memory-efficient processing.
                       If specified, data is loaded lazily in chunks for all data
@@ -807,7 +809,8 @@ class AthenaPolarsResultSet(AthenaResultSet):
         Without read options given to ``execute()``, and with pyarrow installed, the
         files of the data manifest are read one at a time through PyAthena's
         filesystem with ``ParquetChunkReader``, so that memory use depends on the
-        chunk size rather than on the row groups of the files. Otherwise Polars scans
+        chunk size and on the row group being read, not on the size of the result.
+        Otherwise Polars scans
         the unload location with the given options, decoding whole row groups ahead
         of the chunks it returns.
 
@@ -844,6 +847,7 @@ class AthenaPolarsResultSet(AthenaResultSet):
             S3FileSystem(**self._csv_storage_options),
             self._data_manifest,
             cast(int, self._chunksize),
+            cache_type=self._cache_type,
         ) as reader:
             for table in reader:
                 yield cast("pl.DataFrame", pl.from_arrow(table, rechunk=False))
