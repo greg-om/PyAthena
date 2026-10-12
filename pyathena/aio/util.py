@@ -14,7 +14,7 @@ import contextvars
 import logging
 import threading
 from collections.abc import Callable
-from typing import Any, Protocol, TypeVar
+from typing import Any, Protocol, TypeVar, cast
 
 from pyathena.util import RetryConfig, retry_api_call
 
@@ -76,10 +76,12 @@ async def create_in_thread(
 
     Like ``asyncio.to_thread()``, the constructor runs in the event loop's
     default executor with the caller's context. If the caller is cancelled, a
-    construction that has not started is skipped, and an object constructed
-    after the cancellation is closed in the executor: nothing else can close
-    it, and a close by the garbage collector could block the event loop's
-    thread.
+    construction that has not started is skipped, an object constructed after
+    the cancellation is closed by the constructing thread, and an object
+    constructed just before it is closed in a new thread: nothing else can
+    close it, and a close by the garbage collector could block the event
+    loop's thread. The cleanup needs neither the event loop nor its executor,
+    which may be shutting down.
 
     Args:
         factory: The constructor.
@@ -89,26 +91,30 @@ async def create_in_thread(
     Returns:
         The constructed object.
     """
-    loop = asyncio.get_running_loop()
+    lock = threading.Lock()
     cancelled = threading.Event()
+    constructed: list[_ClosableT] = []
 
     def construct() -> _ClosableT | None:
         if cancelled.is_set():
             return None
-        return factory(*args, **kwargs)
+        obj = factory(*args, **kwargs)
+        with lock:
+            if not cancelled.is_set():
+                constructed.append(obj)
+                return obj
+        obj.close()
+        return None
 
-    def close_abandoned(future: asyncio.Future[_ClosableT | None]) -> None:
-        if future.cancelled() or future.exception() is not None:
-            return
-        abandoned = future.result()
-        if abandoned is not None:
-            loop.run_in_executor(None, abandoned.close)
-
-    future = loop.run_in_executor(None, contextvars.copy_context().run, construct)
+    future = asyncio.get_running_loop().run_in_executor(
+        None, contextvars.copy_context().run, construct
+    )
     try:
         result = await asyncio.shield(future)
     except asyncio.CancelledError:
-        cancelled.set()
-        future.add_done_callback(close_abandoned)
+        with lock:
+            cancelled.set()
+        if constructed:
+            threading.Thread(target=constructed[0].close, name="create_in_thread-close").start()
         raise
-    return result  # type: ignore[return-value]
+    return cast(_ClosableT, result)
