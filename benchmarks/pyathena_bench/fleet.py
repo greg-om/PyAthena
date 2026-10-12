@@ -828,30 +828,37 @@ def run_attempt(
                 errors.append(
                     f"Could not quiesce {earlier_output.name}: {type(exc).__name__}: {exc}"
                 )
+        log = workdir / "logs" / f"{job['id']}-{output.name}.log"
+
+        def upload_attempt() -> None:
+            queue.upload_tree(output, *remote)
+            if log.exists():
+                queue.s3.upload_file(str(log), queue.bucket, queue.key("logs", log.name))
+
         code = 1
-        if not errors:
+        if not errors and not watch.interrupted.is_set():
             code = runner(job, workdir, output, resume, watch.interrupted)
-            if watch.interrupted.is_set():
-                watch.stop()
-                queue.upload_tree(output, *remote)
-                queue.renew(claim, 0, state="interrupted")
-                return None
+        if watch.interrupted.is_set():
+            watch.stop()
+            upload_attempt()
+            queue.renew(claim, 0, state="interrupted")
+            return None
+        if not errors:
             try:
                 errors = settle(output) if code else []
             except Exception as exc:
                 errors = [f"Could not quiesce the job: {type(exc).__name__}: {exc}"]
-        queue.upload_tree(output, *remote)
-        log = workdir / "logs" / f"{job['id']}-{output.name}.log"
-        if log.exists():
-            queue.s3.upload_file(str(log), queue.bucket, queue.key("logs", log.name))
+        upload_attempt()
+        report_error = None
         try:
             report(job_dir)
             for name in ("summary.csv", "summary.md"):
                 queue.s3.upload_file(
                     str(job_dir / name), queue.bucket, queue.key("results", job["id"], name)
                 )
-        except (ValueError, OSError):
-            pass  # No trial was recorded; the attempt's log explains why.
+        except Exception as exc:
+            # A job without trials, or with unreadable records, still gets its done marker.
+            report_error = f"{type(exc).__name__}: {exc}"
         queue.s3.put_object(
             Bucket=queue.bucket,
             Key=queue.key("done", job["id"]),
@@ -864,6 +871,7 @@ def run_attempt(
                     "end": now(),
                     "quiesce_errors": errors,
                     "lost_leases": watch.lost,
+                    "report_error": report_error,
                 }
             ).encode(),
         )

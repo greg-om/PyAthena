@@ -98,7 +98,7 @@ Instance size and disk size are parameters, so a later run can deliberately test
 The hosts are Spot Instances of one instance type by default; `Purchase=on-demand` launches On-Demand Instances of that type instead.
 The Auto Scaling group spreads the hosts over `Zones` Availability Zones (4 by default, or 3) with the price-capacity-optimized allocation strategy and never mixes instance types, so every host stays identical.
 The template uses the first `Zones` zones that `Fn::GetAZs` returns, so deployment fails when it returns fewer, which depends on the zones in which the account's default VPC has default subnets; `us-west-2` has four.
-The group replaces an interrupted Spot Instance, and the replacement continues the interrupted job; see [Running on a fleet](#running-on-a-fleet).
+The group replaces an interrupted Spot Instance; with `QueueName` set, the replacement's worker continues the interrupted job, see [Running on a fleet](#running-on-a-fleet).
 `environment.json` does not record the instance type or purchase option; a worker started with `--terminate-host` records both under `hosts/` in its queue, and the recovered `instances.json` lists the hosts that still exist.
 The AMI parameter resolves the current AL2023 image at deployment; record the resulting AMI when comparing environments.
 Source bucket access is read-only and restricted to the configured prefix.

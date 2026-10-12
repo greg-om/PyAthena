@@ -8,6 +8,7 @@
 import csv
 import io
 import json
+import signal
 import threading
 import time
 import urllib.error
@@ -29,6 +30,7 @@ from pyathena_bench.fleet import (
     merge_jobs,
     quiesce,
     retire_host,
+    run_job,
     status,
     submit,
     suspend_rebalance,
@@ -741,6 +743,34 @@ class TestInterruption:
         assert (row["successful_trials"], row["failed_trials"]) == ("3", "0")
         assert json.loads(queue.read("done", "heavy"))["attempt"] == 2
 
+    def test_a_notice_while_quiescing_an_earlier_attempt_skips_the_run(self, tmp_path):
+        s3, queue = queue_with([job("a")], tmp_path)
+        queue.acquire(queue.key("claims", "a"), {"host": "dead"}, -1)
+        s3.put_object(Key=queue.key("results", "a", "attempt-1", "events.jsonl"), Body=b"")
+        notice = threading.Event()
+
+        def settle(output):
+            notice.set()
+            time.sleep(0.2)
+            return []
+
+        def runner(*args):
+            pytest.fail("A job must not start after an interruption notice")
+
+        with pytest.raises(SpotInterruptionError):
+            work(
+                queue,
+                tmp_path / "w",
+                api_slots=1,
+                poll_seconds=0,
+                runner=runner,
+                settle=settle,
+                renew_seconds=0.01,
+                notice=notice.is_set,
+            )
+        lease = queue.read_lease(queue.key("claims", "a"))
+        assert (lease.body["state"], lease.body["attempt"]) == ("interrupted", 2)
+
     def test_a_notice_between_jobs_stops_the_worker_without_claiming(self, tmp_path):
         _, queue = queue_with([job("a")], tmp_path)
         with pytest.raises(SpotInterruptionError):
@@ -763,3 +793,45 @@ class TestInterruption:
         )
         assert ran == ["a"]
         assert all(key.startswith("results/stack/fleet/run1/") for key in s3.objects)
+
+
+class FakeProcess:
+    """A child process that runs until it receives SIGINT."""
+
+    def __init__(self, command, stdout, stderr):
+        self.command = command
+        self.signals = []
+
+    def poll(self):
+        return 130 if self.signals else None
+
+    def send_signal(self, signum):
+        self.signals.append(signum)
+
+    def wait(self, timeout=None):
+        return 130
+
+
+def test_run_job_resumes_earlier_attempts_and_interrupts_with_sigint(tmp_path, monkeypatch):
+    processes = []
+
+    def popen(command, stdout, stderr):
+        processes.append(FakeProcess(command, stdout, stderr))
+        return processes[-1]
+
+    monkeypatch.setattr("pyathena_bench.fleet.subprocess.Popen", popen)
+    stop = threading.Event()
+    stop.set()
+    earlier = tmp_path / "results" / "a" / "attempt-1"
+    code = run_job(
+        {"id": "a", "args": ["--suite", "single"]},
+        tmp_path,
+        tmp_path / "results" / "a" / "attempt-2",
+        [earlier],
+        stop,
+    )
+    assert code == 130
+    [process] = processes
+    assert process.signals == [signal.SIGINT]
+    assert process.command[-4:] == ["--suite", "single", "--resume", str(earlier)]
+    assert (tmp_path / "logs" / "a-attempt-2.log").exists()
