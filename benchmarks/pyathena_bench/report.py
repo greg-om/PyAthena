@@ -122,6 +122,14 @@ def summarize(trials: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "loop_lag_p95_seconds": percentile(lag, 0.95),
                 "loop_lag_max_seconds": max(lag, default=None),
                 "peak_threads": max((t["max_threads"] for t in good), default=None),
+                "max_output_files": max(
+                    (t["output_files"]["count"] for t in good if "output_files" in t),
+                    default=None,
+                ),
+                "max_output_file_bytes": max(
+                    (t["output_files"]["max_bytes"] for t in good if "output_files" in t),
+                    default=None,
+                ),
                 "notes": "; ".join(sorted(reasons)),
             }
         )
@@ -169,11 +177,13 @@ def report(directory: Path) -> None:
         "Total time includes Athena execution and polling; init time excludes validation.",
         "Thread counts include SDK and native library threads, not just executor workers.",
         "Peak temp dir is the per-trial Polars temporary directory, which is outside the RSS.",
+        "Output files: the most Parquet files an UNLOAD or CTAS trial wrote, and the largest.",
         "",
         "| Scale | Case | OK | Fail | Warmup fail | Unsupported | Total (s) | "
         "Client result (s) | Init (s) | Peak RSS (B) | RSS increase (B) | "
-        "Peak temp dir (B) | Notes |",
-        "| --- | --- | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
+        "Peak temp dir (B) | Output files | Largest file (B) | Notes |",
+        "| --- | --- | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: "
+        "| ---: | ---: | --- |",
     ]
     for row in rows:
         values = [
@@ -191,6 +201,8 @@ def report(directory: Path) -> None:
                 "peak_rss_bytes",
                 "median_rss_increase_bytes",
                 "peak_temp_dir_bytes",
+                "max_output_files",
+                "max_output_file_bytes",
                 "notes",
             )
         ]

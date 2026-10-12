@@ -43,12 +43,36 @@ def test_matrix_preserves_unsupported_capabilities():
     wrangler = [c for c in cases if c.family == "wrangler"]
     assert all(c.unsupported for c in wrangler if c.transport == "csv")
     assert all(c.unsupported is None for c in wrangler if c.transport != "csv")
-    assert all(
-        c.unsupported
-        for c in cases
-        if c.family == "pandas" and c.transport == "unload" and c.chunksize
-    )
+    pandas_unload = [c for c in cases if c.family == "pandas" and c.transport == "unload"]
+    # PandasCursor reads UNLOAD results in chunks, with or without dtype_backend.
+    assert all(c.unsupported is None for c in pandas_unload)
+    assert {(c.chunksize, c.dtype_backend) for c in pandas_unload if c.output == "native"} == {
+        (chunk, backend) for chunk in (None, 10000, 100000) for backend in (None, "pyarrow")
+    }
     assert {c.api for c in cases if c.family == "cursor"} == {"sync", "thread", "aio"}
+
+
+def test_sqlalchemy_cases_are_synchronous_single_query_reads():
+    cases = [c for c in matrix(Settings(), "single", "flat") if c.family.startswith("sqla_")]
+    assert {(c.family, c.transport) for c in cases} == {
+        ("sqla_rest", "csv"),
+        ("sqla_s3fs", "csv"),
+        *((f"sqla_{d}", t) for d in ("pandas", "arrow", "polars") for t in ("csv", "unload")),
+    }
+    assert {c.chunksize for c in cases} == {None, 10000, 100000}
+    assert {(c.api, c.output, c.unsupported) for c in cases} == {("sync", "native", None)}
+    for suite in ("concurrent", "init"):
+        assert not [c for c in matrix(Settings(), suite, "flat") if c.family.startswith("sqla_")]
+
+
+def test_json_shape_covers_pandas_and_wrangler_csv_reads():
+    cases = matrix(Settings(), "single", "json")
+    assert {(c.family, c.transport, c.output) for c in cases} == {
+        ("pandas", "csv", "native"),
+        ("wrangler", "csv", "native"),
+    }
+    assert all(c.unsupported is None for c in cases)
+    assert {c.chunksize for c in cases} == {None, 10000, 100000}
 
 
 def test_concurrency_and_init_matrices_are_bounded():
@@ -68,6 +92,10 @@ def test_flat_projection_and_nested_projection_share_the_snapshot():
     assert "file.filename AS filename" in flat
     assert "project, file, details, http" in nested
     assert "LIMIT" not in flat
+    json = select_sql("scratch", "b_run_small", "json")
+    assert json == flat.replace(
+        ' FROM "scratch"', ', CAST(details AS JSON) AS details_json FROM "scratch"'
+    )
 
 
 @pytest.mark.parametrize("family", ["cursor", "dict", "arrow"])

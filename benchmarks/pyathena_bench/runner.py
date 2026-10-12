@@ -32,7 +32,13 @@ from typing import Any
 import psutil
 
 from pyathena_bench.adapters import BACKEND_VERSIONS, Adapter, run_adapter
-from pyathena_bench.aws import cancel_queries, session, validate_inputs, validate_manifest
+from pyathena_bench.aws import (
+    cancel_queries,
+    client,
+    session,
+    validate_inputs,
+    validate_manifest,
+)
 from pyathena_bench.cases import Case
 from pyathena_bench.config import Settings, select_sql, write_json
 
@@ -302,6 +308,36 @@ def supervise(
     return result
 
 
+def output_files(settings: Settings, location: str) -> dict[str, int]:
+    """Summarize the data files that a trial wrote below its output location.
+
+    UNLOAD and CTAS write Parquet files there; query result CSV files, their
+    metadata, and manifests are excluded.
+
+    Args:
+        settings: Configuration with the AWS region and profile.
+        location: The trial's ``s3://`` output prefix.
+
+    Returns:
+        The number of files and their total, largest, and smallest sizes in bytes.
+    """
+    bucket, _, prefix = location.removeprefix("s3://").partition("/")
+    sizes = [
+        item["Size"]
+        for page in client(session(settings), "s3")
+        .get_paginator("list_objects_v2")
+        .paginate(Bucket=bucket, Prefix=prefix)
+        for item in page.get("Contents", [])
+        if not item["Key"].endswith((".csv", ".metadata", ".txt", ".json"))
+    ]
+    return {
+        "count": len(sizes),
+        "bytes": sum(sizes),
+        "max_bytes": max(sizes, default=0),
+        "min_bytes": min(sizes, default=0),
+    }
+
+
 def environment(settings: Settings) -> dict[str, Any]:
     root = Path(__file__).resolve().parents[2]
     git = subprocess.run(
@@ -370,6 +406,16 @@ def run(
                 }
                 append_json(output / "events.jsonl", {"event": "trial_start", **payload})
                 result = supervise(payload, output / "events.jsonl", settings)
+                if (
+                    result["status"] == "ok"
+                    and case.transport in {"unload", "ctas"}
+                    and case.suite != "init"
+                ):
+                    try:
+                        result["output_files"] = output_files(settings, payload["output"])
+                    except Exception as exc:
+                        # The measurement stands; only the file summary is missing.
+                        result["output_files_error"] = f"{type(exc).__name__}: {exc}"
                 append_json(
                     output / "trials.jsonl",
                     {

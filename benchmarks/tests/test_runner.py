@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 from pyathena_bench.cases import Case
 from pyathena_bench.config import Settings
-from pyathena_bench.runner import Observer, run, supervise
+from pyathena_bench.runner import Observer, output_files, run, supervise
 
 
 def successful_worker(pipe, payload):
@@ -132,3 +132,78 @@ class TestRunner:
         assert calls[0]["warmup"]
         result = json.loads((tmp_path / "run/trials.jsonl").read_text())
         assert result["status"] == status
+
+
+class FakeS3Listing:
+    """An S3 client whose paginated listing returns fixed pages."""
+
+    def __init__(self, pages):
+        self.pages = pages
+        self.requests = []
+
+    def get_paginator(self, name):
+        assert name == "list_objects_v2"
+        return self
+
+    def paginate(self, **kwargs):
+        self.requests.append(kwargs)
+        return iter(self.pages)
+
+
+def test_output_files_count_parquet_files_below_the_trial_prefix(monkeypatch):
+    s3 = FakeS3Listing(
+        [
+            {
+                "Contents": [
+                    {"Key": "runs/r/trials/t/q.csv", "Size": 10},
+                    {"Key": "runs/r/trials/t/q.csv.metadata", "Size": 1},
+                    {"Key": "runs/r/trials/t/q-manifest.csv", "Size": 2},
+                    {"Key": "runs/r/trials/t/unload/20261012_0001", "Size": 300},
+                ]
+            },
+            {"Contents": [{"Key": "runs/r/trials/t/unload/20261012_0002", "Size": 100}]},
+            {},
+        ]
+    )
+    monkeypatch.setattr("pyathena_bench.runner.session", lambda settings: None)
+    monkeypatch.setattr("pyathena_bench.runner.client", lambda session_, service: s3)
+    assert output_files(Settings(), "s3://out/runs/r/trials/t/") == {
+        "count": 2,
+        "bytes": 400,
+        "max_bytes": 300,
+        "min_bytes": 100,
+    }
+    assert s3.requests == [{"Bucket": "out", "Prefix": "runs/r/trials/t/"}]
+
+
+@pytest.mark.parametrize(
+    ("case", "listed"),
+    [(Case("pandas", transport="unload", output="native"), True), (Case("pandas"), False)],
+)
+def test_unload_trials_record_their_output_files(monkeypatch, tmp_path, case, listed):
+    monkeypatch.setattr(
+        "pyathena_bench.runner.validate_manifest",
+        lambda *args: {"ScratchDatabase": "scratch", "Bucket": "out"},
+    )
+    monkeypatch.setattr("pyathena_bench.runner.validate_inputs", lambda *args: None)
+    monkeypatch.setattr("pyathena_bench.runner.environment", lambda *args: {})
+    monkeypatch.setattr("pyathena_bench.runner.supervise", lambda *args: {"status": "ok"})
+    locations = []
+
+    def summarize(settings, location):
+        locations.append(location)
+        return {"count": 1, "bytes": 5, "max_bytes": 5, "min_bytes": 5}
+
+    monkeypatch.setattr("pyathena_bench.runner.output_files", summarize)
+    manifest = {
+        "run_id": "a" * 32,
+        "scales": {"small": {"table": "input", "rows": 10}},
+        "fixtures": {},
+    }
+    settings = replace(Settings(), warmups=0, repetitions=1)
+    assert run(settings, manifest, [case], ["small"], tmp_path / "run")
+    trial = json.loads((tmp_path / "run/trials.jsonl").read_text())
+    assert ("output_files" in trial) is listed
+    assert [loc.startswith(f"s3://out/runs/{'a' * 32}/trials/") for loc in locations] == (
+        [True] if listed else []
+    )

@@ -26,9 +26,10 @@ from pyathena_bench.aws import (
     stack_resources,
     validate_manifest,
 )
-from pyathena_bench.cases import FAMILIES, matrix
+from pyathena_bench.cases import FAMILIES, SHAPES, SQLALCHEMY_FAMILIES, matrix
 from pyathena_bench.config import Settings, read_json
 from pyathena_bench.fleet import (
+    API_FAMILIES,
     Filters,
     Queue,
     expand_jobs,
@@ -62,7 +63,7 @@ def parser() -> argparse.ArgumentParser:
         suites = ("single", "concurrent", "init")
         if name == "jobs":
             command.add_argument("--suite", choices=suites, nargs="+", required=True)
-            command.add_argument("--shape", choices=("flat", "nested"), nargs="+", default=["flat"])
+            command.add_argument("--shape", choices=SHAPES, nargs="+", default=["flat"])
             command.add_argument(
                 "--split-pages",
                 type=int,
@@ -71,17 +72,25 @@ def parser() -> argparse.ArgumentParser:
             )
         else:
             command.add_argument("--suite", choices=suites, required=True)
-            command.add_argument("--shape", choices=("flat", "nested"), default="flat")
+            command.add_argument("--shape", choices=SHAPES, default="flat")
         command.add_argument("--warmups", type=int, help="Override the configured warmups")
         command.add_argument("--repetitions", type=int, help="Override the configured repetitions")
         command.add_argument("--scale", nargs="+", required=True)
-        command.add_argument("--family", choices=(*FAMILIES, "wrangler"), nargs="+")
+        command.add_argument(
+            "--family", choices=(*FAMILIES, "wrangler", *SQLALCHEMY_FAMILIES), nargs="+"
+        )
         command.add_argument(
             "--api", choices=("sync", "thread", "aio", "direct", "to_thread"), nargs="+"
         )
         command.add_argument("--transport", choices=("csv", "unload", "ctas"), nargs="+")
         command.add_argument("--output-kind", choices=("rows", "native"))
         command.add_argument("--arraysize", type=int, nargs="+")
+        command.add_argument(
+            "--chunksize",
+            type=int,
+            nargs="+",
+            help="Chunk sizes to keep; 0 selects unchunked reads",
+        )
         if name == "run":
             command.add_argument("--manifest", type=Path, required=True)
             command.add_argument("--out", type=Path, required=True)
@@ -187,7 +196,9 @@ def main(argv: list[str] | None = None) -> int:
         else:
             sys.stdout.write(json.dumps(status(queue), indent=2) + "\n")
     elif args.command == "jobs":
-        filters = Filters(args.family, args.api, args.transport, args.output_kind, args.arraysize)
+        filters = Filters(
+            args.family, args.api, args.transport, args.output_kind, args.arraysize, args.chunksize
+        )
         overrides = {
             k: v for k in ("warmups", "repetitions") if (v := getattr(args, k)) is not None
         }
@@ -209,17 +220,15 @@ def main(argv: list[str] | None = None) -> int:
         }
         if overrides:
             settings = replace(settings, **overrides)
-        filters = Filters(args.family, args.api, args.transport, args.output_kind, args.arraysize)
+        filters = Filters(
+            args.family, args.api, args.transport, args.output_kind, args.arraysize, args.chunksize
+        )
         cases = filters.select(matrix(settings, args.suite, args.shape))
         if not cases:
             raise ValueError("No cases match the selected filters")
         if args.command == "plan":
             page_size = min(
-                (
-                    c.arraysize
-                    for c in cases
-                    if c.family in {"cursor", "dict"} and c.suite != "init"
-                ),
+                (c.arraysize for c in cases if c.family in API_FAMILIES and c.suite != "init"),
                 default=0,
             )
             sys.stdout.write(

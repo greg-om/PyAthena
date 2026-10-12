@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import pytest
 from botocore.exceptions import ClientError
 from pyathena_bench.__main__ import main
+from pyathena_bench.cases import Case
 from pyathena_bench.config import Settings
 from pyathena_bench.fleet import (
     Filters,
@@ -192,6 +193,50 @@ class TestExpandJobsArraysize:
             settings, ["concurrent"], ["small"], ["flat"], Filters(family=["cursor"], api=["aio"])
         )
         assert [(j["api_heavy"], j["api_weight"]) for j in jobs] == [(True, 10)]
+
+
+class TestExpandJobsSelection:
+    def test_chunksize_filter_is_passed_to_the_job_and_named_in_its_id(self):
+        selection = Filters(
+            family=["pandas"], api=["sync"], transport=["csv"], output_kind="native"
+        )
+        jobs = [
+            job
+            for chunks in ([0], [100000])
+            for job in expand_jobs(
+                SETTINGS,
+                ["single"],
+                ["small"],
+                ["flat"],
+                replace(selection, chunksize=chunks),
+            )
+        ]
+        assert [j["id"] for j in jobs] == [
+            "single-small-flat-pandas-sync-csv-native-c0",
+            "single-small-flat-pandas-sync-csv-native-c100000",
+        ]
+        assert [j["args"][-2:] for j in jobs] == [["--chunksize", "0"], ["--chunksize", "100000"]]
+        assert merge_jobs([jobs[:1], jobs[1:]]) == jobs
+        cases = [Case("pandas", output="native", chunksize=c) for c in (None, 10000, 100000)]
+        assert [c.chunksize for c in replace(selection, chunksize=[0]).select(cases)] == [None]
+        assert [c.chunksize for c in replace(selection, chunksize=[100000]).select(cases)] == [
+            100000
+        ]
+
+    def test_read_sql_query_through_the_rest_driver_pages_through_the_api(self):
+        jobs = expand_jobs(
+            SETTINGS,
+            ["single"],
+            ["small"],
+            ["flat"],
+            Filters(family=["sqla_rest", "sqla_pandas"], chunksize=[0]),
+        )
+        heavy = {j["id"]: (j["api_heavy"], j["api_weight"]) for j in jobs}
+        assert heavy == {
+            "single-small-flat-sqla_rest-sync-csv-native-c0": (True, 1),
+            "single-small-flat-sqla_pandas-sync-csv-native-c0": (False, 0),
+            "single-small-flat-sqla_pandas-sync-unload-native-c0": (False, 0),
+        }
 
 
 class TestQueue:

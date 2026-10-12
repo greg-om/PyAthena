@@ -109,3 +109,24 @@ class TestReport:
         assert "Client result (s)" in markdown
         assert "Init (s)" in markdown
         assert "RSS increase (B)" in markdown
+
+    def test_report_shows_the_most_output_files_and_the_largest_file(self, tmp_path):
+        base = {
+            "case_id": "case",
+            "scale": "small",
+            "status": "ok",
+            "queries": [{"total_seconds": 1}],
+            "successful_queries_per_second": 1,
+            "rss_peak_bytes": 1,
+            "max_threads": 1,
+        }
+        trials = [
+            {**base, "output_files": {"count": 30, "bytes": 60, "max_bytes": 4, "min_bytes": 1}},
+            {**base, "output_files": {"count": 31, "bytes": 60, "max_bytes": 3, "min_bytes": 1}},
+        ]
+        (tmp_path / "trials.jsonl").write_text("".join(json.dumps(t) + "\n" for t in trials))
+        report(tmp_path)
+        row = summarize(trials)[0]
+        assert (row["max_output_files"], row["max_output_file_bytes"]) == (31, 4)
+        assert "| 31 | 4 |" in (tmp_path / "summary.md").read_text()
+        assert summarize([base])[0]["max_output_files"] is None
