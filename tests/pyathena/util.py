@@ -7,7 +7,7 @@
 
 import io
 import time
-from concurrent.futures import wait
+from concurrent.futures import Future, wait
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -233,6 +233,33 @@ def wait_for_spark_session_state(client, session_id, state, timeout=120):
 
 # Seconds a test waits for an event from a helper thread before failing.
 EVENT_TIMEOUT = 10
+
+
+class ImmediateExecutor:
+    """An executor that runs each call when it is submitted."""
+
+    def __init__(self, max_workers=None):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        pass
+
+    def shutdown(self, wait=True, cancel_futures=False):
+        pass
+
+    def submit(self, fn, *args, **kwargs):
+        future = self._new_future()
+        try:
+            future.set_result(fn(*args, **kwargs))
+        except Exception as e:
+            future.set_exception(e)
+        return future
+
+    def _new_future(self):
+        return Future()
 
 
 def interrupt_start_waits(started, release, interrupts=1):

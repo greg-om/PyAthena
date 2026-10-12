@@ -31,6 +31,12 @@ Async S3 FileSystem
 .. autoclass:: pyathena.filesystem.s3_async.AioS3File
    :members:
 
+Read-ahead Stream
+-----------------
+
+.. autoclass:: pyathena.filesystem.reader.ReadAheadStream
+   :members:
+
 S3 Executor
 -----------
 

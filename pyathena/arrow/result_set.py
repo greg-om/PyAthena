@@ -12,9 +12,9 @@ from typing import (
 
 from pyathena import OperationalError
 from pyathena.arrow.converter import _to_timestamp
-from pyathena.arrow.reader import ReadAheadStream
 from pyathena.arrow.util import to_column_info
 from pyathena.converter import Converter, _to_default
+from pyathena.filesystem.reader import ReadAheadStream
 from pyathena.model import AthenaQueryExecution
 from pyathena.result_set import AthenaResultSet
 from pyathena.util import RetryConfig, override, parse_output_location
@@ -65,10 +65,6 @@ class AthenaArrowResultSet(AthenaResultSet):
     """
 
     DEFAULT_BLOCK_SIZE = 1024 * 1024 * 128
-    #: Bytes requested by one range read of a CSV result file; see _open_csv().
-    CSV_READ_PART_SIZE: ClassVar[int] = 8 * 2**20
-    #: The most range reads of a CSV result file in flight at once.
-    CSV_READ_PARTS: ClassVar[int] = 16
 
     _timestamp_parsers: ClassVar[list[str]] = [
         "%Y-%m-%d",
@@ -236,9 +232,9 @@ class AthenaArrowResultSet(AthenaResultSet):
     def _open_csv(self, location: str) -> Any:
         """Open the CSV result file for ``pyarrow.csv.read_csv()``.
 
-        The file is read in parts of ``CSV_READ_PART_SIZE`` bytes, with up to
-        ``CSV_READ_PARTS`` parts read ahead in parallel through the pyarrow S3
-        filesystem; see :class:`~pyathena.arrow.reader.ReadAheadStream`.
+        The file is read in parts with several parts read ahead in parallel
+        through the pyarrow S3 filesystem; see
+        :class:`~pyathena.filesystem.reader.ReadAheadStream`.
 
         Args:
             location: The bucket and key of the file.
@@ -250,7 +246,9 @@ class AthenaArrowResultSet(AthenaResultSet):
 
         file = self._fs.open_input_file(location)
         try:
-            stream = ReadAheadStream(file, self.CSV_READ_PART_SIZE, self.CSV_READ_PARTS)
+            stream = ReadAheadStream(
+                lambda offset, size: file.read_at(size, offset), file.size(), on_close=file.close
+            )
         except BaseException:
             file.close()
             raise
