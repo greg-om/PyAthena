@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from functools import partial
 from typing import Any
 
 from botocore.config import Config
@@ -18,30 +19,10 @@ from botocore.config import Config
 from pyathena import connect
 from pyathena.filesystem.s3 import S3FileSystem
 from pyathena.filesystem.s3_async import AioS3FileSystem
-from pyathena.filesystem.s3_core import S3Core
-from pyathena.filesystem.s3_path import S3Path
+from pyathena.util import parse_output_location
 from pyathena_bench.adapters import heartbeat
 from pyathena_bench.cases import Case
 from pyathena_bench.config import Settings
-
-
-def unsupported_reason(case: Case, size: int) -> str | None:
-    """Return why a filesystem case does not run for an object size.
-
-    A copy of an object up to ``S3Core.MULTIPART_UPLOAD_MAX_PART_SIZE`` is a
-    single CopyObject request, which neither ``max_workers`` nor the
-    connection pool affects.
-
-    Args:
-        case: Filesystem case.
-        size: Size of the object in bytes.
-
-    Returns:
-        The reason, or None if the case runs.
-    """
-    if case.transport == "copy" and size <= S3Core.MULTIPART_UPLOAD_MAX_PART_SIZE:
-        return "Objects up to 5 GiB are copied with a single CopyObject request"
-    return None
 
 
 def read_object(fs: Any, path: str, block_size: int) -> int:
@@ -59,27 +40,28 @@ def read_object(fs: Any, path: str, block_size: int) -> int:
         return len(stream.read())
 
 
-def write_object(fs: Any, path: str, size: int, block: memoryview) -> int:
-    """Write an object of zero bytes as a multipart upload with parts of the block's size.
+def write_object(fs: Any, path: str, size: int, block_size: int) -> int:
+    """Write an object of zero bytes as a multipart upload with parts of ``block_size``.
 
     Args:
         fs: The filesystem.
         path: Object to write.
         size: Size of the object in bytes.
-        block: Zero bytes written repeatedly, whose size is the block size.
+        block_size: Size of each part, and of the zero bytes written at a time.
 
     Returns:
         The number of bytes written.
     """
-    with fs.open(path, "wb", block_size=len(block)) as stream:
+    block = memoryview(bytes(block_size))
+    with fs.open(path, "wb", block_size=block_size) as stream:
         remaining = size
         while remaining:
-            remaining -= stream.write(block[: min(remaining, len(block))])
+            remaining -= stream.write(block[: min(remaining, block_size)])
     return size
 
 
 async def transfer(
-    fs: Any, case: Case, source: str, destination: str, size: int, block: memoryview
+    fs: Any, case: Case, source: str, destination: str, size: int, block_size: int
 ) -> int:
     """Run the case's operation in the way its API is used.
 
@@ -91,34 +73,31 @@ async def transfer(
 
     Args:
         fs: ``S3FileSystem`` for the ``sync`` API, ``AioS3FileSystem`` for ``aio``.
-        case: Filesystem case; the transport is the operation.
+        case: Filesystem case; the transport is the operation, ``read``,
+            ``write``, or ``copy``.
         source: Object to read or copy.
         destination: Object to write or copy to.
         size: Size of the object in bytes.
-        block: Zero bytes of the block size.
+        block_size: Size of each range request, part, or copied part.
 
     Returns:
         The number of bytes read, written, or copied.
-
-    Raises:
-        ValueError: If the operation is unknown.
     """
     if case.transport == "copy":
-        options = {"max_workers": case.max_workers, "block_size": len(block)}
+        options = {"max_workers": case.max_workers, "block_size": block_size}
         if case.api == "aio":
             await fs._cp_file(source, destination, **options)
         else:
             fs.cp_file(source, destination, **options)
         return size
-    if case.transport == "read":
-        if case.api == "aio":
-            return await asyncio.to_thread(read_object, fs, source, len(block))
-        return read_object(fs, source, len(block))
-    if case.transport == "write":
-        if case.api == "aio":
-            return await asyncio.to_thread(write_object, fs, destination, size, block)
-        return write_object(fs, destination, size, block)
-    raise ValueError(f"Unknown filesystem operation: {case.transport}")
+    operation = (
+        partial(read_object, fs, source, block_size)
+        if case.transport == "read"
+        else partial(write_object, fs, destination, size, block_size)
+    )
+    if case.api == "aio":
+        return await asyncio.to_thread(operation)
+    return operation()
 
 
 async def run_filesystem(
@@ -160,7 +139,6 @@ async def run_filesystem(
     fs = filesystem_class(
         connection=connection, max_workers=case.max_workers, skip_instance_cache=True
     )
-    block = memoryview(bytes(settings.filesystem_block_size))
     samples: list[float] = []
     stop = asyncio.Event()
     monitor = asyncio.create_task(heartbeat(settings.heartbeat_interval, stop, samples))
@@ -170,16 +148,18 @@ async def run_filesystem(
         await asyncio.sleep(0)
         start = time.perf_counter()
         try:
-            transferred = await transfer(fs, case, source, destination, size, block)
+            transferred = await transfer(
+                fs, case, source, destination, size, settings.filesystem_block_size
+            )
             elapsed = time.perf_counter() - start
             # Checked after the measurement: the written or copied object is complete.
             if case.transport != "read":
-                written = S3Path.parse(destination)
-                transferred = connection.s3_client.head_object(
-                    Bucket=written.bucket, Key=written.key
-                )["ContentLength"]
+                bucket, key = parse_output_location(destination)
+                transferred = connection.s3_client.head_object(Bucket=bucket, Key=key)[
+                    "ContentLength"
+                ]
                 # Removed, so that the trials do not accumulate copies of the object.
-                connection.s3_client.delete_object(Bucket=written.bucket, Key=written.key)
+                connection.s3_client.delete_object(Bucket=bucket, Key=key)
         except Exception as exc:
             query = {
                 "status": "error",

@@ -209,7 +209,7 @@ It validates the full row count after construction, outside `init_seconds`.
 The filesystem suite transfers one S3 object through PyAthena's `S3FileSystem` (API `sync`) and `AioS3FileSystem` (API `aio`) and does not query Athena.
 Its operations, selected with `--transport`, are:
 
-- `read`: one `read()` of the whole object from a file opened with `block_size`, which reads it as parallel range requests of that size;
+- `read`: one `read()` of the whole object from a file opened with `block_size`, which reads it as parallel range requests of that size and holds the parts and the joined object, about twice the object's size, in memory;
 - `write`: writes through a file opened with `block_size`, which uploads the object as a multipart upload with parts of that size;
 - `copy`: `cp_file()`, or `_cp_file()` of `AioS3FileSystem`, which copies an object over 5 GiB as a multipart copy with parts of `block_size`; the copies of smaller objects, single CopyObject requests, are recorded as unsupported.
 

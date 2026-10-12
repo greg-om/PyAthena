@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 
+from pyathena.filesystem.s3_core import S3Core
 from pyathena_bench.config import Settings
 
 FAMILIES = ("cursor", "dict", "s3fs", "pandas", "arrow", "polars")
@@ -66,6 +67,28 @@ class Case:
             f"{self.suite}-{self.family}-{self.api}-{self.transport}-{self.output}-"
             f"a{self.arraysize}-c{self.chunksize or 0}{backend}-{self.shape}-n{self.concurrency}"
         )
+
+    def unsupported_reason(self, settings: Settings, scale: str) -> str | None:
+        """Return why the case does not run at a scale.
+
+        A copy of an object up to ``S3Core.MULTIPART_UPLOAD_MAX_PART_SIZE`` is
+        a single CopyObject request, which neither ``max_workers`` nor the
+        connection pool affects.
+
+        Args:
+            settings: Configuration with the filesystem suite's object sizes.
+            scale: Scale of the suite.
+
+        Returns:
+            The reason, or None if the case runs.
+        """
+        if (
+            self.suite == "filesystem"
+            and self.transport == "copy"
+            and settings.filesystem_sizes[scale] <= S3Core.MULTIPART_UPLOAD_MAX_PART_SIZE
+        ):
+            return "Objects up to 5 GiB are copied with a single CopyObject request"
+        return self.unsupported
 
 
 def matrix(settings: Settings, suite: str, shape: str) -> list[Case]:

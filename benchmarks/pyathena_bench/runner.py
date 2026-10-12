@@ -47,7 +47,7 @@ from pyathena_bench.aws import (
 )
 from pyathena_bench.cases import Case
 from pyathena_bench.config import Settings, select_sql, write_json
-from pyathena_bench.filesystem import run_filesystem, unsupported_reason
+from pyathena_bench.filesystem import run_filesystem
 from pyathena_bench.report import CHECKPOINT, read_trials, trial_key
 
 _logger = logging.getLogger(__name__)
@@ -480,12 +480,9 @@ def run(
     success = True
     s3 = client(session(settings), "s3")
     locations = run_locations(resources, manifest["run_id"])
-    results_root = locations["results"]
     for scale in scales:
         for case in cases:
-            unsupported = case.unsupported
-            if case.suite == "filesystem":
-                unsupported = unsupported_reason(case, manifest["objects"][scale]["size"])
+            unsupported = case.unsupported_reason(settings, scale)
             if unsupported:
                 if (scale, case.id, None) in completed:
                     continue
@@ -529,7 +526,7 @@ def run(
                 else:
                     payload.update(
                         database=resources["ScratchDatabase"],
-                        output=f"{results_root}trials/{trial}/",
+                        output=f"{locations['results']}trials/{trial}/",
                         temp_table=f"b_{manifest['run_id']}_{trial}",
                         sql=select_sql(
                             resources["ScratchDatabase"],

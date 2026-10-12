@@ -175,12 +175,11 @@ def expand_jobs(
     jobs: list[dict[str, Any]] = []
     for suite in suites:
         for scale in scales:
+            rows = settings.suite_scales(suite)[scale]
             if suite == "filesystem":
                 # Weighed as rows that take about as long as transferring the bytes:
                 # 100,000 rows and 1 GB each take seconds.
-                rows = settings.filesystem_sizes[scale] // 10_000
-            else:
-                rows = settings.scales[scale]
+                rows //= 10_000
             for shape in shapes:
                 groups: dict[tuple[Any, ...], list[Case]] = {}
                 for case in filters.select(matrix(settings, suite, shape)):
@@ -203,7 +202,7 @@ def expand_jobs(
                         chunks = [str(c) for c in sorted({c.chunksize or 0 for c in cases})]
                         base += "-c" + "_".join(chunks)
                         args += ["--chunksize", *chunks]
-                    runnable = [c for c in cases if c.unsupported is None]
+                    runnable = [c for c in cases if c.unsupported_reason(settings, scale) is None]
                     pages = max((api_pages(c, rows) for c in runnable), default=0)
                     api_weight = max(
                         (c.concurrency for c in runnable if api_pages(c, rows)), default=0

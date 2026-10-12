@@ -22,6 +22,7 @@ import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
 
+from pyathena.util import parse_output_location
 from pyathena_bench.config import Settings, identifier, select_sql, write_json
 
 
@@ -272,9 +273,9 @@ def validate_manifest(settings: Settings, manifest: dict[str, Any]) -> dict[str,
     for scale, item in manifest["scales"].items():
         if item["table"] != prefix + identifier(scale):
             raise ValueError("Table is outside the manifest namespace")
-    objects = f"s3://{actual['Bucket']}/runs/{manifest['run_id']}/objects/{{}}-"
+    objects = run_locations(actual, manifest["run_id"])["scratch"] + "objects/"
     for scale, item in manifest.get("objects", {}).items():
-        if not item["location"].startswith(objects.format(identifier(scale))):
+        if not item["location"].startswith(f"{objects}{identifier(scale)}-"):
             raise ValueError("Object is outside the manifest namespace")
     return actual
 
@@ -359,16 +360,18 @@ def prepare_objects(
     if manifest.get("cleaned"):
         raise ValueError("The manifest's resources were cleaned")
     objects = manifest.setdefault("objects", {})
+    root = run_locations(resources, manifest["run_id"])["scratch"]
     s3 = client(session(settings), "s3")
     for scale in scales:
         if scale in objects:
             continue
         size = settings.filesystem_sizes[scale]
-        key = f"runs/{manifest['run_id']}/objects/{identifier(scale)}-{uuid.uuid4().hex}"
-        s3.upload_fileobj(ZeroReader(size), resources["Bucket"], key)
-        if s3.head_object(Bucket=resources["Bucket"], Key=key)["ContentLength"] != size:
+        location = f"{root}objects/{identifier(scale)}-{uuid.uuid4().hex}"
+        bucket, key = parse_output_location(location)
+        s3.upload_fileobj(ZeroReader(size), bucket, key)
+        if s3.head_object(Bucket=bucket, Key=key)["ContentLength"] != size:
             raise ValueError(f"Uploaded object for {scale} has an unexpected size")
-        objects[scale] = {"location": f"s3://{resources['Bucket']}/{key}", "size": size}
+        objects[scale] = {"location": location, "size": size}
         write_json(path, manifest)
 
 

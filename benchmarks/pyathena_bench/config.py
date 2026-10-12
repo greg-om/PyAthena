@@ -111,11 +111,11 @@ class Settings:
             if not values or any(type(v) is not int or v < 1 for v in values):
                 raise ValueError(f"Invalid {name}")
 
-    def suite_scales(self, suite: str) -> dict[str, int]:
+    def suite_scales(self, suite: str | None) -> dict[str, int]:
         """Return the scales of a suite by name.
 
         Args:
-            suite: Suite name.
+            suite: Suite name, or None for the snapshots that ``prepare`` creates.
 
         Returns:
             The object sizes in bytes of the ``filesystem`` suite, and the row

@@ -200,11 +200,15 @@ class TestExpandJobsFilesystem:
         jobs = expand_jobs(settings, ["filesystem"], ["large"], ["flat", "nested"], Filters())
         assert len(jobs) == 6
         assert not any(j["api_heavy"] for j in jobs)
-        job = next(j for j in jobs if j["id"] == "filesystem-large-flat-s3-aio-copy-bytes")
+        job = next(j for j in jobs if j["id"] == "filesystem-large-flat-s3-aio-read-bytes")
         assert job["args"][:4] == ["--suite", "filesystem", "--scale", "large"]
-        assert job["args"][-4:] == ["--transport", "copy", "--output-kind", "bytes"]
+        assert job["args"][-4:] == ["--transport", "read", "--output-kind", "bytes"]
         cases = len(settings.filesystem_max_workers) * len(settings.filesystem_pool_connections)
-        assert job["weight"] == 2**30 // 10_000 * cases * (settings.warmups + settings.repetitions)
+        trials = settings.warmups + settings.repetitions
+        assert job["weight"] == 2**30 // 10_000 * cases * trials
+        # A 1 GiB copy is a single CopyObject, so the copy job only records unsupported cases.
+        copy = next(j for j in jobs if j["id"] == "filesystem-large-flat-s3-aio-copy-bytes")
+        assert copy["weight"] == 2**30 // 10_000 * trials
 
 
 class TestExpandJobsArraysize:
@@ -521,7 +525,7 @@ class TestCommandLine:
         argv = ["--config", str(config), "prepare", "--stack", "s", "--manifest", "m.json"]
         assert main([*argv, "--filesystem-scale", "large"]) == 0
         assert calls == [("prepare", []), ("objects", ["large"])]
-        with pytest.raises(ValueError, match="filesystem scales"):
+        with pytest.raises(ValueError, match="Select distinct scales"):
             main([*argv, "--filesystem-scale", "small"])
 
 

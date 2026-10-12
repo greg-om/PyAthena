@@ -194,23 +194,23 @@ def main(argv: list[str] | None = None) -> int:
         settings = replace(settings, profile=args.profile)
     scales = getattr(args, "scale", [])
     suite = getattr(args, "suite", None)
-    # prepare has no suite; it creates the snapshots of the row scales.
-    suites = suite if isinstance(suite, list) else [suite or "single"]
-    if len(set(scales)) != len(scales) or any(
-        s not in settings.suite_scales(name) for name in suites for s in scales
+    # prepare has no suite: --scale names snapshots, --filesystem-scale objects.
+    selections = [
+        (scales, settings.suite_scales(name))
+        for name in (suite if isinstance(suite, list) else [suite])
+    ]
+    selections.append((getattr(args, "filesystem_scale", []), settings.filesystem_sizes))
+    if any(
+        len(set(names)) != len(names) or any(n not in defined for n in names)
+        for names, defined in selections
     ):
         raise ValueError("Select distinct scales defined in the configuration")
     if args.command == "preflight":
         sys.stdout.write(json.dumps(preflight(settings, args.stack), indent=2) + "\n")
     elif args.command == "prepare":
-        objects = args.filesystem_scale
-        if len(set(objects)) != len(objects) or any(
-            s not in settings.filesystem_sizes for s in objects
-        ):
-            raise ValueError("Select distinct filesystem scales defined in the configuration")
         manifest = prepare(settings, args.stack, args.manifest, scales)
-        if objects:
-            prepare_objects(settings, manifest, args.manifest, objects)
+        if args.filesystem_scale:
+            prepare_objects(settings, manifest, args.manifest, args.filesystem_scale)
     elif args.command == "cleanup":
         manifest = read_json(args.manifest)
         resources = validate_manifest(settings, manifest)
@@ -308,8 +308,9 @@ def main(argv: list[str] | None = None) -> int:
                 json.dumps(
                     {
                         "scales": {s: settings.suite_scales(args.suite)[s] for s in scales},
-                        "trials": sum(c.unsupported is None for c in cases)
-                        * len(scales)
+                        "trials": sum(
+                            c.unsupported_reason(settings, s) is None for c in cases for s in scales
+                        )
                         * (settings.warmups + settings.repetitions),
                         "cases": [{"id": c.id, **asdict(c)} for c in cases],
                         "warnings": [

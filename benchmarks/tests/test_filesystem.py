@@ -18,7 +18,6 @@ from pyathena_bench.filesystem import (
     read_object,
     run_filesystem,
     transfer,
-    unsupported_reason,
     write_object,
 )
 
@@ -32,8 +31,7 @@ def memory_fs():
 
 
 def test_written_object_has_the_size_in_blocks_and_reads_back_whole(memory_fs):
-    block = memoryview(bytes(4))
-    assert write_object(memory_fs, "/bucket/object", 10, block) == 10
+    assert write_object(memory_fs, "/bucket/object", 10, 4) == 10
     assert memory_fs.cat_file("/bucket/object") == bytes(10)
     assert read_object(memory_fs, "/bucket/object", 4) == 10
 
@@ -71,7 +69,7 @@ def test_aio_file_transfers_run_in_a_thread_as_the_aio_cursor_reads(api, operati
     case = Case("s3", api, operation, "bytes", suite="filesystem", max_workers=8)
 
     async def run():
-        await transfer(fs, case, "s3://b/source", "s3://b/destination", 0, memoryview(bytes(1)))
+        await transfer(fs, case, "s3://b/source", "s3://b/destination", 0, 5 * 2**20)
         return threading.get_ident()
 
     loop_thread = asyncio.run(run())
@@ -82,9 +80,7 @@ def test_aio_file_transfers_run_in_a_thread_as_the_aio_cursor_reads(api, operati
 def test_copy_passes_the_case_workers_and_block_size(api, method):
     fs = RecordingFileSystem()
     case = Case("s3", api, "copy", "bytes", suite="filesystem", max_workers=8)
-    copied = asyncio.run(
-        transfer(fs, case, "s3://b/source", "s3://b/destination", 20, memoryview(bytes(5)))
-    )
+    copied = asyncio.run(transfer(fs, case, "s3://b/source", "s3://b/destination", 20, 5))
     assert copied == 20
     assert fs.copies == [
         (method, "s3://b/source", "s3://b/destination", {"max_workers": 8, "block_size": 5})
@@ -102,7 +98,9 @@ def test_copy_passes_the_case_workers_and_block_size(api, method):
 )
 def test_only_multipart_copies_run(operation, size, runs):
     case = Case("s3", "sync", operation, "bytes", suite="filesystem", max_workers=8)
-    assert (unsupported_reason(case, size) is None) is runs
+    settings = Settings(filesystem_sizes={"small": size})
+    assert (case.unsupported_reason(settings, "small") is None) is runs
+    assert Case("cursor").unsupported_reason(settings, "small") is None
 
 
 class FakeS3Client:
