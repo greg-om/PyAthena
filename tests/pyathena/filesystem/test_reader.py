@@ -256,21 +256,32 @@ class TestReadAheadStream:
 
     def test_close_with_queued_reads(self, monkeypatch):
         """Closing cancels a part that no worker has started and does not wait for it."""
+        shut_down = threading.Event()
+
+        class Executor(ThreadPoolExecutor):
+            def shutdown(self, wait=True, *, cancel_futures=False):
+                super().shutdown(wait=wait, cancel_futures=cancel_futures)
+                shut_down.set()
+
         monkeypatch.setattr(
             "pyathena.filesystem.reader.ThreadPoolExecutor",
-            lambda max_workers: ThreadPoolExecutor(max_workers=1),
+            lambda max_workers: Executor(max_workers=1),
         )
         gate = threading.Event()
         file = _RecordingRandomAccessFile(bytes(100), gate=gate)
         stream = ReadAheadStream.from_arrow_file(file, part_size=10, max_parts=2)
-        # The one worker blocks in the read of the second part, and the third waits.
-        assert stream.read(10) == bytes(10)
-        assert file.gated_read_started.wait(EVENT_TIMEOUT)
         closer = threading.Thread(target=stream.close, daemon=True)
-        closer.start()
-        closer.join(0.2)
-        assert closer.is_alive()
-        gate.set()
+        try:
+            # The one worker blocks in the read of the second part, and the third waits.
+            assert stream.read(10) == bytes(10)
+            assert file.gated_read_started.wait(EVENT_TIMEOUT)
+            closer.start()
+            # The queued third part is cancelled, and close() waits for the second.
+            assert shut_down.wait(EVENT_TIMEOUT)
+            closer.join(0.2)
+            assert closer.is_alive()
+        finally:
+            gate.set()
         closer.join(EVENT_TIMEOUT)
         assert not closer.is_alive()
         assert file.closed
