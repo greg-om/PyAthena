@@ -1,3 +1,4 @@
+import asyncio
 import threading
 from datetime import datetime
 from decimal import Decimal
@@ -16,16 +17,21 @@ from tests.pyathena.util import throttle_metadata_api
 
 
 class TestAsyncAdaptPyathenaCursor:
-    async def test_execute_closes_cursor_off_event_loop_when_fetch_fails(self):
+    @pytest.mark.parametrize(
+        "error",
+        [ValueError("conversion failed"), asyncio.CancelledError()],
+        ids=["error", "cancel"],
+    )
+    async def test_execute_closes_cursor_off_event_loop_when_fetch_fails(self, error):
         cursor = MagicMock()
         cursor.execute = AsyncMock(return_value=cursor)
         cursor.description = [("col", "varchar", None, None, None, None, None)]
-        cursor.fetchall = AsyncMock(side_effect=ValueError("conversion failed"))
+        cursor.fetchall = AsyncMock(side_effect=error)
         closes = []
         cursor.close.side_effect = lambda: closes.append(threading.get_ident())
         adapted = AsyncAdapt_pyathena_cursor(cursor)
 
-        with pytest.raises(ValueError, match="conversion failed"):
+        with pytest.raises(type(error)):
             await greenlet_spawn(adapted.execute, "SELECT 1")
 
         assert len(closes) == 1

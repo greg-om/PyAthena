@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections import deque
 from collections.abc import MutableMapping
 from typing import TYPE_CHECKING, Any, cast
@@ -102,9 +103,10 @@ class AsyncAdapt_pyathena_cursor:
         if self._cursor.description:
             try:
                 self._rows = deque(await_only(self._cursor.fetchall()))
-            except BaseException:
+            except (Exception, asyncio.CancelledError):
                 # Close the partly read result here, off the event loop: SQLAlchemy
-                # closes the cursor with the synchronous close() after the error.
+                # closes the cursor with the synchronous close() after the error,
+                # including a cancellation such as a timeout.
                 await_only(close_in_thread(self._cursor.close))
                 raise
         else:
