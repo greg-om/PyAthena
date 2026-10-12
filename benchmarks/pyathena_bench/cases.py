@@ -49,9 +49,10 @@ def matrix(settings: Settings, suite: str, shape: str) -> list[Case]:
     """Return every case of a suite and result shape, including unsupported ones.
 
     The ``json`` shape adds a ``json`` column to the flat projection and covers
-    only the native pandas and Wrangler reads of CSV results in the single-query
-    suite: Parquet cannot hold the ``json`` type, and the initialization suite
-    prepares UNLOAD fixtures too.
+    the native pandas and Wrangler reads in the single-query suite. Their UNLOAD
+    and CTAS reads are marked unsupported, because Parquet cannot hold the
+    ``json`` type; the initialization suite, which prepares UNLOAD fixtures too,
+    has no json cases.
 
     Args:
         settings: Configuration with the arraysizes, chunk sizes, and concurrency.
@@ -125,11 +126,10 @@ def matrix(settings: Settings, suite: str, shape: str) -> list[Case]:
     if shape == "json":
         cases = [
             c
+            if c.transport == "csv"
+            else replace(c, unsupported="Athena cannot write the json type to Parquet")
             for c in cases
-            if c.family in {"pandas", "wrangler"}
-            and c.transport == "csv"
-            and c.output == "native"
-            and c.dtype_backend is None
+            if c.family in {"pandas", "wrangler"} and c.output == "native"
         ]
     if suite == "concurrent":
         # Keep the scaling suite bounded; chunk and arraysize sweeps belong to single.

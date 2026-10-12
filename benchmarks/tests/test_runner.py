@@ -9,6 +9,7 @@ import json
 import os
 import time
 from dataclasses import replace
+from io import BytesIO
 from pathlib import Path
 
 import pytest
@@ -134,11 +135,13 @@ class TestRunner:
         assert result["status"] == status
 
 
-class FakeS3Listing:
-    """An S3 client whose paginated listing returns fixed pages."""
+class FakeS3:
+    """An S3 client with a fixed paginated listing and object bodies."""
 
-    def __init__(self, pages):
+    def __init__(self, pages, bodies=None, heads=None):
         self.pages = pages
+        self.bodies = bodies or {}
+        self.heads = heads or {}
         self.requests = []
 
     def get_paginator(self, name):
@@ -146,34 +149,62 @@ class FakeS3Listing:
         return self
 
     def paginate(self, **kwargs):
-        self.requests.append(kwargs)
+        self.requests.append(("list", kwargs))
         return iter(self.pages)
 
+    def get_object(self, **kwargs):
+        self.requests.append(("get", kwargs["Key"]))
+        return {"Body": BytesIO(self.bodies[kwargs["Key"]].encode())}
 
-def test_output_files_count_parquet_files_below_the_trial_prefix(monkeypatch):
-    s3 = FakeS3Listing(
+    def head_object(self, **kwargs):
+        self.requests.append(("head", kwargs["Bucket"], kwargs["Key"]))
+        return {"ContentLength": self.heads[(kwargs["Bucket"], kwargs["Key"])]}
+
+
+def test_output_files_follow_the_query_manifests():
+    root = "runs/r/trials/t/"
+    s3 = FakeS3(
         [
             {
                 "Contents": [
-                    {"Key": "runs/r/trials/t/q.csv", "Size": 10},
-                    {"Key": "runs/r/trials/t/q.csv.metadata", "Size": 1},
-                    {"Key": "runs/r/trials/t/q-manifest.csv", "Size": 2},
-                    {"Key": "runs/r/trials/t/unload/20261012_0001", "Size": 300},
+                    {"Key": f"{root}q.csv", "Size": 10},
+                    {"Key": f"{root}u-manifest.csv", "Size": 2},
+                    {"Key": f"{root}u.metadata", "Size": 1},
+                    {"Key": f"{root}unload/20261012_0001", "Size": 300},
+                    # Not in a manifest, so not a data file of the query.
+                    {"Key": f"{root}unload/leftover", "Size": 999},
                 ]
             },
-            {"Contents": [{"Key": "runs/r/trials/t/unload/20261012_0002", "Size": 100}]},
+            {
+                "Contents": [
+                    {"Key": f"{root}unload/20261012_0002", "Size": 100},
+                    {"Key": f"{root}tables/c-manifest.csv", "Size": 2},
+                ]
+            },
             {},
-        ]
+        ],
+        bodies={
+            f"{root}u-manifest.csv": (
+                f"s3://out/{root}unload/20261012_0001\ns3://out/{root}unload/20261012_0002\n"
+            ),
+            f"{root}tables/c-manifest.csv": "s3://elsewhere/ctas/f1\n",
+        },
+        heads={("elsewhere", "ctas/f1"): 50},
     )
-    monkeypatch.setattr("pyathena_bench.runner.session", lambda settings: None)
-    monkeypatch.setattr("pyathena_bench.runner.client", lambda session_, service: s3)
-    assert output_files(Settings(), "s3://out/runs/r/trials/t/") == {
-        "count": 2,
-        "bytes": 400,
+    assert output_files(s3, f"s3://out/{root}") == {
+        "count": 3,
+        "bytes": 450,
         "max_bytes": 300,
-        "min_bytes": 100,
+        "min_bytes": 50,
     }
-    assert s3.requests == [{"Bucket": "out", "Prefix": "runs/r/trials/t/"}]
+    assert s3.requests[0] == ("list", {"Bucket": "out", "Prefix": root})
+    assert ("head", "elsewhere", "ctas/f1") in s3.requests
+
+
+def test_output_files_without_a_manifest_is_an_error():
+    s3 = FakeS3([{"Contents": [{"Key": "runs/r/trials/t/q.csv", "Size": 10}]}])
+    with pytest.raises(ValueError, match="No query manifest"):
+        output_files(s3, "s3://out/runs/r/trials/t/")
 
 
 @pytest.mark.parametrize(
@@ -189,21 +220,35 @@ def test_unload_trials_record_their_output_files(monkeypatch, tmp_path, case, li
     monkeypatch.setattr("pyathena_bench.runner.environment", lambda *args: {})
     monkeypatch.setattr("pyathena_bench.runner.supervise", lambda *args: {"status": "ok"})
     locations = []
+    clients = []
 
-    def summarize(settings, location):
+    def summarize(s3, location):
         locations.append(location)
+        clients.append(s3)
         return {"count": 1, "bytes": 5, "max_bytes": 5, "min_bytes": 5}
 
+    created = []
+
+    def make_client(session_, service):
+        assert service == "s3"
+        created.append(object())
+        return created[-1]
+
     monkeypatch.setattr("pyathena_bench.runner.output_files", summarize)
+    monkeypatch.setattr("pyathena_bench.runner.session", lambda settings: None)
+    monkeypatch.setattr("pyathena_bench.runner.client", make_client)
     manifest = {
         "run_id": "a" * 32,
         "scales": {"small": {"table": "input", "rows": 10}},
         "fixtures": {},
     }
-    settings = replace(Settings(), warmups=0, repetitions=1)
+    settings = replace(Settings(), warmups=0, repetitions=2)
     assert run(settings, manifest, [case], ["small"], tmp_path / "run")
-    trial = json.loads((tmp_path / "run/trials.jsonl").read_text())
-    assert ("output_files" in trial) is listed
+    trials = [json.loads(line) for line in (tmp_path / "run/trials.jsonl").read_text().splitlines()]
+    assert all(("output_files" in trial) is listed for trial in trials)
     assert [loc.startswith(f"s3://out/runs/{'a' * 32}/trials/") for loc in locations] == (
-        [True] if listed else []
+        [True, True] if listed else []
     )
+    # One client serves every trial of the run.
+    assert len(created) == (1 if listed else 0)
+    assert clients == created * 2

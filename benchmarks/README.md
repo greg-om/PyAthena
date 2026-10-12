@@ -30,7 +30,7 @@ The Athena timings describe queries against these smaller snapshots, not a scan 
 
 The flat workload projects scalar fields from `file`, `details`, and `http` alongside the top-level scalar columns.
 The nested workload preserves those structures.
-The json workload adds `CAST(details AS JSON) AS details_json` to the flat projection; it covers only native pandas and Wrangler reads of CSV results in the single-query suite, because Parquet cannot hold the `json` type.
+The json workload adds `CAST(details AS JSON) AS details_json` to the flat projection; it covers native pandas and Wrangler reads in the single-query suite, with their UNLOAD and CTAS reads marked unsupported, because Parquet cannot hold the `json` type.
 No workload converts every library's output into a common Python object representation.
 
 ## Dependencies and local checks
@@ -248,7 +248,7 @@ When the temporary directory is a tmpfs, as `/tmp` is on Amazon Linux 2023, file
 | Wrangler CTAS and UNLOAD | Full DataFrame or chunks, including nested workloads |
 
 The SQLAlchemy families `sqla_rest`, `sqla_pandas`, `sqla_arrow`, `sqla_polars`, and `sqla_s3fs` read with the synchronous API in the single-query suite only, and the result-file drivers also read UNLOAD results.
-Their engines connect with the same workgroup, output location, polling interval, and disabled result reuse as the cursor cases, and their cursors take the same cursor options; with `chunksize`, the pandas and Polars drivers' cursors also read the result file in chunks.
+Their engines connect with the same workgroup, output location, polling interval, and disabled result reuse as the cursor cases, their statements run without the client cache (`cache_size` defaults to 0), and their cursors take the same cursor options; with `chunksize`, the pandas and Polars drivers' cursors also read the result file in chunks.
 As a cursor is, the engine's connection is opened during setup, outside `total_seconds`.
 `pandas.read_sql_query()` builds DataFrames from the rows of `fetchall()` or `fetchmany()`, so these cases include the driver's row output; `sqla_rest` pages through GetQueryResults like Cursor.
 
@@ -342,7 +342,7 @@ For example, the following selection, with `chunksizes = [10000, 100000, 1000000
 
 - medium as a small regression subset: Cursor and S3FS rows with arraysize 1000, and the native reads of the DataFrame families and Wrangler without chunks, flat, three repetitions;
 - large, flat and nested: Cursor and S3FS rows with arraysize 1000 (five repetitions), Cursor with arraysize 100 (three, split into single-repetition jobs), DictCursor flat (three), every native read of the DataFrame families and Wrangler including the json workload (five), and `read_sql_query()` for every driver without chunks and with 100,000-row chunks (five; three for `sqla_rest`, split);
-- xlarge: S3FS rows flat, every native read of the DataFrame families and Wrangler, the json workload without chunks and with 100,000-row chunks, and `read_sql_query()` for the result-file drivers flat without chunks and with chunks, and nested with chunks only, all with three repetitions.
+- xlarge: S3FS rows flat, every native read of the DataFrame families and Wrangler, the json workload without chunks and with 100,000-row chunks, and `read_sql_query()` through the pandas, Arrow, Polars, and S3FS drivers flat without chunks and with chunks, and through the pandas, Arrow, and Polars drivers nested with chunks only, all with three repetitions.
 
 It leaves out the ThreadPool and native asyncio APIs, whose single-query timings matched the synchronous API, the initialization suite, the concurrency suite, arraysize 100 for every family but Cursor, and DictCursor beyond one scale.
 Every selection runs without warmups because each trial already runs in a fresh process.
@@ -369,7 +369,7 @@ jobs --suite single --scale xlarge --shape flat --api sync --arraysize 1000 \
   --family s3fs --output-kind rows --repetitions 3 > results/jobs-xlarge-s3fs.json
 jobs --suite single --scale xlarge --shape flat nested --api sync \
   --family pandas arrow polars wrangler --output-kind native --repetitions 3 > results/jobs-xlarge-native.json
-jobs --suite single --scale xlarge --shape json --api sync --chunksize 0 100000 \
+jobs --suite single --scale xlarge --shape json --api sync --transport csv --chunksize 0 100000 \
   --family pandas wrangler --repetitions 3 > results/jobs-xlarge-json.json
 jobs --suite single --scale xlarge --shape flat --chunksize 0 100000 \
   --family sqla_pandas sqla_arrow sqla_polars sqla_s3fs --repetitions 3 > results/jobs-xlarge-sqla-flat.json
@@ -382,7 +382,7 @@ uv run --no-sync python -m pyathena_bench --config results/fleet.toml queue \
 
 The manifest for this selection must be prepared with `--scale medium large xlarge`.
 It is published as `large-1` in place of the previous example, so the worker and status commands below apply unchanged.
-The selection has 96 jobs; from the job durations of the 2026-10-11 run, they take about 14 host-hours on `r7g.2xlarge` hosts, and the longest, xlarge nested pandas CSV, about 75 minutes.
+The selection has 99 jobs, three of which only record the unsupported json UNLOAD and CTAS cases; from the job durations of the 2026-10-11 run, they take about 14 hours of job time on `r7g.2xlarge` hosts, and the longest, xlarge nested pandas CSV, about 75 minutes.
 
 `queue` reserves the name with a conditional write, stores the configuration, manifest, and jobs under `fleet/<name>/` in the scratch bucket, and writes the `queue.json` marker last.
 Workers refuse a queue without the marker.
@@ -423,7 +423,7 @@ Every output directory contains `environment.json`, a copy of the input manifest
 Environment metadata includes Git SHA, dirty state, Python and dependency versions, lockfile hash, CPU count, RAM, and settings.
 SDK events preserve query IDs, SQL, output locations, Athena statistics, and failed operations without storing result rows.
 Successful measurements generate `summary.csv` and `summary.md`; failed trials and unsupported cases remain visible.
-After each successful UNLOAD or CTAS trial, `run` lists the trial's output location and records the number and sizes of the Parquet files in `output_files`; the summary shows the most files and the largest file, and notes a trial whose listing failed.
+After each successful UNLOAD or CTAS trial, `run` reads the query manifests (`<query_id>-manifest.csv`) below the trial's output location and records the number and sizes of the data files they list in `output_files`; the summary shows the most files and the largest file of the measured trials, and notes a measured trial whose files could not be summarized.
 Regenerate reports after interruption with:
 
 ```bash

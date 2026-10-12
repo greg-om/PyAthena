@@ -176,9 +176,11 @@ def expand_jobs(
                         base += f"-a{arraysize}"
                         args += ["--arraysize", str(arraysize)]
                     if filters.chunksize:
-                        # The job runs the same chunk selection; the ID keeps it unique.
-                        base += "-c" + "_".join(map(str, filters.chunksize))
-                        args += ["--chunksize", *map(str, filters.chunksize)]
+                        # The job runs the same chunk selection, which its ID names
+                        # in one order so that equal selections share an ID.
+                        chunks = [str(c) for c in sorted(set(filters.chunksize))]
+                        base += "-c" + "_".join(chunks)
+                        args += ["--chunksize", *chunks]
                     runnable = [c for c in cases if c.unsupported is None]
                     pages = max((api_pages(c, rows) for c in runnable), default=0)
                     api_weight = max(

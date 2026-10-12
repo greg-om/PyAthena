@@ -65,14 +65,18 @@ def test_sqlalchemy_cases_are_synchronous_single_query_reads():
         assert not [c for c in matrix(Settings(), suite, "flat") if c.family.startswith("sqla_")]
 
 
-def test_json_shape_covers_pandas_and_wrangler_csv_reads():
+def test_json_shape_covers_pandas_and_wrangler_reads():
     cases = matrix(Settings(), "single", "json")
     assert {(c.family, c.transport, c.output) for c in cases} == {
         ("pandas", "csv", "native"),
+        ("pandas", "unload", "native"),
         ("wrangler", "csv", "native"),
+        ("wrangler", "ctas", "native"),
+        ("wrangler", "unload", "native"),
     }
-    assert all(c.unsupported is None for c in cases)
-    assert {c.chunksize for c in cases} == {None, 10000, 100000}
+    # Parquet cannot hold json, so UNLOAD and CTAS stay visible as unsupported.
+    assert all((c.unsupported is None) == (c.transport == "csv") for c in cases)
+    assert {c.chunksize for c in cases if c.transport == "csv"} == {None, 10000, 100000}
     # The initialization suite would also prepare an UNLOAD fixture, which json rejects.
     assert matrix(Settings(), "init", "json") == []
     assert matrix(Settings(), "concurrent", "json") == []

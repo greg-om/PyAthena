@@ -70,7 +70,7 @@ def summarize(trials: list[dict[str, Any]]) -> list[dict[str, Any]]:
         reasons = set()
         for trial in group:
             if trial["status"] == "ok":
-                if "output_files_error" in trial:
+                if "output_files_error" in trial and not trial.get("warmup"):
                     # The timing stands, but the file columns miss this trial.
                     reasons.add(f"Output files not listed: {trial['output_files_error']}")
                 continue

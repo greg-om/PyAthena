@@ -217,6 +217,13 @@ class TestExpandJobsSelection:
         ]
         assert [j["args"][-2:] for j in jobs] == [["--chunksize", "0"], ["--chunksize", "100000"]]
         assert merge_jobs([jobs[:1], jobs[1:]]) == jobs
+        # Equal selections in another order or with repeats get the same job.
+        again = expand_jobs(
+            SETTINGS, ["single"], ["small"], ["flat"], replace(selection, chunksize=[100000, 0, 0])
+        )
+        assert [(j["id"], j["args"][-3:]) for j in again] == [
+            ("single-small-flat-pandas-sync-csv-native-c0_100000", ["--chunksize", "0", "100000"])
+        ]
         cases = [Case("pandas", output="native", chunksize=c) for c in (None, 10000, 100000)]
         assert [c.chunksize for c in replace(selection, chunksize=[0]).select(cases)] == [None]
         assert [c.chunksize for c in replace(selection, chunksize=[100000]).select(cases)] == [

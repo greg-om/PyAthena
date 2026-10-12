@@ -225,7 +225,9 @@ class Adapter:
         connections create cursors with the cursor options of the driver's
         family, including ``chunksize`` for the pandas and Polars drivers, so a
         chunked read also streams the result file. ``NullPool`` opens one
-        connection per query.
+        connection per query. Result reuse is disabled through the connection's
+        ``result_reuse_enable``, and the client cache stays off because the
+        dialect executes statements without ``cache_size``, which defaults to 0.
 
         Returns:
             The engine.
@@ -242,12 +244,18 @@ class Adapter:
         )
 
     def execute_kwargs(self) -> dict[str, Any]:
-        """Return the ``execute()`` options of the case besides cache and reuse settings.
+        """Return the ``execute()`` options of a cursor case.
+
+        The client cache and Athena result reuse are disabled, and pandas cases
+        that set ``dtype_backend`` pass it.
 
         Returns:
-            ``dtype_backend`` for the pandas cases that set it, or no options.
+            The keyword arguments for the cursor's ``execute()``.
         """
-        return {"dtype_backend": self.case.dtype_backend} if self.case.dtype_backend else {}
+        options: dict[str, Any] = {"cache_size": 0, "result_reuse_enable": False}
+        if self.case.dtype_backend:
+            options["dtype_backend"] = self.case.dtype_backend
+        return options
 
     def wrangler(self, sql: str) -> Any:
         options: dict[str, Any] = {
@@ -302,7 +310,6 @@ async def measure_query(adapter: Adapter, cursor: Any, sql: str, expected: int) 
     case = adapter.case
     result = None
     try:
-        options = {"cache_size": 0, "result_reuse_enable": False, **adapter.execute_kwargs()}
         if case.family == "wrangler":
             result = adapter.wrangler(sql)
             ready = time.perf_counter()
@@ -315,17 +322,19 @@ async def measure_query(adapter: Adapter, cursor: Any, sql: str, expected: int) 
             count = consume(result, case)
             query_id = None
         elif case.api == "thread":
-            query_id, future = await asyncio.to_thread(cursor.execute, sql, **options)
+            query_id, future = await asyncio.to_thread(
+                cursor.execute, sql, **adapter.execute_kwargs()
+            )
             result = await asyncio.wrap_future(future)
             ready = time.perf_counter()
             count = await asyncio.to_thread(consume, result, case)
         elif case.api == "aio":
-            await cursor.execute(sql, **options)
+            await cursor.execute(sql, **adapter.execute_kwargs())
             ready = time.perf_counter()
             query_id = cursor.query_id
             count = await consume_aio(cursor, case)
         else:
-            cursor.execute(sql, **options)
+            cursor.execute(sql, **adapter.execute_kwargs())
             ready = time.perf_counter()
             query_id = cursor.query_id
             count = consume(cursor.result_set, case)
@@ -368,20 +377,24 @@ async def run_adapter(
     sqlalchemy = case.family in SQLALCHEMY_FAMILIES
     connection = None if case.family == "wrangler" or sqlalchemy else adapter.connection()
     engine = adapter.engine() if sqlalchemy else None
-    # Like a cursor, the SQLAlchemy connection is set up outside the measurement.
-    cursors: list[Any] = [engine.connect()] if engine is not None else []
-    if case.suite != "init" and connection is not None:
-        # AsyncCursor owns one shared pool; Aio cursors carry per-query state.
-        cursors = [
-            adapter.cursor(connection) for _ in range(case.concurrency if case.api == "aio" else 1)
-        ]
-    setup_seconds = time.perf_counter() - setup_start
-    samples: list[float] = []
-    stop = asyncio.Event()
-    monitor = asyncio.create_task(heartbeat(adapter.settings.heartbeat_interval, stop, samples))
-    await asyncio.sleep(0)
-    start = time.perf_counter()
+    cursors: list[Any] = []
+    monitor = None
     try:
+        if engine is not None:
+            # Like a cursor, the SQLAlchemy connection is set up outside the measurement.
+            cursors = [engine.connect()]
+        if case.suite != "init" and connection is not None:
+            # AsyncCursor owns one shared pool; Aio cursors carry per-query state.
+            cursors = [
+                adapter.cursor(connection)
+                for _ in range(case.concurrency if case.api == "aio" else 1)
+            ]
+        setup_seconds = time.perf_counter() - setup_start
+        samples: list[float] = []
+        stop = asyncio.Event()
+        monitor = asyncio.create_task(heartbeat(adapter.settings.heartbeat_interval, stop, samples))
+        await asyncio.sleep(0)
+        start = time.perf_counter()
         if case.suite == "init":
             if fixture is None:
                 raise ValueError("Missing completed query fixture")
@@ -428,8 +441,9 @@ async def run_adapter(
             else None,
         }
     finally:
-        stop.set()
-        await monitor
+        if monitor is not None:
+            stop.set()
+            await monitor
         for cursor in cursors:
             if case.api == "thread":
                 cursor.close(wait=True)

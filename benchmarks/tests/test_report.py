@@ -134,3 +134,6 @@ class TestReport:
         row = summarize([trials[0], failed_listing])[0]
         assert (row["successful_trials"], row["max_output_files"]) == (2, 30)
         assert row["notes"] == "Output files not listed: ClientError: denied"
+        # A warmup is not in the columns, so its listing failure is not noted either.
+        row = summarize([trials[0], {**failed_listing, "warmup": True}])[0]
+        assert row["notes"] == ""

@@ -241,6 +241,24 @@ class TestAdapter:
         assert result["status"] == "ok"
         assert events == ["connect", "measure", "close", "dispose"]
 
+    async def test_failed_sqlalchemy_connect_disposes_the_engine(self, monkeypatch):
+        events = []
+
+        class Engine:
+            def connect(self):
+                raise OSError("connect failed")
+
+            def dispose(self):
+                events.append("dispose")
+
+        monkeypatch.setattr(Adapter, "engine", lambda self: Engine())
+        adapter = Adapter(
+            Settings(), Case("sqla_rest", output="native"), None, "scratch", "s3://out/", "temp"
+        )
+        with pytest.raises(OSError, match="connect failed"):
+            await run_adapter(adapter, "SELECT a", 5)
+        assert events == ["dispose"]
+
     def test_pandas_dtype_backend_is_an_execute_option(self):
         adapter = Adapter(
             Settings(),
@@ -250,8 +268,10 @@ class TestAdapter:
             "s3://out/",
             "temp",
         )
-        assert adapter.execute_kwargs() == {"dtype_backend": "pyarrow"}
-        assert Adapter(Settings(), Case("pandas"), None, "s", "s3://o/", "t").execute_kwargs() == {}
+        disabled = {"cache_size": 0, "result_reuse_enable": False}
+        assert adapter.execute_kwargs() == {**disabled, "dtype_backend": "pyarrow"}
+        plain = Adapter(Settings(), Case("pandas"), None, "s", "s3://o/", "t")
+        assert plain.execute_kwargs() == disabled
 
     @pytest.mark.parametrize("api", ["sync", "thread", "aio"])
     async def test_real_api_cursors_consume_stubbed_athena_results(self, api):

@@ -308,28 +308,41 @@ def supervise(
     return result
 
 
-def output_files(settings: Settings, location: str) -> dict[str, int]:
-    """Summarize the data files that a trial wrote below its output location.
+def output_files(s3: Any, location: str) -> dict[str, int]:
+    """Summarize the data files that a trial's UNLOAD or CTAS queries wrote.
 
-    UNLOAD and CTAS write Parquet files there; query result CSV files, their
-    metadata, and manifests are excluded.
+    Athena writes a ``<query_id>-manifest.csv`` that lists the data files of
+    each UNLOAD or CTAS query below the query's output location, for PyAthena
+    and Wrangler alike, so the manifests below the trial's location name the
+    files. Sizes come from the listing of that location, or from
+    ``HeadObject`` for a file outside it.
 
     Args:
-        settings: Configuration with the AWS region and profile.
+        s3: S3 client.
         location: The trial's ``s3://`` output prefix.
 
     Returns:
         The number of files and their total, largest, and smallest sizes in bytes.
+
+    Raises:
+        ValueError: If no manifest is below the location.
     """
     bucket, _, prefix = location.removeprefix("s3://").partition("/")
-    sizes = [
-        item["Size"]
-        for page in client(session(settings), "s3")
-        .get_paginator("list_objects_v2")
-        .paginate(Bucket=bucket, Prefix=prefix)
-        for item in page.get("Contents", [])
-        if not item["Key"].endswith((".csv", ".metadata", ".txt", ".json"))
-    ]
+    listed: dict[str, int] = {}
+    for page in s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix):
+        listed.update((item["Key"], item["Size"]) for item in page.get("Contents", []))
+    manifests = [key for key in listed if key.endswith("-manifest.csv")]
+    if not manifests:
+        raise ValueError(f"No query manifest below {location}")
+    sizes = []
+    for manifest in manifests:
+        body: str = s3.get_object(Bucket=bucket, Key=manifest)["Body"].read().decode()
+        for line in filter(None, body.splitlines()):
+            file_bucket, _, key = line.removeprefix("s3://").partition("/")
+            size = listed.get(key) if file_bucket == bucket else None
+            if size is None:
+                size = s3.head_object(Bucket=file_bucket, Key=key)["ContentLength"]
+            sizes.append(size)
     return {
         "count": len(sizes),
         "bytes": sum(sizes),
@@ -370,6 +383,8 @@ def run(
     write_json(output / "environment.json", environment(settings))
     write_json(output / "manifest.json", manifest)
     success = True
+    # Created on first use and shared by the run's output file summaries.
+    s3: Any = None
     for scale in scales:
         for case in cases:
             if case.unsupported:
@@ -412,7 +427,9 @@ def run(
                     and case.suite != "init"
                 ):
                     try:
-                        result["output_files"] = output_files(settings, payload["output"])
+                        if s3 is None:
+                            s3 = client(session(settings), "s3")
+                        result["output_files"] = output_files(s3, payload["output"])
                     except Exception as exc:
                         # The measurement stands; only the file summary is missing.
                         result["output_files_error"] = f"{type(exc).__name__}: {exc}"
