@@ -68,6 +68,12 @@ def parser() -> argparse.ArgumentParser:
         default=[],
         help="Snapshots to create; none for a manifest that only the filesystem suite uses",
     )
+    prep.add_argument(
+        "--filesystem-scale",
+        nargs="+",
+        default=[],
+        help="Source objects of the filesystem suite to upload, which fleet hosts then share",
+    )
     for name in ("plan", "run", "jobs"):
         command = commands.add_parser(name)
         if name == "jobs":
@@ -197,7 +203,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "preflight":
         sys.stdout.write(json.dumps(preflight(settings, args.stack), indent=2) + "\n")
     elif args.command == "prepare":
-        prepare(settings, args.stack, args.manifest, scales)
+        objects = args.filesystem_scale
+        if len(set(objects)) != len(objects) or any(
+            s not in settings.filesystem_sizes for s in objects
+        ):
+            raise ValueError("Select distinct filesystem scales defined in the configuration")
+        manifest = prepare(settings, args.stack, args.manifest, scales)
+        if objects:
+            prepare_objects(settings, manifest, args.manifest, objects)
     elif args.command == "cleanup":
         manifest = read_json(args.manifest)
         resources = validate_manifest(settings, manifest)

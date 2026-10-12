@@ -504,6 +504,26 @@ class TestCommandLine:
         with pytest.raises(ValueError, match="Select distinct scales"):
             main([*argv, "--scale", "small"])
 
+    def test_prepare_uploads_the_selected_filesystem_objects_with_the_manifest(
+        self, tmp_path, monkeypatch
+    ):
+        config = tmp_path / "config.toml"
+        config.write_text("[filesystem]\nsizes = { large = 1073741824 }\n")
+        calls = []
+        monkeypatch.setattr(
+            "pyathena_bench.__main__.prepare",
+            lambda settings, stack, path, scales: calls.append(("prepare", scales)) or {},
+        )
+        monkeypatch.setattr(
+            "pyathena_bench.__main__.prepare_objects",
+            lambda settings, manifest, path, scales: calls.append(("objects", scales)),
+        )
+        argv = ["--config", str(config), "prepare", "--stack", "s", "--manifest", "m.json"]
+        assert main([*argv, "--filesystem-scale", "large"]) == 0
+        assert calls == [("prepare", []), ("objects", ["large"])]
+        with pytest.raises(ValueError, match="filesystem scales"):
+            main([*argv, "--filesystem-scale", "small"])
+
 
 class TestQueueSafety:
     def test_interrupted_publication_can_be_repeated_and_is_not_consumed(self, tmp_path):

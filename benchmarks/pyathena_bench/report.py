@@ -89,6 +89,8 @@ def summarize(trials: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     reason = query.get("error", query["status"])
                     if query["status"] == "row_count_mismatch":
                         reason += f": expected {query['expected_rows']}, got {query['rows']}"
+                    elif query["status"] == "size_mismatch":
+                        reason += f": expected {query['expected_bytes']} B, got {query['bytes']} B"
                     reasons.add(prefix + reason)
             else:
                 reasons.add(prefix + trial.get("reason", trial.get("error", trial["status"])))

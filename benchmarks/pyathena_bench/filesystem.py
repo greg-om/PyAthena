@@ -18,10 +18,30 @@ from botocore.config import Config
 from pyathena import connect
 from pyathena.filesystem.s3 import S3FileSystem
 from pyathena.filesystem.s3_async import AioS3FileSystem
+from pyathena.filesystem.s3_core import S3Core
 from pyathena.filesystem.s3_path import S3Path
 from pyathena_bench.adapters import heartbeat
 from pyathena_bench.cases import Case
 from pyathena_bench.config import Settings
+
+
+def unsupported_reason(case: Case, size: int) -> str | None:
+    """Return why a filesystem case does not run for an object size.
+
+    A copy of an object up to ``S3Core.MULTIPART_UPLOAD_MAX_PART_SIZE`` is a
+    single CopyObject request, which neither ``max_workers`` nor the
+    connection pool affects.
+
+    Args:
+        case: Filesystem case.
+        size: Size of the object in bytes.
+
+    Returns:
+        The reason, or None if the case runs.
+    """
+    if case.transport == "copy" and size <= S3Core.MULTIPART_UPLOAD_MAX_PART_SIZE:
+        return "Objects up to 5 GiB are copied with a single CopyObject request"
+    return None
 
 
 def read_object(fs: Any, path: str, block_size: int) -> int:
@@ -67,7 +87,7 @@ async def transfer(
     reads result files, the asyncio filesystem's file reads and writes run in
     ``asyncio.to_thread()``: its files dispatch their range requests and part
     uploads through ``S3AioExecutor`` to the filesystem's event loop. Its
-    multipart copy is a coroutine awaited on the trial's event loop.
+    copy is a coroutine awaited on the trial's event loop.
 
     Args:
         fs: ``S3FileSystem`` for the ``sync`` API, ``AioS3FileSystem`` for ``aio``.
@@ -84,13 +104,11 @@ async def transfer(
         ValueError: If the operation is unknown.
     """
     if case.transport == "copy":
-        # Called directly: copy() uses a multipart copy only for objects over 5 GiB.
-        args = (S3Path.parse(source), S3Path.parse(destination))
-        kwargs = {"max_workers": case.max_workers, "block_size": len(block)}
+        options = {"max_workers": case.max_workers, "block_size": len(block)}
         if case.api == "aio":
-            await fs._copy_object_with_multipart_upload(*args, **kwargs)
+            await fs._cp_file(source, destination, **options)
         else:
-            fs._copy_object_with_multipart_upload(*args, **kwargs)
+            fs.cp_file(source, destination, **options)
         return size
     if case.transport == "read":
         if case.api == "aio":
@@ -117,7 +135,8 @@ async def run_filesystem(
         case: Filesystem case.
         session_: boto3 session.
         source: Prepared object of ``size`` bytes, read or copied.
-        destination: Object that a write or copy creates.
+        destination: Object that a write or copy creates and the trial deletes
+            after checking its size.
         size: Size of the object in bytes.
 
     Returns:
@@ -152,13 +171,6 @@ async def run_filesystem(
         start = time.perf_counter()
         try:
             transferred = await transfer(fs, case, source, destination, size, block)
-        except Exception as exc:
-            query = {
-                "status": "error",
-                "error": f"{type(exc).__name__}: {exc}",
-                "total_seconds": time.perf_counter() - start,
-            }
-        else:
             elapsed = time.perf_counter() - start
             # Checked after the measurement: the written or copied object is complete.
             if case.transport != "read":
@@ -166,6 +178,15 @@ async def run_filesystem(
                 transferred = connection.s3_client.head_object(
                     Bucket=written.bucket, Key=written.key
                 )["ContentLength"]
+                # Removed, so that the trials do not accumulate copies of the object.
+                connection.s3_client.delete_object(Bucket=written.bucket, Key=written.key)
+        except Exception as exc:
+            query = {
+                "status": "error",
+                "error": f"{type(exc).__name__}: {exc}",
+                "total_seconds": time.perf_counter() - start,
+            }
+        else:
             query = {
                 "status": "ok" if transferred == size else "size_mismatch",
                 "bytes": transferred,

@@ -211,27 +211,29 @@ Its operations, selected with `--transport`, are:
 
 - `read`: one `read()` of the whole object from a file opened with `block_size`, which reads it as parallel range requests of that size;
 - `write`: writes through a file opened with `block_size`, which uploads the object as a multipart upload with parts of that size;
-- `copy`: `_copy_object_with_multipart_upload()` with parts of `block_size`, the multipart copy that `copy()` uses only for objects over 5 GiB.
+- `copy`: `cp_file()`, or `_cp_file()` of `AioS3FileSystem`, which copies an object over 5 GiB as a multipart copy with parts of `block_size`; the copies of smaller objects, single CopyObject requests, are recorded as unsupported.
 
 Each case sets the filesystem's `max_workers` and the S3 client's `max_pool_connections` through the connection's `s3_config`.
 The `[filesystem]` section of `config.toml` sets the swept values, 8 and 40 workers and pools of 10 and 40 by default, and a `block_size` of 8 MiB.
-The suite's scales are the object sizes in bytes in `[filesystem] sizes`, not the row counts in `[scales]`: 64 MiB (small), 256 MiB (medium), 1 GiB (large), and 4 GiB (xlarge) by default.
+The suite's scales are the object sizes in bytes in `[filesystem] sizes`, not the row counts in `[scales]`: 64 MiB (small), 256 MiB (medium), 1 GiB (large), and 6 GiB (xlarge) by default.
 
 The `sync` API calls the filesystem on the trial's thread, and a file's parallel requests run in an `S3ThreadPoolExecutor`.
 The `aio` API runs a read or write in `asyncio.to_thread()`, as `AioS3FSCursor` reads result files, and a file's parallel requests run through `S3AioExecutor` in `asyncio.to_thread()` on the filesystem's event loop, fsspec's IO thread.
 Its copy is a coroutine awaited on the trial's event loop, whose part copies run in `asyncio.to_thread()`.
 Both event loops keep Python's default executor, whose `min(32, os.cpu_count() + 4)` threads bound the parallel requests of the `aio` API.
 
-Before its first trial, `run` uploads each missing source object, of zero bytes, with boto3 below the run's scratch prefix and records it under `objects` in the manifest.
-A fleet worker uploads the objects on its host, to its own copy of the manifest.
-Writes and copies go to `trials/<trial>/object` below the scratch prefix, which `cleanup` removes, also with `--trials-only`.
-`total_seconds` covers the transfer; afterwards, the trial checks the size of the data read or of the written or copied object.
+The source objects, of zero bytes, are uploaded with boto3 below the run's scratch prefix and recorded under `objects` in the manifest.
+`prepare --filesystem-scale` uploads them with the manifest, so that every fleet host reads the same objects.
+Otherwise, `run` uploads the missing objects before its first trial, and a fleet worker uploads them on its host, to its own copy of the manifest.
+Writes and copies go to `trials/<trial>/object` below the scratch prefix.
+`total_seconds` covers the transfer; afterwards, the trial checks the size of the data read or of the written or copied object, and deletes the written or copied object.
+`cleanup` removes the source objects and any remaining trial objects, the latter also with `--trials-only`.
 The summary shows the throughput in MiB per second and the peak thread count.
-A manifest for this suite alone needs no snapshot: `prepare` without `--scale` records the stack's resources only.
+A manifest for this suite alone needs no snapshot: without `--scale`, `prepare` creates none.
 
 ```bash
 uv run --no-sync python -m pyathena_bench prepare \
-  --stack "$BENCHMARK_STACK_ID" --manifest results/input-filesystem.json
+  --stack "$BENCHMARK_STACK_ID" --manifest results/input-filesystem.json --filesystem-scale large
 uv run --no-sync python -m pyathena_bench run \
   --manifest results/input-filesystem.json --out results/filesystem-large \
   --suite filesystem --scale large

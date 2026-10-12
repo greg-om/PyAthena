@@ -47,7 +47,7 @@ from pyathena_bench.aws import (
 )
 from pyathena_bench.cases import Case
 from pyathena_bench.config import Settings, select_sql, write_json
-from pyathena_bench.filesystem import run_filesystem
+from pyathena_bench.filesystem import run_filesystem, unsupported_reason
 from pyathena_bench.report import CHECKPOINT, read_trials, trial_key
 
 _logger = logging.getLogger(__name__)
@@ -483,7 +483,10 @@ def run(
     results_root = locations["results"]
     for scale in scales:
         for case in cases:
-            if case.unsupported:
+            unsupported = case.unsupported
+            if case.suite == "filesystem":
+                unsupported = unsupported_reason(case, manifest["objects"][scale]["size"])
+            if unsupported:
                 if (scale, case.id, None) in completed:
                     continue
                 append_json(
@@ -493,7 +496,7 @@ def run(
                         "case_id": case.id,
                         "scale": scale,
                         "status": "unsupported",
-                        "reason": case.unsupported,
+                        "reason": unsupported,
                     },
                 )
                 continue

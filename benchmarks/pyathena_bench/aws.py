@@ -272,6 +272,10 @@ def validate_manifest(settings: Settings, manifest: dict[str, Any]) -> dict[str,
     for scale, item in manifest["scales"].items():
         if item["table"] != prefix + identifier(scale):
             raise ValueError("Table is outside the manifest namespace")
+    objects = f"s3://{actual['Bucket']}/runs/{manifest['run_id']}/objects/{{}}-"
+    for scale, item in manifest.get("objects", {}).items():
+        if not item["location"].startswith(objects.format(identifier(scale))):
+            raise ValueError("Object is outside the manifest namespace")
     return actual
 
 

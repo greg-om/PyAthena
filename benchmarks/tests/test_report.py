@@ -62,6 +62,12 @@ def test_summary_preserves_failed_warmup_and_cancellation_reasons():
     assert "Warmup: q: StopQueryExecution denied" in rows[0]["notes"]
 
 
+def test_summary_notes_the_sizes_of_a_size_mismatch():
+    query = {"status": "size_mismatch", "bytes": 9, "expected_bytes": 10, "total_seconds": 1}
+    rows = summarize([{"case_id": "case", "scale": "small", "status": "error", "queries": [query]}])
+    assert rows[0]["notes"] == "size_mismatch: expected 10 B, got 9 B"
+
+
 class TestReport:
     def test_report_recovers_an_interrupted_trial_without_claiming_success(self, tmp_path):
         event = {

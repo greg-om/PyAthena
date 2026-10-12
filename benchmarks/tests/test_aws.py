@@ -127,13 +127,19 @@ class TestObjects:
 
 
 class TestAwsLifecycle:
-    @pytest.mark.parametrize("change", ["bucket", "table", "region", "date"])
+    @pytest.mark.parametrize("change", ["bucket", "table", "object", "region", "date"])
     def test_manifest_rejects_changed_or_foreign_targets(self, aws_metadata, change):
         data = manifest()
+        data["objects"] = {
+            "small": {"location": f"s3://temporary/runs/{RUN}/objects/small-x", "size": 1}
+        }
+        validate_manifest(Settings(), data)
         if change == "bucket":
             data["resources"]["Bucket"] = "input"
         elif change == "table":
             data["scales"]["small"]["table"] = "pypi_file_downloads"
+        elif change == "object":
+            data["objects"]["small"]["location"] = "s3://input/data/part-0"
         elif change == "region":
             data["region"] = "us-east-1"
         else:

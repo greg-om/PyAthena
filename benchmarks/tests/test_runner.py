@@ -281,6 +281,24 @@ def test_filesystem_trials_transfer_the_prepared_object_within_the_scratch_bucke
     assert "sql" not in payload
 
 
+def test_copies_without_a_multipart_copy_are_recorded_as_unsupported(
+    monkeypatch, tmp_path, run_stubs
+):
+    monkeypatch.setattr("pyathena_bench.runner.validate_objects", lambda *args: None)
+    monkeypatch.setattr(
+        "pyathena_bench.runner.supervise",
+        lambda payload, events, settings: pytest.fail("No trial runs for a single CopyObject"),
+    )
+    manifest = {**RUN_MANIFEST, "objects": {"small": {"location": "s3://out/o", "size": 2**30}}}
+    case = Case(
+        "s3", "sync", "copy", "bytes", suite="filesystem", max_workers=8, pool_connections=10
+    )
+    assert run(Settings(), manifest, [case], ["small"], tmp_path / "run")
+    [record] = [json.loads(line) for line in (tmp_path / "run" / "trials.jsonl").open()]
+    assert record["status"] == "unsupported"
+    assert "single CopyObject" in record["reason"]
+
+
 class TestResume:
     def test_finished_trials_are_skipped_and_outputs_go_to_the_results_location(
         self, monkeypatch, tmp_path, run_stubs
