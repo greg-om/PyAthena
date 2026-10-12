@@ -242,6 +242,9 @@ class _JSONConverter:
         """
         import pandas as pd
 
+        if values.dtype.kind in "mM":
+            # pandas parsed the text as dates, as parse_dates given to execute() asks.
+            return pd.Series(values.array, index=index)
         # A value that is not text is NULL, which the converter gets as an empty string,
         # as pandas passes NULL to a converter.
         converted = pd.Series(
@@ -1032,7 +1035,12 @@ class AthenaPandasResultSet(AthenaResultSet):
         else:
             dtype = {}
         dtype.update(renamed_dtypes)
-        dtype.update(dict.fromkeys(json_converters, object))
+        if labels is not None:
+            # By position, as pandas gives a column that it renames, such as x.1, the
+            # dtype of the first column with the name, and not its position.
+            dtype.update({i: object for i, label in enumerate(labels) if label in json_converters})
+        else:
+            dtype.update(dict.fromkeys(json_converters, object))
         read_csv_kwargs["dtype"] = dtype
 
     @staticmethod
