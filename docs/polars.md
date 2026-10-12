@@ -11,9 +11,10 @@ This cursor downloads the CSV file after executing the query and loads it into a
 Performance is better than fetching data with Cursor.
 
 PolarsCursor uses [Polars](https://pola.rs/) native reading capabilities (`pl.read_csv`, `pl.read_parquet`) and
-does not require PyArrow as a dependency. CSV results read without the chunksize option use
-PyAthena's own S3FileSystem (fsspec compatible), and other reads use Polars' native S3 access,
-so s3fs is also not required.
+does not require PyArrow as a dependency. CSV results read without the chunksize option, and
+UNLOAD results read with it when pyarrow is installed and `execute()` is given no Polars read
+options, use PyAthena's own S3FileSystem (fsspec compatible), and other reads use Polars' native
+S3 access, so s3fs is also not required.
 
 Options passed to `execute()`, other than PolarsCursor's own options such as `chunksize`, are passed to the Polars read function.
 Column types for a CSV result are given as `schema_overrides`, which replaces PyAthena's column types.
