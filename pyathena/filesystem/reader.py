@@ -13,14 +13,9 @@ import io
 from collections import deque
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor, wait
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from pyathena.util import override
-
-if TYPE_CHECKING:
-    from pyarrow import NativeFile
-
-    from pyathena.filesystem.s3 import S3FileSystem
 
 
 class ReadAheadStream(io.RawIOBase):
@@ -38,7 +33,10 @@ class ReadAheadStream(io.RawIOBase):
     then calls ``on_close``.
 
     Example:
-        >>> stream = ReadAheadStream.from_arrow_file(fs.open_input_file(path))
+        >>> file = fs.open_input_file(path)
+        >>> stream = ReadAheadStream(
+        ...     lambda offset, size: file.read_at(size, offset), file.size(), on_close=file.close
+        ... )
         >>> with pyarrow.PythonFile(stream, mode="r") as f:
         ...     table = pyarrow.csv.read_csv(f)
     """
@@ -74,13 +72,18 @@ class ReadAheadStream(io.RawIOBase):
             ValueError: If ``part_size`` or ``max_parts`` is not positive.
         """
         super().__init__()
-        try:
-            part_size, max_parts = self._resolve_options(part_size, max_parts)
-        except BaseException:
+        part_size = self.DEFAULT_PART_SIZE if part_size is None else part_size
+        max_parts = self.DEFAULT_MAX_PARTS if max_parts is None else max_parts
+        error = None
+        if part_size < 1:
+            error = ValueError(f"part_size must be positive, got {part_size}.")
+        elif max_parts < 1:
+            error = ValueError(f"max_parts must be positive, got {max_parts}.")
+        if error is not None:
             # Closed as io.RawIOBase, so that finalizing the stream does not call
             # close() of this class, nor on_close.
             super().close()
-            raise
+            raise error
         self._read_range = read_range
         self._size = size
         self._part_size = part_size
@@ -92,119 +95,6 @@ class ReadAheadStream(io.RawIOBase):
         self._position = 0
         self._buffer = memoryview(b"")
         self._error: BaseException | None = None
-
-    @classmethod
-    def _resolve_options(cls, part_size: int | None, max_parts: int | None) -> tuple[int, int]:
-        """Apply the defaults to the part size and number of parts, and check them.
-
-        Args:
-            part_size: The given part size, or None for ``DEFAULT_PART_SIZE``.
-            max_parts: The given number of parts, or None for ``DEFAULT_MAX_PARTS``.
-
-        Returns:
-            The part size and the number of parts.
-
-        Raises:
-            ValueError: If either is not positive.
-        """
-        part_size = cls.DEFAULT_PART_SIZE if part_size is None else part_size
-        max_parts = cls.DEFAULT_MAX_PARTS if max_parts is None else max_parts
-        if part_size < 1:
-            raise ValueError(f"part_size must be positive, got {part_size}.")
-        if max_parts < 1:
-            raise ValueError(f"max_parts must be positive, got {max_parts}.")
-        return part_size, max_parts
-
-    @classmethod
-    def from_arrow_file(
-        cls, file: NativeFile, part_size: int | None = None, max_parts: int | None = None
-    ) -> ReadAheadStream:
-        """Read a pyarrow random-access file with ``read_at()``.
-
-        Args:
-            file: The file to read, such as one that
-                ``pyarrow.fs.S3FileSystem.open_input_file()`` opened, whose
-                ``read_at()`` may be called from several threads at once. The
-                stream closes it when closed, or here if the stream cannot be
-                created.
-            part_size: Bytes requested by one ``read_at()`` call; if None,
-                ``DEFAULT_PART_SIZE``.
-            max_parts: The most parts read ahead at once; if None,
-                ``DEFAULT_MAX_PARTS``.
-
-        Returns:
-            The stream over the file.
-        """
-        try:
-            return cls(
-                lambda offset, size: file.read_at(size, offset),
-                file.size(),
-                part_size,
-                max_parts,
-                file.close,
-            )
-        except BaseException:
-            file.close()
-            raise
-
-    @classmethod
-    def from_s3(
-        cls,
-        fs: S3FileSystem,
-        path: str,
-        part_size: int | None = None,
-        max_parts: int | None = None,
-        **kwargs: Any,
-    ) -> ReadAheadStream:
-        """Read an S3 object through PyAthena's S3 filesystem.
-
-        The object is opened with ``fs.open()``, which looks it up once, and its
-        parts are read with GetObject requests of the opened file: a version or
-        ETag observed when opening, and the request parameters given in
-        ``kwargs``, apply to every part.
-
-        Args:
-            fs: The filesystem that opens the object.
-            path: The S3 path (s3://bucket/key) of the object.
-            part_size: Bytes requested by one GetObject request; if None,
-                ``DEFAULT_PART_SIZE``.
-            max_parts: The most parts read ahead at once; if None,
-                ``DEFAULT_MAX_PARTS``.
-            **kwargs: Additional arguments passed to ``fs.open()``, such as
-                ``version_id`` or ``s3_additional_kwargs``. Unless ``max_workers``
-                is given, the file is opened with ``max_workers=1``, so that each
-                part is read with one GetObject request. The file is opened without
-                a cache, whatever ``cache_type`` and ``cache_options`` are given.
-
-        Returns:
-            The stream over the object.
-
-        Raises:
-            FileNotFoundError: If the object does not exist.
-            ValueError: If ``part_size`` or ``max_parts`` is not positive; the
-                object is not opened then.
-        """
-        part_size, max_parts = cls._resolve_options(part_size, max_parts)
-        if kwargs.get("max_workers") is None:
-            # Each part is read with one request, not split into parallel ones on
-            # a thread pool of the file.
-            kwargs["max_workers"] = 1
-        # The parts bypass the cache of the file, which would only add reads, such
-        # as the whole object that the "all" cache reads when the file is opened.
-        kwargs["cache_type"] = "none"
-        kwargs.pop("cache_options", None)
-        file = fs.open(path, "rb", **kwargs)
-        try:
-            return cls(
-                lambda offset, size: file._fetch_range(offset, offset + size),
-                file.size,
-                part_size,
-                max_parts,
-                file.close,
-            )
-        except BaseException:
-            file.close()
-            raise
 
     @override
     def readable(self) -> bool:

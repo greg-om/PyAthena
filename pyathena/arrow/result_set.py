@@ -244,7 +244,14 @@ class AthenaArrowResultSet(AthenaResultSet):
         """
         import pyarrow as pa
 
-        stream = ReadAheadStream.from_arrow_file(self._fs.open_input_file(location))
+        file = self._fs.open_input_file(location)
+        try:
+            stream = ReadAheadStream(
+                lambda offset, size: file.read_at(size, offset), file.size(), on_close=file.close
+            )
+        except BaseException:
+            file.close()
+            raise
         return pa.PythonFile(stream, mode="r")
 
     def _read_csv(self) -> Table:
