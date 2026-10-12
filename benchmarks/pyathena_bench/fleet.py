@@ -1024,6 +1024,9 @@ def run_attempt(
                 queue.s3.upload_file(
                     str(job_dir / name), queue.bucket, queue.key("results", job["id"], name)
                 )
+        if time.time() >= claim.body["expires"]:
+            # Publication outlasted the renewed claim, which another worker may own now.
+            return Outcome("lost")
         # The first done marker of a job is never replaced.
         recorded = queue.put_lease(
             queue.key("done", job["id"]),
@@ -1129,7 +1132,11 @@ def work(
             # over when it expires.
             if all(
                 lease.body.get("renewed") is None
-                or (lease.body["renewed"] != waiting[job_id] and not lease.stale(at))
+                or (
+                    lease.body["renewed"] != waiting[job_id]
+                    and not lease.stale(at)
+                    and not lease.takeable(at)
+                )
                 for job_id, lease in running.items()
             ):
                 return completed

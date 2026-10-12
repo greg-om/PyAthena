@@ -759,6 +759,14 @@ class TestInterruption:
 
         settled = []
         runs = []
+        writes = []
+        original_put = s3.put_object
+
+        def recording_put(**kwargs):
+            writes.append(kwargs["Key"])
+            return original_put(**kwargs)
+
+        s3.put_object = recording_put
 
         def resumed_runner(item, workdir, out, resume, stop):
             runs.append((item["id"], out.name, [p.name for p in resume]))
@@ -781,6 +789,9 @@ class TestInterruption:
         assert runs == [("heavy", "attempt-2", ["attempt-1"]), ("next", "attempt-1", [])]
         # The interrupted attempt's queries are quiesced before the job continues.
         assert settled == ["attempt-1"]
+        order = [key for key in writes if key.endswith(("heavy/summary.csv", "done/heavy"))]
+        # A recorded job always has its summary.
+        assert order == [queue.key("results", "heavy", "summary.csv"), queue.key("done", "heavy")]
         summary = s3.objects[queue.key("results", "heavy", "summary.csv")].decode()
         row = next(csv.DictReader(io.StringIO(summary)))
         assert (row["successful_trials"], row["failed_trials"]) == ("3", "0")
@@ -1012,15 +1023,21 @@ class TestLeaseExpiry:
 
         def stall(lease, seconds, **changes):
             stalled.set()
-            assert released.wait(5)
+            released.wait()
             return False
 
         queue.renew = stall
-        with JobWatch(queue, [claim], 600, 0.01, lambda: None, lambda: False) as watch:
-            assert stalled.wait(5)
-            # The claim expires while its renewal is still blocked in S3.
-            assert watch.stop_requested.wait(5)
-            assert not watch.interrupted.is_set()
+        watch = JobWatch(queue, [claim], 600, 0.01, lambda: None, lambda: False)
+        try:
+            with watch:
+                assert stalled.wait(5)
+                # The claim expires while its renewal is still blocked in S3.
+                assert watch.stop_requested.wait(5)
+                assert not watch.interrupted.is_set()
+                assert stalled.is_set()
+                assert not watch.lost
+                released.set()
+        finally:
             released.set()
 
     def test_losing_a_slot_does_not_stop_the_job(self, tmp_path):
