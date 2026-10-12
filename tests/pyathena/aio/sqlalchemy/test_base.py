@@ -37,6 +37,25 @@ class TestAsyncAdaptPyathenaCursor:
         assert len(closes) == 1
         assert closes[0] != threading.get_ident()
 
+    @pytest.mark.parametrize(
+        "error",
+        [ValueError("conversion failed"), asyncio.CancelledError()],
+        ids=["error", "cancel"],
+    )
+    async def test_execute_keeps_fetch_error_when_close_fails(self, error, caplog):
+        cursor = MagicMock()
+        cursor.execute = AsyncMock(return_value=cursor)
+        cursor.description = [("col", "varchar", None, None, None, None, None)]
+        cursor.fetchall = AsyncMock(side_effect=error)
+        cursor.close.side_effect = ValueError("generator already executing")
+        adapted = AsyncAdapt_pyathena_cursor(cursor)
+
+        with pytest.raises(type(error)) as raised:
+            await greenlet_spawn(adapted.execute, "SELECT 1")
+
+        assert raised.value is error
+        assert "Failed to close the cursor after a failed fetch." in caplog.text
+
 
 class TestAsyncSQLAlchemyAthena:
     @pytest.mark.parametrize(
