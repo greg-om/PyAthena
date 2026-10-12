@@ -37,7 +37,7 @@ Parameters:
   InstanceType:
     Type: String
     Default: r7i.2xlarge
-    AllowedValues: [r7i.large, r7i.xlarge, r7i.2xlarge, r7i.4xlarge, r7i.8xlarge, r7g.large, r7g.xlarge, r7g.2xlarge, r7g.4xlarge, r7g.8xlarge, r8g.large, r8g.xlarge, r8g.2xlarge, r8g.4xlarge, r8g.8xlarge]
+    AllowedValues: [r7i.large, r7i.xlarge, r7i.2xlarge, r7i.4xlarge, r7i.8xlarge, r7g.large, r7g.xlarge, r7g.2xlarge, r7g.4xlarge, r7g.8xlarge, r8g.large, r8g.xlarge, r8g.2xlarge, r8g.4xlarge, r8g.8xlarge, c8gn.2xlarge]
   VolumeSize:
     Type: Number
     Default: 100
@@ -108,8 +108,8 @@ Rules:
   Arm64InstanceType:
     RuleCondition: !Equals [!Ref Architecture, arm64]
     Assertions:
-      - Assert: !Contains [[r7g.large, r7g.xlarge, r7g.2xlarge, r7g.4xlarge, r7g.8xlarge, r8g.large, r8g.xlarge, r8g.2xlarge, r8g.4xlarge, r8g.8xlarge], !Ref InstanceType]
-        AssertDescription: Use an r7g or r8g instance type with the arm64 architecture.
+      - Assert: !Contains [[r7g.large, r7g.xlarge, r7g.2xlarge, r7g.4xlarge, r7g.8xlarge, r8g.large, r8g.xlarge, r8g.2xlarge, r8g.4xlarge, r8g.8xlarge, c8gn.2xlarge], !Ref InstanceType]
+        AssertDescription: Use an r7g, r8g, or c8gn instance type with the arm64 architecture.
 
 Conditions:
   IsArm64: !Equals [!Ref Architecture, arm64]

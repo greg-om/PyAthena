@@ -70,7 +70,7 @@ def test_architecture_selects_the_image_and_rules_match_instance_families():
     assert families["x86_64"] | families["arm64"] == allowed
     assert not families["x86_64"] & families["arm64"]
     assert all(t.startswith("r7i.") for t in families["x86_64"])
-    assert all(t.startswith(("r7g.", "r8g.")) for t in families["arm64"])
+    assert all(t.startswith(("r7g.", "r8g.", "c8gn.")) for t in families["arm64"])
 
 
 def test_spot_by_default_keeps_one_instance_type_across_three_or_four_zones():
