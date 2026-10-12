@@ -108,7 +108,7 @@ The supplied template assumes ordinary IAM access and SSE-S3 source objects; Lak
 The fleet queues, reports, and Athena trial outputs go to the stack's results location, the `Results` stack output.
 With `ResultsBucket` set to an existing bucket, the results location is `s3://<ResultsBucket>/<ResultsPrefix>/<stack name>/`, and the instance role can write only below it; with `ResultsBucket` empty, the default, it is the scratch bucket.
 Input snapshots, initialization fixtures, and scratch tables stay in the scratch bucket and database either way.
-This repository's CI test bucket, which `AWS_ATHENA_S3_STAGING_DIR` names in CI, expires every object a day after it is written (`cloudformation/github_actions_oidc.yaml`).
+This repository's CI test bucket, which `AWS_ATHENA_S3_STAGING_DIR` names in CI, expires every object one day after it is written, at the following midnight UTC (`cloudformation/github_actions_oidc.yaml`).
 As the results location, it removes leftovers by itself, but reports must be recovered within that day.
 
 The deployment identity needs permission to create these resources and pass the instance role.
@@ -400,7 +400,7 @@ uv run --env-file ../.env --locked aws ssm send-command --targets "Key=tag:aws:a
 A worker claims a job by creating `claims/<job>` with an S3 conditional write, so exactly one host runs each job.
 A claim, like each API slot under `slots/`, is a lease that its worker renews every tenth of `--lease-seconds` (600 by default) while the job runs.
 When a worker dies, its claim and slots expire, and another worker takes them over with a conditional write, so the job and the slots return to the fleet without manual steps.
-Each attempt of a job writes to `results/<job>/attempt-<n>/`, and the worker uploads its trial records at every renewal, so a lost host loses at most the trials of the last minutes.
+Each attempt of a job writes to `results/<job>/attempt-<n>/`, and the worker uploads its trial records at every renewal, so a lost host loses its running trial and at most the records written since the last renewal.
 After a job, the worker uploads the attempt's output directory and its log to `logs/`, writes `results/<job>/summary.csv` and `summary.md` from every attempt, and writes `done/<job>` with the exit code, attempt, host, and times.
 A failed trial stops only its own job; `status` lists jobs with a non-zero exit code, the claims of running jobs, and the slots in use, each with its host, attempt, and whether its lease has expired.
 After a failed job, the worker stops the job's reported queries and every queued or running query in the workgroup that writes under the job's trial output prefixes, which also covers queries whose IDs were never reported before a trial process died.
@@ -411,7 +411,7 @@ Each worker checks instance metadata for a Spot interruption notice (`spot/insta
 On a notice, the worker interrupts the running trial with SIGINT, which cancels the trial's reported queries, uploads the attempt, releases its claim as `interrupted` and its slots, and exits without terminating the host.
 The group replaces the reclaimed instance, and the new host's worker takes over the interrupted claim as the next attempt: it downloads the earlier attempts, quiesces their trials as after a failed job, and runs only the repetitions that they did not record as successful, through `run --resume`.
 The job's summary merges the attempts and leaves out a failed or incomplete trial whose repetition succeeded in a later attempt, so it reports the trials of an uninterrupted run.
-Rebalance recommendations are not acted on; they often precede no interruption, and the notice leaves enough time to stop a trial.
+Rebalance recommendations are not acted on; an interruption does not always follow them, and the notice leaves enough time to stop a trial.
 
 Workers exit when no job is left to claim: every job is done or claimed by a live lease.
 With `--terminate-host`, a worker first suspends the group's `AZRebalance` process, which would otherwise let the group launch a host in one zone and terminate a busy host in another when Spot capacity or retired hosts leave the zones uneven; the process stays suspended until the stack is deleted.
@@ -462,7 +462,7 @@ uv run --env-file ../.env --locked aws autoscaling terminate-instance-in-auto-sc
 ```
 
 The group launches a replacement whose worker continues the job as `attempt-2` and then retires the host.
-The pilot passes when `done/<job>` records `attempt` 2 and exit code 0, `results/<job>/summary.csv` reports six successful trials and no failures, `hosts/` records the replacement with lifecycle `spot`, and the group's desired capacity drops to zero.
+The pilot passes when `done/<job>` records `attempt` 2 and exit code 0, every case in `results/<job>/summary.csv` reports six successful trials and no failures, `hosts/` records the replacement with lifecycle `spot`, and the group's desired capacity drops to zero.
 AWS Fault Injection Service (`aws:ec2:send-spot-instance-interruptions`) sends a real notice instead, but needs its own IAM role and experiment template.
 
 ## Reports and recovery

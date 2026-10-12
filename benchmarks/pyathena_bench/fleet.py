@@ -335,6 +335,29 @@ class Queue:
             raise
         return Lease(key, json.loads(response["Body"].read()), str(response["ETag"]))
 
+    def put_lease(self, key: str, body: dict[str, Any], **condition: str) -> Lease | None:
+        """Write a lease conditionally, recognizing a write that already succeeded.
+
+        When the response to a successful conditional write is lost, the SDK
+        retries it, and the retry fails its condition. An object that holds
+        exactly ``body`` is therefore this worker's own write.
+
+        Args:
+            key: Object key.
+            body: Lease content, unique through its expiry time.
+            **condition: ``IfNoneMatch="*"`` or ``IfMatch=<etag>``.
+
+        Returns:
+            The lease, or None if the condition failed for another writer's object.
+        """
+        etag = self.put(key, body, **condition)
+        if etag is not None:
+            return Lease(key, body, etag)
+        current = self.read_lease(key)
+        if current is not None and current.body == body:
+            return current
+        return None
+
     def acquire(self, key: str, owner: dict[str, Any], lease_seconds: float) -> Lease | None:
         """Take a lease on an object that is absent, expired, or interrupted.
 
@@ -350,16 +373,14 @@ class Queue:
             The lease, or None if another worker holds it.
         """
         body = {**owner, "attempt": 1, "state": "running", "expires": time.time() + lease_seconds}
-        etag = self.put(key, body, IfNoneMatch="*")
-        if etag is None:
-            current = self.read_lease(key)
-            if current is None or not current.takeable(time.time()):
-                return None
-            body["attempt"] = current.body.get("attempt", 1) + 1
-            etag = self.put(key, body, IfMatch=current.etag)
-            if etag is None:
-                return None
-        return Lease(key, body, etag)
+        lease = self.put_lease(key, body, IfNoneMatch="*")
+        if lease is not None:
+            return lease
+        current = self.read_lease(key)
+        if current is None or not current.takeable(time.time()):
+            return None
+        body["attempt"] = current.body.get("attempt", 1) + 1
+        return self.put_lease(key, body, IfMatch=current.etag)
 
     def renew(self, lease: Lease, lease_seconds: float, **changes: Any) -> bool:
         """Extend or update a lease if this worker still holds it.
@@ -373,10 +394,10 @@ class Queue:
             False if another worker took over the lease.
         """
         body = {**lease.body, "expires": time.time() + lease_seconds, **changes}
-        etag = self.put(lease.key, body, IfMatch=lease.etag)
-        if etag is None:
+        written = self.put_lease(lease.key, body, IfMatch=lease.etag)
+        if written is None:
             return False
-        lease.body, lease.etag = body, etag
+        lease.body, lease.etag = written.body, written.etag
         return True
 
     def names(self, folder: str) -> set[str]:

@@ -609,6 +609,29 @@ class TestLeases:
         assert not queue.renew(stale, 600)
         assert queue.read_lease(key).body["host"] == "one"
 
+    @pytest.mark.parametrize("operation", ["create", "takeover", "renew"])
+    def test_a_retried_write_that_already_succeeded_keeps_the_lease(self, tmp_path, operation):
+        s3, queue = queue_with([], tmp_path)
+        key = queue.key("claims", "a")
+        if operation != "create":
+            lease = queue.acquire(key, {"host": "h"}, -1 if operation == "takeover" else 600)
+        original = s3.put_object
+
+        def lost_response(**kwargs):
+            # The first write succeeds, but its response is lost and the SDK retries.
+            original(**kwargs)
+            return original(**kwargs)
+
+        s3.put_object = lost_response
+        if operation == "renew":
+            assert queue.renew(lease, 600)
+            assert queue.read_lease(key).etag == lease.etag
+        else:
+            taken = queue.acquire(key, {"host": "me"}, 600)
+            assert taken.body["host"] == "me"
+            assert taken.body["attempt"] == (1 if operation == "create" else 2)
+            assert queue.read_lease(key).etag == taken.etag
+
     def test_live_claims_are_left_and_expired_ones_return_to_the_fleet(self, tmp_path):
         _, queue = queue_with([job("live"), job("expired")], tmp_path)
         queue.acquire(queue.key("claims", "live"), {"host": "busy"}, 600)
