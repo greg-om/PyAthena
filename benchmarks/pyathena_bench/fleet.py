@@ -803,7 +803,9 @@ class JobWatch:
         exc: BaseException | None,
         traceback: TracebackType | None,
     ) -> None:
-        self.stop()
+        # After a notice or a lost lease, a renewal stuck in S3 must not delay the
+        # release of the slots; a late renewal fails against the changed ETags.
+        self.stop(10 if self.stop_requested.is_set() else None)
 
     def stop(self, timeout: float | None = None) -> None:
         """Stop the threads and wait for them.
