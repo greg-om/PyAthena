@@ -194,6 +194,23 @@ class TestExpandJobs:
         assert heavy == sorted(heavy, reverse=True)
 
 
+class TestExpandJobsFilesystem:
+    def test_one_job_per_api_and_operation_runs_the_worker_and_pool_sweep(self):
+        settings = replace(SETTINGS, filesystem_sizes={"large": 2**30})
+        jobs = expand_jobs(settings, ["filesystem"], ["large"], ["flat", "nested"], Filters())
+        assert len(jobs) == 6
+        assert not any(j["api_heavy"] for j in jobs)
+        job = next(j for j in jobs if j["id"] == "filesystem-large-flat-s3-aio-read-bytes")
+        assert job["args"][:4] == ["--suite", "filesystem", "--scale", "large"]
+        assert job["args"][-4:] == ["--transport", "read", "--output-kind", "bytes"]
+        cases = len(settings.filesystem_max_workers) * len(settings.filesystem_pool_connections)
+        trials = settings.warmups + settings.repetitions
+        assert job["weight"] == 2**30 // 10_000 * cases * trials
+        # A 1 GiB copy is a single CopyObject, so the copy job only records unsupported cases.
+        copy = next(j for j in jobs if j["id"] == "filesystem-large-flat-s3-aio-copy-bytes")
+        assert copy["weight"] == 2**30 // 10_000 * trials
+
+
 class TestExpandJobsArraysize:
     def test_row_output_jobs_keep_one_arraysize_for_every_family(self):
         jobs = expand_jobs(
@@ -476,6 +493,40 @@ class TestCommandLine:
         plan = json.loads(capsys.readouterr().out)
         assert [c["arraysize"] for c in plan["cases"]] == [1000]
         assert plan["trials"] == 1
+
+    def test_filesystem_scales_are_the_object_sizes(self, tmp_path, capsys):
+        config = tmp_path / "config.toml"
+        config.write_text("[scales]\nsmall = 10000\n[filesystem]\nsizes = { large = 1073741824 }\n")
+        argv = ["--config", str(config), "plan", "--suite", "filesystem"]
+        assert main([*argv, "--scale", "large", "--api", "aio", "--transport", "read"]) == 0
+        plan = json.loads(capsys.readouterr().out)
+        assert plan["scales"] == {"large": 2**30}
+        assert {c["id"] for c in plan["cases"]} == {
+            f"filesystem-s3-aio-read-w{w}-p{p}" for w in (8, 40) for p in (10, 40)
+        }
+        assert plan["warnings"] == []
+        with pytest.raises(ValueError, match="Select distinct scales"):
+            main([*argv, "--scale", "small"])
+
+    def test_prepare_uploads_the_selected_filesystem_objects_with_the_manifest(
+        self, tmp_path, monkeypatch
+    ):
+        config = tmp_path / "config.toml"
+        config.write_text("[filesystem]\nsizes = { large = 1073741824 }\n")
+        calls = []
+        monkeypatch.setattr(
+            "pyathena_bench.__main__.prepare",
+            lambda settings, stack, path, scales: calls.append(("prepare", scales)) or {},
+        )
+        monkeypatch.setattr(
+            "pyathena_bench.__main__.prepare_objects",
+            lambda settings, manifest, path, scales: calls.append(("objects", scales)),
+        )
+        argv = ["--config", str(config), "prepare", "--stack", "s", "--manifest", "m.json"]
+        assert main([*argv, "--filesystem-scale", "large"]) == 0
+        assert calls == [("prepare", []), ("objects", ["large"])]
+        with pytest.raises(ValueError, match="Select distinct scales"):
+            main([*argv, "--filesystem-scale", "small"])
 
 
 class TestQueueSafety:

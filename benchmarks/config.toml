@@ -33,3 +33,10 @@ sample_interval = 0.05
 heartbeat_interval = 0.01
 timeout_seconds = 3600.0
 memory_fraction = 0.8
+
+[filesystem]
+# Object sizes in bytes of the filesystem suite, by scale name; copies run only over 5 GiB.
+sizes = { small = 67108864, medium = 268435456, large = 1073741824, xlarge = 6442450944 }
+block_size = 8388608
+max_workers = [8, 40]
+pool_connections = [10, 40]

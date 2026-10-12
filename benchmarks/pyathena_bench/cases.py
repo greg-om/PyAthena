@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 
+from pyathena.filesystem.s3_core import S3Core
 from pyathena_bench.config import Settings
 
 FAMILIES = ("cursor", "dict", "s3fs", "pandas", "arrow", "polars")
@@ -26,7 +27,12 @@ SQLALCHEMY_FAMILIES = {
     "sqla_polars": "polars",
     "sqla_s3fs": "s3fs",
 }
-ALL_FAMILIES = (*FAMILIES, "wrangler", *SQLALCHEMY_FAMILIES)
+# The filesystem suite transfers one S3 object with PyAthena's S3FileSystem (API "sync")
+# or AioS3FileSystem (API "aio"); its transport is the operation.
+FILESYSTEM_FAMILY = "s3"
+FILESYSTEM_OPERATIONS = ("read", "write", "copy")
+ALL_FAMILIES = (*FAMILIES, "wrangler", *SQLALCHEMY_FAMILIES, FILESYSTEM_FAMILY)
+SUITES = ("single", "concurrent", "init", "filesystem")
 SHAPES = ("flat", "nested", "json")
 
 
@@ -44,14 +50,45 @@ class Case:
     unsupported: str | None = None
     # The pandas.read_csv()/read_parquet() dtype_backend given to execute().
     dtype_backend: str | None = None
+    # The filesystem's max_workers and the S3 client's max_pool_connections of the
+    # filesystem suite.
+    max_workers: int | None = None
+    pool_connections: int | None = None
 
     @property
     def id(self) -> str:
+        if self.suite == "filesystem":
+            return (
+                f"{self.suite}-{self.family}-{self.api}-{self.transport}-"
+                f"w{self.max_workers}-p{self.pool_connections}"
+            )
         backend = f"-{self.dtype_backend}" if self.dtype_backend else ""
         return (
             f"{self.suite}-{self.family}-{self.api}-{self.transport}-{self.output}-"
             f"a{self.arraysize}-c{self.chunksize or 0}{backend}-{self.shape}-n{self.concurrency}"
         )
+
+    def unsupported_reason(self, settings: Settings, scale: str) -> str | None:
+        """Return why the case does not run at a scale.
+
+        A copy of an object up to ``S3Core.MULTIPART_UPLOAD_MAX_PART_SIZE`` is
+        a single CopyObject request, which neither ``max_workers`` nor the
+        connection pool affects.
+
+        Args:
+            settings: Configuration with the filesystem suite's object sizes.
+            scale: Scale of the suite.
+
+        Returns:
+            The reason, or None if the case runs.
+        """
+        if (
+            self.suite == "filesystem"
+            and self.transport == "copy"
+            and settings.filesystem_sizes[scale] <= S3Core.MULTIPART_UPLOAD_MAX_PART_SIZE
+        ):
+            return "Objects up to 5 GiB are copied with a single CopyObject request"
+        return self.unsupported
 
 
 def matrix(settings: Settings, suite: str, shape: str) -> list[Case]:
@@ -63,9 +100,13 @@ def matrix(settings: Settings, suite: str, shape: str) -> list[Case]:
     ``json`` type; the initialization suite, which prepares UNLOAD fixtures too,
     has no json cases.
 
+    The ``filesystem`` suite does not query Athena and has no shape; its cases
+    belong to the ``flat`` shape.
+
     Args:
-        settings: Configuration with the arraysizes, chunk sizes, and concurrency.
-        suite: ``single``, ``concurrent``, or ``init``.
+        settings: Configuration with the arraysizes, chunk sizes, and concurrency,
+            and the filesystem suite's max_workers and connection pools.
+        suite: ``single``, ``concurrent``, ``init``, or ``filesystem``.
         shape: ``flat``, ``nested``, or ``json``.
 
     Returns:
@@ -74,8 +115,26 @@ def matrix(settings: Settings, suite: str, shape: str) -> list[Case]:
     Raises:
         ValueError: If the suite or shape is unknown.
     """
-    if suite not in {"single", "concurrent", "init"} or shape not in SHAPES:
+    if suite not in SUITES or shape not in SHAPES:
         raise ValueError("Unknown suite or shape")
+    if suite == "filesystem":
+        if shape != "flat":
+            return []
+        return [
+            Case(
+                FILESYSTEM_FAMILY,
+                api,
+                operation,
+                "bytes",
+                suite=suite,
+                max_workers=workers,
+                pool_connections=pool,
+            )
+            for operation in FILESYSTEM_OPERATIONS
+            for api in ("sync", "aio")
+            for workers in settings.filesystem_max_workers
+            for pool in settings.filesystem_pool_connections
+        ]
     if shape == "json" and suite != "single":
         return []
     cases: list[Case] = []

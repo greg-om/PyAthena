@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import io
 import json
 import re
 import time
@@ -21,6 +22,7 @@ import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
 
+from pyathena.util import parse_output_location
 from pyathena_bench.config import Settings, identifier, select_sql, write_json
 
 
@@ -271,6 +273,10 @@ def validate_manifest(settings: Settings, manifest: dict[str, Any]) -> dict[str,
     for scale, item in manifest["scales"].items():
         if item["table"] != prefix + identifier(scale):
             raise ValueError("Table is outside the manifest namespace")
+    objects = run_locations(actual, manifest["run_id"])["scratch"] + "objects/"
+    for scale, item in manifest.get("objects", {}).items():
+        if not item["location"].startswith(f"{objects}{identifier(scale)}-"):
+            raise ValueError("Object is outside the manifest namespace")
     return actual
 
 
@@ -299,6 +305,93 @@ def prepare_fixtures(
                 "unload_location": unload,
             }
             write_json(path, manifest)
+
+
+class ZeroReader(io.RawIOBase):
+    """A readable stream of a fixed number of zero bytes."""
+
+    def __init__(self, size: int) -> None:
+        """Initialize the stream.
+
+        Args:
+            size: Number of bytes to read before the end of the stream.
+        """
+        self.remaining = size
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buffer: Any) -> int:
+        """Fill the start of a buffer with zero bytes.
+
+        Args:
+            buffer: Writable buffer.
+
+        Returns:
+            The number of bytes filled, 0 at the end of the stream.
+        """
+        view = memoryview(buffer).cast("B")
+        count = min(len(view), self.remaining)
+        view[:count] = bytes(count)
+        self.remaining -= count
+        return count
+
+
+def prepare_objects(
+    settings: Settings, manifest: dict[str, Any], path: Path, scales: list[str]
+) -> None:
+    """Upload the filesystem suite's source objects that the manifest lacks.
+
+    Each object holds the configured number of zero bytes; S3 stores and
+    transfers the bytes uncompressed. It is uploaded with boto3, not with the
+    measured filesystems, below the run's scratch prefix, which ``cleanup``
+    removes, and recorded under ``objects`` in the manifest.
+
+    Args:
+        settings: Configuration with the filesystem sizes.
+        manifest: Prepared manifest, updated in place.
+        path: Manifest file, rewritten after each upload.
+        scales: Filesystem scale names.
+
+    Raises:
+        ValueError: If the manifest was cleaned.
+    """
+    resources = validate_manifest(settings, manifest)
+    if manifest.get("cleaned"):
+        raise ValueError("The manifest's resources were cleaned")
+    objects = manifest.setdefault("objects", {})
+    root = run_locations(resources, manifest["run_id"])["scratch"]
+    s3 = client(session(settings), "s3")
+    for scale in scales:
+        if scale in objects:
+            continue
+        size = settings.filesystem_sizes[scale]
+        location = f"{root}objects/{identifier(scale)}-{uuid.uuid4().hex}"
+        bucket, key = parse_output_location(location)
+        s3.upload_fileobj(ZeroReader(size), bucket, key)
+        if s3.head_object(Bucket=bucket, Key=key)["ContentLength"] != size:
+            raise ValueError(f"Uploaded object for {scale} has an unexpected size")
+        objects[scale] = {"location": location, "size": size}
+        write_json(path, manifest)
+
+
+def validate_objects(settings: Settings, manifest: dict[str, Any], scales: list[str]) -> None:
+    """Check that the filesystem suite's source objects are prepared as configured.
+
+    Args:
+        settings: Configuration with the filesystem sizes.
+        manifest: Manifest with the prepared ``objects``.
+        scales: Filesystem scale names.
+
+    Raises:
+        ValueError: If the manifest was cleaned, an object is missing, or its
+            size differs from the configuration.
+    """
+    objects = manifest.get("objects", {})
+    if manifest.get("cleaned") or any(scale not in objects for scale in scales):
+        raise ValueError("Prepare all requested filesystem objects before running")
+    if any(objects[scale]["size"] != settings.filesystem_sizes[scale] for scale in scales):
+        raise ValueError("Prepared object size differs from current configuration")
 
 
 def validate_inputs(settings: Settings, manifest: dict[str, Any], scales: list[str]) -> None:

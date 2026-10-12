@@ -59,6 +59,12 @@ class Settings:
     heartbeat_interval: float = 0.01
     timeout_seconds: float = 3600
     memory_fraction: float = 0.8
+    # The filesystem suite: object sizes in bytes by scale name, the block size of
+    # reads, writes, and copied parts, and the swept max_workers and S3 connection pools.
+    filesystem_sizes: dict[str, int] = field(default_factory=lambda: {"small": 64 * 2**20})
+    filesystem_block_size: int = 8 * 2**20
+    filesystem_max_workers: list[int] = field(default_factory=lambda: [8, 40])
+    filesystem_pool_connections: list[int] = field(default_factory=lambda: [10, 40])
 
     def __post_init__(self) -> None:
         identifier(self.database)
@@ -86,18 +92,50 @@ class Settings:
                 raise ValueError(f"Invalid {name}")
         if not 0 < self.memory_fraction < 1:
             raise ValueError("memory_fraction must be between zero and one")
+        if not self.filesystem_sizes:
+            raise ValueError("At least one filesystem size is required")
+        for name, size in self.filesystem_sizes.items():
+            identifier(name)
+            if type(size) is not int or size < 1:
+                raise ValueError("Filesystem sizes must be positive integers")
+        # S3's minimum part size, below which a multipart upload cannot complete.
+        if type(self.filesystem_block_size) is not int or self.filesystem_block_size < 5 * 2**20:
+            raise ValueError("filesystem block_size must be at least 5 MiB")
+        # A size up to block_size would be one request instead of parallel ranges or parts.
+        if any(
+            not self.filesystem_block_size < size <= 10_000 * self.filesystem_block_size
+            for size in self.filesystem_sizes.values()
+        ):
+            raise ValueError("Filesystem sizes must take 2 to 10,000 parts of block_size")
+        for name in ("filesystem_max_workers", "filesystem_pool_connections"):
+            values = getattr(self, name)
+            if not values or any(type(v) is not int or v < 1 for v in values):
+                raise ValueError(f"Invalid {name}")
+
+    def suite_scales(self, suite: str | None) -> dict[str, int]:
+        """Return the scales of a suite by name.
+
+        Args:
+            suite: Suite name, or None for the snapshots that ``prepare`` creates.
+
+        Returns:
+            The object sizes in bytes of the ``filesystem`` suite, and the row
+            counts of the snapshots of the other suites.
+        """
+        return self.filesystem_sizes if suite == "filesystem" else self.scales
 
     @classmethod
     def load(cls, path: Path) -> Settings:
         with path.open("rb") as stream:
             data = tomllib.load(stream)
-        if set(data) - {"aws", "source", "scales", "measurement"}:
+        if set(data) - {"aws", "source", "scales", "measurement", "filesystem"}:
             raise ValueError("Unknown configuration section")
         return cls(
             **data.get("aws", {}),
             **data.get("source", {}),
             scales=data.get("scales", {"small": 10000}),
             **data.get("measurement", {}),
+            **{f"filesystem_{k}": v for k, v in data.get("filesystem", {}).items()},
         )
 
 

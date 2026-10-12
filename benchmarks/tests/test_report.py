@@ -62,6 +62,12 @@ def test_summary_preserves_failed_warmup_and_cancellation_reasons():
     assert "Warmup: q: StopQueryExecution denied" in rows[0]["notes"]
 
 
+def test_summary_notes_the_sizes_of_a_size_mismatch():
+    query = {"status": "size_mismatch", "bytes": 9, "expected_bytes": 10, "total_seconds": 1}
+    rows = summarize([{"case_id": "case", "scale": "small", "status": "error", "queries": [query]}])
+    assert rows[0]["notes"] == "size_mismatch: expected 10 B, got 9 B"
+
+
 class TestReport:
     def test_report_recovers_an_interrupted_trial_without_claiming_success(self, tmp_path):
         event = {
@@ -109,6 +115,28 @@ class TestReport:
         assert "Client result (s)" in markdown
         assert "Init (s)" in markdown
         assert "RSS increase (B)" in markdown
+
+    def test_report_shows_the_throughput_of_filesystem_transfers(self, tmp_path):
+        base = {
+            "case_id": "filesystem-s3-sync-read-w8-p10",
+            "scale": "small",
+            "status": "ok",
+            "successful_queries_per_second": 0.5,
+            "rss_peak_bytes": 100,
+            "max_threads": 12,
+        }
+        trials = [
+            {**base, "repetition": r, "queries": [{"bytes": 2**30, "total_seconds": s}]}
+            for r, s in enumerate((2, 4, 8))
+        ]
+        (tmp_path / "trials.jsonl").write_text("".join(json.dumps(t) + "\n" for t in trials))
+        report(tmp_path)
+        row = summarize(trials)[0]
+        assert row["median_mib_per_second"] == 256
+        assert row["peak_threads"] == 12
+        markdown = (tmp_path / "summary.md").read_text()
+        assert "Throughput (MiB/s)" in markdown
+        assert "| 256.0 |" in markdown
 
     def test_report_shows_the_most_output_files_and_the_largest_file(self, tmp_path):
         base = {

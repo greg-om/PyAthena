@@ -9,7 +9,7 @@ SPDX-License-Identifier: MIT
 
 # Cursor benchmarks
 
-This project measures result retrieval, memory use, and concurrent query behavior for PyAthena and AWS SDK for pandas (AWS Wrangler).
+This project measures result retrieval, memory use, and concurrent query behavior for PyAthena and AWS SDK for pandas (AWS Wrangler), and S3 transfers through PyAthena's filesystems.
 It includes a disposable CloudFormation environment and does not run benchmarks in CI.
 Recorded measurements are listed in [RESULTS.md](RESULTS.md); cursor recommendations are pending.
 
@@ -204,6 +204,43 @@ It compares direct synchronous ResultSet construction with `asyncio.to_thread()`
 Construction can include S3 I/O and conversion; the difference is not a measurement of pure scheduler overhead.
 It validates the full row count after construction, outside `init_seconds`.
 
+### Filesystem suite
+
+The filesystem suite transfers one S3 object through PyAthena's `S3FileSystem` (API `sync`) and `AioS3FileSystem` (API `aio`) and does not query Athena.
+Its operations, selected with `--transport`, are:
+
+- `read`: one `read()` of the whole object from a file opened with `block_size`, which reads it as parallel range requests of that size and holds the parts and the joined object, about twice the object's size, in memory;
+- `write`: writes through a file opened with `block_size`, which uploads the object as a multipart upload with parts of that size;
+- `copy`: `cp_file()`, or `_cp_file()` of `AioS3FileSystem`, which copies an object over 5 GiB as a multipart copy with parts of `block_size`; the copies of smaller objects, single CopyObject requests, are recorded as unsupported; the copies exclude tags and annotations, which the generated objects do not have.
+
+Each case sets the filesystem's `max_workers` and the S3 client's `max_pool_connections` through the connection's `s3_config`.
+The `[filesystem]` section of `config.toml` sets the swept values, 8 and 40 workers and pools of 10 and 40 by default, and a `block_size` of 8 MiB.
+The suite's scales are the object sizes in bytes in `[filesystem] sizes`, not the row counts in `[scales]`: 64 MiB (small), 256 MiB (medium), 1 GiB (large), and 6 GiB (xlarge) by default.
+
+The `sync` API calls the filesystem on the trial's thread, and a file's parallel requests run in an `S3ThreadPoolExecutor`.
+The `aio` API runs a read or write in `asyncio.to_thread()`, as `AioS3FSCursor` reads result files, and a file's parallel requests run through `S3AioExecutor` in `asyncio.to_thread()` on the filesystem's event loop, fsspec's IO thread.
+Its copy is a coroutine awaited on the trial's event loop, whose part copies run in `asyncio.to_thread()`.
+Both event loops keep Python's default executor, whose `min(32, os.cpu_count() + 4)` threads bound the parallel requests of the `aio` API.
+
+The source objects, of zero bytes, are uploaded with boto3 below the run's scratch prefix and recorded under `objects` in the manifest.
+`prepare --filesystem-scale` uploads them with the manifest, so that every fleet host reads the same objects.
+Otherwise, `run` uploads the missing objects before its first trial, and a fleet worker uploads them on its host, to its own copy of the manifest.
+Writes and copies go to `trials/<trial>/object` below the scratch prefix.
+`total_seconds` and the event-loop lag cover the transfer; afterwards, the trial checks the size of the data read or of the written or copied object, and deletes the written or copied object.
+`cleanup` removes the source objects and any remaining trial objects, the latter also with `--trials-only`.
+The summary shows the throughput in MiB per second and the peak thread count.
+A manifest for this suite alone needs no snapshot: without `--scale`, `prepare` creates none.
+
+```bash
+uv run --no-sync python -m pyathena_bench prepare \
+  --stack "$BENCHMARK_STACK_ID" --manifest results/input-filesystem.json --filesystem-scale large
+uv run --no-sync python -m pyathena_bench run \
+  --manifest results/input-filesystem.json --out results/filesystem-large \
+  --suite filesystem --scale large
+```
+
+`jobs` reads the scales of the filesystem suite from `[filesystem] sizes`; a `jobs` command that also selects another suite accepts only scale names defined in both tables, so expand the filesystem suite in its own command when its scales differ and combine the job files with `queue --jobs`.
+
 ## Measurement semantics
 
 Each warmup and measured trial runs in a fresh child process, with imports outside the measurement baseline.
@@ -220,7 +257,7 @@ Athena result reuse and library query caches are disabled.
 | `setup_seconds` | Connection and cursor preparation |
 | `execute_seconds` | Public execute call through completion, including waiting for a Future or coroutine |
 | `consume_seconds` | Consumption after execute completes |
-| `total_seconds` | Execute plus full result consumption; excludes connection preparation and cleanup |
+| `total_seconds` | Execute plus full result consumption; excludes connection preparation and cleanup; the transfer in the filesystem suite |
 | `post_completion_setup_seconds` | First observed successful Athena status through result readiness, when available |
 | `init_seconds` | ResultSet construction in the initialization suite |
 | Athena statistics | Server execution, queue time, scanned bytes, and engine version from SDK responses |
@@ -253,6 +290,7 @@ When the temporary directory is a tmpfs, as `/tmp` is on Amazon Linux 2023, file
 | SQLAlchemy (`sqla_*`) | `pandas.read_sql_query()` through an engine of each PyAthena driver, whole or with `chunksize` |
 | Wrangler CSV | Scalar projections and the json workload; nested cases are marked unsupported |
 | Wrangler CTAS and UNLOAD | Full DataFrame or chunks, including nested workloads |
+| S3 filesystem (`s3`) | Read, write, and multipart copy of one object with `S3FileSystem` and `AioS3FileSystem` |
 
 The SQLAlchemy families `sqla_rest`, `sqla_pandas`, `sqla_arrow`, `sqla_polars`, and `sqla_s3fs` read with the synchronous API in the single-query suite only, and the result-file drivers also read UNLOAD results.
 Their engines connect with the same workgroup, output location, polling interval, and disabled result reuse as the cursor cases, their statements run without the client cache (`cache_size` defaults to 0), and their cursors take the same cursor options; with `chunksize`, the pandas and Polars drivers' cursors also read the result file in chunks.

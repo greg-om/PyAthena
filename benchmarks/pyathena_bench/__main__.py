@@ -22,13 +22,14 @@ from pyathena_bench.aws import (
     preflight,
     prepare,
     prepare_fixtures,
+    prepare_objects,
     run_locations,
     session,
     split_location,
     stack_resources,
     validate_manifest,
 )
-from pyathena_bench.cases import ALL_FAMILIES, SHAPES, matrix
+from pyathena_bench.cases import ALL_FAMILIES, FILESYSTEM_OPERATIONS, SHAPES, SUITES, matrix
 from pyathena_bench.config import Settings, read_json
 from pyathena_bench.fleet import (
     API_FAMILIES,
@@ -61,12 +62,22 @@ def parser() -> argparse.ArgumentParser:
     prep = commands.add_parser("prepare", help="Create fixed inputs; incurs Athena and S3 usage")
     prep.add_argument("--stack", required=True)
     prep.add_argument("--manifest", type=Path, required=True)
-    prep.add_argument("--scale", nargs="+", required=True)
+    prep.add_argument(
+        "--scale",
+        nargs="*",
+        default=[],
+        help="Snapshots to create; none for a manifest that only the filesystem suite uses",
+    )
+    prep.add_argument(
+        "--filesystem-scale",
+        nargs="+",
+        default=[],
+        help="Source objects of the filesystem suite to upload, which fleet hosts then share",
+    )
     for name in ("plan", "run", "jobs"):
         command = commands.add_parser(name)
-        suites = ("single", "concurrent", "init")
         if name == "jobs":
-            command.add_argument("--suite", choices=suites, nargs="+", required=True)
+            command.add_argument("--suite", choices=SUITES, nargs="+", required=True)
             command.add_argument("--shape", choices=SHAPES, nargs="+", default=["flat"])
             command.add_argument(
                 "--split-pages",
@@ -75,7 +86,7 @@ def parser() -> argparse.ArgumentParser:
                 "GetQueryResults pages",
             )
         else:
-            command.add_argument("--suite", choices=suites, required=True)
+            command.add_argument("--suite", choices=SUITES, required=True)
             command.add_argument("--shape", choices=SHAPES, default="flat")
         command.add_argument("--warmups", type=int, help="Override the configured warmups")
         command.add_argument("--repetitions", type=int, help="Override the configured repetitions")
@@ -84,8 +95,13 @@ def parser() -> argparse.ArgumentParser:
         command.add_argument(
             "--api", choices=("sync", "thread", "aio", "direct", "to_thread"), nargs="+"
         )
-        command.add_argument("--transport", choices=("csv", "unload", "ctas"), nargs="+")
-        command.add_argument("--output-kind", choices=("rows", "native"))
+        command.add_argument(
+            "--transport",
+            choices=("csv", "unload", "ctas", *FILESYSTEM_OPERATIONS),
+            nargs="+",
+            help="Result transports, or the operations of the filesystem suite",
+        )
+        command.add_argument("--output-kind", choices=("rows", "native", "bytes"))
         command.add_argument("--arraysize", type=int, nargs="+")
         command.add_argument(
             "--chunksize",
@@ -177,12 +193,24 @@ def main(argv: list[str] | None = None) -> int:
     if args.profile:
         settings = replace(settings, profile=args.profile)
     scales = getattr(args, "scale", [])
-    if len(set(scales)) != len(scales) or any(s not in settings.scales for s in scales):
+    suite = getattr(args, "suite", None)
+    # prepare has no suite: --scale names snapshots, --filesystem-scale objects.
+    selections = [
+        (scales, settings.suite_scales(name))
+        for name in (suite if isinstance(suite, list) else [suite])
+    ]
+    selections.append((getattr(args, "filesystem_scale", []), settings.filesystem_sizes))
+    if any(
+        len(set(names)) != len(names) or any(n not in defined for n in names)
+        for names, defined in selections
+    ):
         raise ValueError("Select distinct scales defined in the configuration")
     if args.command == "preflight":
         sys.stdout.write(json.dumps(preflight(settings, args.stack), indent=2) + "\n")
     elif args.command == "prepare":
-        prepare(settings, args.stack, args.manifest, scales)
+        manifest = prepare(settings, args.stack, args.manifest, scales)
+        if args.filesystem_scale:
+            prepare_objects(settings, manifest, args.manifest, args.filesystem_scale)
     elif args.command == "cleanup":
         manifest = read_json(args.manifest)
         resources = validate_manifest(settings, manifest)
@@ -279,9 +307,10 @@ def main(argv: list[str] | None = None) -> int:
             sys.stdout.write(
                 json.dumps(
                     {
-                        "scales": {s: settings.scales[s] for s in scales},
-                        "trials": sum(c.unsupported is None for c in cases)
-                        * len(scales)
+                        "scales": {s: settings.suite_scales(args.suite)[s] for s in scales},
+                        "trials": sum(
+                            c.unsupported_reason(settings, s) is None for c in cases for s in scales
+                        )
                         * (settings.warmups + settings.repetitions),
                         "cases": [{"id": c.id, **asdict(c)} for c in cases],
                         "warnings": [
@@ -289,7 +318,7 @@ def main(argv: list[str] | None = None) -> int:
                             f"{(settings.scales[scale] + page_size - 1) // page_size} "
                             "GetQueryResults pages per query; use a pilot to choose timeout_seconds"
                             for scale in scales
-                            if settings.scales[scale] >= 1_000_000 and page_size
+                            if page_size and settings.scales[scale] >= 1_000_000
                         ],
                     },
                     indent=2,
@@ -302,6 +331,8 @@ def main(argv: list[str] | None = None) -> int:
             manifest = read_json(args.manifest)
             if args.suite == "init":
                 prepare_fixtures(settings, manifest, args.manifest, scales, args.shape)
+            elif args.suite == "filesystem":
+                prepare_objects(settings, manifest, args.manifest, scales)
             checkpoint = (
                 s3_checkpoint(client(session(settings), "s3"), args.checkpoint)
                 if args.checkpoint
