@@ -6,43 +6,16 @@
 # SPDX-License-Identifier: MIT
 
 import os
-import threading
-from concurrent.futures import Future
 
 import pyarrow as pa
-import pyarrow.csv as pa_csv
 import pyarrow.parquet as pq
 import pytest
 from fsspec import AbstractFileSystem
 from fsspec.implementations.local import LocalFileSystem
 from fsspec.spec import AbstractBufferedFile
 
-from pyathena.arrow.reader import ParquetChunkReader, ReadAheadStream
-from tests.pyathena.util import EVENT_TIMEOUT
-
-
-class _ImmediateExecutor:
-    """An executor that runs each call when it is submitted."""
-
-    def __init__(self, max_workers=None):
-        pass
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *args):
-        pass
-
-    def shutdown(self, wait=True, cancel_futures=False):
-        pass
-
-    def submit(self, fn, *args, **kwargs):
-        future = Future()
-        try:
-            future.set_result(fn(*args, **kwargs))
-        except Exception as e:
-            future.set_exception(e)
-        return future
+from pyathena.arrow.reader import ParquetChunkReader
+from tests.pyathena.util import ImmediateExecutor
 
 
 class _RecordingFile(AbstractBufferedFile):
@@ -157,7 +130,7 @@ class TestParquetChunkReader:
 
         monkeypatch.setattr(ParquetChunkReader, "_open", open_)
         # Open ahead at once, so that a file opened ahead is never cancelled.
-        monkeypatch.setattr("pyathena.arrow.reader.ThreadPoolExecutor", _ImmediateExecutor)
+        monkeypatch.setattr("pyathena.arrow.reader.ThreadPoolExecutor", ImmediateExecutor)
         reader = ParquetChunkReader(LocalFileSystem(), paths, 2)
         if corrupt:
             with pytest.raises((OSError, ValueError)):
@@ -179,7 +152,7 @@ class TestParquetChunkReader:
 
         monkeypatch.setattr(ParquetChunkReader, "_open", open_)
         # Open at once, so that an open submitted too early is not cancelled.
-        monkeypatch.setattr("pyathena.arrow.reader.ThreadPoolExecutor", _ImmediateExecutor)
+        monkeypatch.setattr("pyathena.arrow.reader.ThreadPoolExecutor", ImmediateExecutor)
         with pytest.raises(OSError, match="cannot open"):
             next(ParquetChunkReader(LocalFileSystem(), paths, 2))
         assert opened == paths[:1]
@@ -249,127 +222,3 @@ class TestParquetChunkReader:
         assert opened
         assert all(f.closed for f in opened)
         assert list(reader) == []
-
-
-class _RecordingRandomAccessFile:
-    """A random-access file over bytes that records its reads."""
-
-    def __init__(self, data, short=False, error_at=None, gate=None):
-        self._data = data
-        self._short = short
-        self._error_at = error_at
-        self._gate = gate
-        self.gated_read_started = threading.Event()
-        self.reads = []
-        self.closed = False
-
-    def size(self):
-        return len(self._data)
-
-    def read_at(self, nbytes, offset):
-        self.reads.append((offset, nbytes))
-        if self._gate is not None and offset > 0:
-            self.gated_read_started.set()
-            assert self._gate.wait(EVENT_TIMEOUT)
-        if offset == self._error_at:
-            raise OSError("read failed")
-        return self._data[offset : offset + nbytes - (1 if self._short else 0)]
-
-    def close(self):
-        self.closed = True
-
-
-class TestReadAheadStream:
-    """Tests for reading a random-access file sequentially with parallel range reads."""
-
-    @pytest.mark.parametrize("size", [0, 1, 6, 7, 21, 25])
-    @pytest.mark.parametrize("read_size", [1, 5, 7, 100])
-    def test_read(self, size, read_size):
-        data = bytes(range(256))[:size]
-        file = _RecordingRandomAccessFile(data)
-        stream = ReadAheadStream(file, part_size=7, max_parts=2)
-        chunks = []
-        while chunk := stream.read(read_size):
-            # Every read is full except at the end of the file.
-            assert len(chunk) == read_size or sum(map(len, chunks)) + len(chunk) == size
-            chunks.append(chunk)
-        assert b"".join(chunks) == data
-        assert stream.tell() == size
-        assert sorted(file.reads) == [(o, min(7, size - o)) for o in range(0, size, 7)]
-        stream.close()
-        assert file.closed
-
-    def test_parts_in_flight(self, monkeypatch):
-        """At most max_parts parts are requested ahead of the one being consumed."""
-        monkeypatch.setattr("pyathena.arrow.reader.ThreadPoolExecutor", _ImmediateExecutor)
-        file = _RecordingRandomAccessFile(bytes(100))
-        stream = ReadAheadStream(file, part_size=10, max_parts=3)
-        assert file.reads == []
-        assert stream.read(1) == bytes(1)
-        # Three parts were requested, the first is being consumed, and one more follows.
-        assert file.reads == [(0, 10), (10, 10), (20, 10), (30, 10)]
-        assert stream.read(9) == bytes(9)
-        assert len(file.reads) == 4
-        stream.close()
-
-    def test_short_read(self):
-        stream = ReadAheadStream(
-            _RecordingRandomAccessFile(bytes(20), short=True), part_size=10, max_parts=2
-        )
-        with pytest.raises(OSError, match="Read 9 bytes of a range of 10 bytes"):
-            stream.read(20)
-        stream.close()
-
-    def test_read_error(self):
-        """An error is raised by the read that reaches the failed part."""
-        file = _RecordingRandomAccessFile(bytes(30), error_at=10)
-        stream = ReadAheadStream(file, part_size=10, max_parts=2)
-        assert stream.read(10) == bytes(10)
-        with pytest.raises(OSError, match="read failed"):
-            stream.read(10)
-        # A later read does not continue past the failed part.
-        with pytest.raises(OSError, match="read failed"):
-            stream.read(10)
-        stream.close()
-        assert file.closed
-
-    def test_close_before_end(self):
-        """Closing cancels the queued reads and closes the file."""
-        file = _RecordingRandomAccessFile(bytes(1000))
-        stream = ReadAheadStream(file, part_size=10, max_parts=2)
-        assert stream.read(5) == bytes(5)
-        stream.close()
-        assert file.closed
-        assert stream.closed
-        assert len(file.reads) <= 3
-        stream.close()
-
-    def test_close_waits_for_running_reads(self):
-        """Closing waits for the reads in flight before closing the file."""
-        gate = threading.Event()
-        file = _RecordingRandomAccessFile(bytes(100), gate=gate)
-        stream = ReadAheadStream(file, part_size=10, max_parts=2)
-        closer = threading.Thread(target=stream.close)
-        try:
-            assert stream.read(10) == bytes(10)
-            assert file.gated_read_started.wait(EVENT_TIMEOUT)
-            closer.start()
-            closer.join(0.2)
-            # A read of a later part is still blocked, so close() has not returned.
-            assert closer.is_alive()
-            assert not file.closed
-        finally:
-            gate.set()
-            if closer.is_alive():
-                closer.join(EVENT_TIMEOUT)
-        assert file.closed
-
-    def test_csv(self):
-        """pyarrow reads a CSV through the stream with its own block size."""
-        data = b"a,b\n" + b"".join(f"{i},x{i}\n".encode() for i in range(10_000))
-        file = pa.BufferReader(data)
-        read_options = pa_csv.ReadOptions(block_size=4096)
-        with pa.PythonFile(ReadAheadStream(file, 7, 3), mode="r") as source:
-            table = pa_csv.read_csv(source, read_options=read_options)
-        assert table.equals(pa_csv.read_csv(pa.BufferReader(data), read_options=read_options))
-        assert file.closed
