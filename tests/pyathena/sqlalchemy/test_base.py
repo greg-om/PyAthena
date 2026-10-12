@@ -28,7 +28,7 @@ from sqlalchemy.util import PluginLoader
 from pyathena.aio.connection import AioConnection
 from pyathena.aio.cursor import AioCursor
 from pyathena.aio.pandas.cursor import AioPandasCursor
-from pyathena.aio.sqlalchemy.base import AsyncAdapt_pyathena_connection, AthenaAioDialect
+from pyathena.aio.sqlalchemy.base import AthenaAioAdaptedConnection, AthenaAioDialect
 from pyathena.connection import Connection
 from pyathena.cursor import Cursor
 from pyathena.error import DatabaseError, OperationalError
@@ -208,7 +208,7 @@ class TestAthenaDialect:
             cursor_kwargs={"unload": True, "chunksize": 10, "arraysize": 5000},
         )
         driver_connection = (
-            AsyncAdapt_pyathena_connection(MagicMock(), conn)
+            AthenaAioAdaptedConnection(MagicMock(), conn)
             if connection_class is AioConnection
             else conn
         )

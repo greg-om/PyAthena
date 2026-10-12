@@ -199,9 +199,6 @@ ignore-decorators = ["pyathena.util.override"]
 "pyathena/sqlalchemy/compiler.py" = [
     "N802",  # SQLAlchemy TypeCompiler requires visit_UPPERCASE method names
 ]
-"pyathena/aio/sqlalchemy/base.py" = [
-    "N801",  # SQLAlchemy async adapter naming convention (AsyncAdapt_*)
-]
 
 [tool.mypy]
 follow_imports = "silent"

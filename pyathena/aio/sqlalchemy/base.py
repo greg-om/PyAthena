@@ -49,7 +49,7 @@ _logger = logging.getLogger(__name__)
 _ASYNC_CURSOR_CLASSES: dict[Any, Any] = {Cursor: AioCursor}
 
 
-class AsyncAdapt_pyathena_cursor:
+class AthenaAioAdaptedCursor:
     """Wraps any async PyAthena cursor with a sync DBAPI interface.
 
     SQLAlchemy's async engine uses greenlet-based ``await_only()`` to call
@@ -221,24 +221,24 @@ class AsyncAdapt_pyathena_cursor:
         """
         return await_only(self._cursor.list_table_metadata(*args, **kwargs))
 
-    def __enter__(self) -> AsyncAdapt_pyathena_cursor:
+    def __enter__(self) -> AthenaAioAdaptedCursor:
         return self
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         self.close()
 
 
-class AsyncAdapt_pyathena_connection(AdaptedConnection):
+class AthenaAioAdaptedConnection(AdaptedConnection):
     """Wraps ``AioConnection`` with a sync DBAPI interface.
 
     This adapted connection delegates ``cursor()`` to the underlying
     ``AioConnection`` and wraps each returned async cursor with
-    ``AsyncAdapt_pyathena_cursor``.
+    ``AthenaAioAdaptedCursor``.
     """
 
     __slots__ = ("_connection", "dbapi")
 
-    def __init__(self, dbapi: AsyncAdapt_pyathena_dbapi, connection: AioConnection) -> None:
+    def __init__(self, dbapi: AthenaAioAdaptedDBAPI, connection: AioConnection) -> None:
         """Initialize the adapted connection.
 
         Args:
@@ -273,7 +273,7 @@ class AsyncAdapt_pyathena_connection(AdaptedConnection):
         """The retry configuration of the wrapped connection."""
         return self._connection.retry_config  # type: ignore[no-any-return]
 
-    def cursor(self, cursor: Any = None, **kwargs: Any) -> AsyncAdapt_pyathena_cursor:
+    def cursor(self, cursor: Any = None, **kwargs: Any) -> AthenaAioAdaptedCursor:
         """Create an async cursor on the wrapped connection and adapt it.
 
         A synchronous cursor class that has a registered async counterpart is
@@ -286,14 +286,14 @@ class AsyncAdapt_pyathena_connection(AdaptedConnection):
                 ``cursor()``.
 
         Returns:
-            The created cursor wrapped in ``AsyncAdapt_pyathena_cursor``.
+            The created cursor wrapped in ``AthenaAioAdaptedCursor``.
         """
         # The shared dialect names a cursor class in its synchronous form; this
         # connection can only drive the async counterpart.
         raw_cursor = self._connection.cursor(_ASYNC_CURSOR_CLASSES.get(cursor, cursor), **kwargs)
-        return AsyncAdapt_pyathena_cursor(raw_cursor)
+        return AthenaAioAdaptedCursor(raw_cursor)
 
-    def _internal_cursor(self, cursor: Any) -> AsyncAdapt_pyathena_cursor:
+    def _internal_cursor(self, cursor: Any) -> AthenaAioAdaptedCursor:
         """Create a cursor with the wrapped connection's ``_internal_cursor()`` and adapt it.
 
         A synchronous cursor class is replaced as in ``cursor()``.
@@ -302,10 +302,10 @@ class AsyncAdapt_pyathena_connection(AdaptedConnection):
             cursor: The cursor class to create.
 
         Returns:
-            The created cursor wrapped in ``AsyncAdapt_pyathena_cursor``.
+            The created cursor wrapped in ``AthenaAioAdaptedCursor``.
         """
         raw_cursor = self._connection._internal_cursor(_ASYNC_CURSOR_CLASSES.get(cursor, cursor))
-        return AsyncAdapt_pyathena_cursor(raw_cursor)
+        return AthenaAioAdaptedCursor(raw_cursor)
 
     def close(self) -> None:
         """Close the wrapped connection."""
@@ -319,7 +319,7 @@ class AsyncAdapt_pyathena_connection(AdaptedConnection):
         """Do nothing, because Athena does not support transactions."""
 
 
-class AsyncAdapt_pyathena_dbapi:
+class AthenaAioAdaptedDBAPI:
     """Fake DBAPI module for the async SQLAlchemy engine.
 
     SQLAlchemy expects ``import_dbapi()`` to return a module-like object
@@ -344,17 +344,17 @@ class AsyncAdapt_pyathena_dbapi:
     DataError = DataError
     NotSupportedError = NotSupportedError
 
-    def connect(self, **kwargs: Any) -> AsyncAdapt_pyathena_connection:
+    def connect(self, **kwargs: Any) -> AthenaAioAdaptedConnection:
         """Create an ``AioConnection`` and wrap it in an adapted connection.
 
         Args:
             **kwargs: Keyword arguments forwarded to ``AioConnection.create()``.
 
         Returns:
-            The new connection wrapped in ``AsyncAdapt_pyathena_connection``.
+            The new connection wrapped in ``AthenaAioAdaptedConnection``.
         """
         connection = await_only(AioConnection.create(**kwargs))
-        return AsyncAdapt_pyathena_connection(self, connection)
+        return AthenaAioAdaptedConnection(self, connection)
 
 
 class AthenaAioDialect(AthenaDialect):
@@ -384,12 +384,12 @@ class AthenaAioDialect(AthenaDialect):
     @classmethod
     @override
     def import_dbapi(cls) -> ModuleType:
-        return AsyncAdapt_pyathena_dbapi()  # type: ignore[return-value]
+        return AthenaAioAdaptedDBAPI()  # type: ignore[return-value]
 
     @classmethod
     @override
     def dbapi(cls) -> ModuleType:  # type: ignore[override]
-        return AsyncAdapt_pyathena_dbapi()  # type: ignore[return-value]
+        return AthenaAioAdaptedDBAPI()  # type: ignore[return-value]
 
     @override
     def create_connect_args(self, url: URL) -> tuple[tuple[str], MutableMapping[str, Any]]:
