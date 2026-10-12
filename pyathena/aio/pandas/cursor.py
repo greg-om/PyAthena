@@ -84,10 +84,11 @@ class AioPandasCursor(WithAsyncFetch):
             chunksize: Number of rows per DataFrame chunk when reading CSV results. If set,
                 it takes precedence over ``auto_optimize_chunksize``.
             block_size: Default block size of the S3 filesystem that reads the results.
-            cache_type: Default cache type of the S3 filesystem that reads the results. Without
-                ``block_size`` or ``cache_type``, a CSV result file is read in 32 MiB blocks with
-                fsspec's background cache, which reads the next block while pandas parses the
-                current one.
+            cache_type: The default fsspec cache type of the S3 filesystem that reads the results,
+                such as ``"none"``, ``"bytes"``, ``"readahead"``, ``"blockcache"``, or
+                ``"background"``; see ``S3FileSystem``. Without ``block_size`` or ``cache_type``, a
+                CSV result file is read in 32 MiB blocks with fsspec's background cache, which reads
+                the next block while pandas parses the current one.
                 Without ``cache_type``, PyAthena's filesystem reads a Parquet file of a chunked
                 UNLOAD result that is larger than 32 MiB without a cache.
             s3_max_workers: Maximum number of workers of the S3 filesystem.

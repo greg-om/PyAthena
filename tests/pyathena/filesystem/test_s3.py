@@ -3385,6 +3385,23 @@ class TestS3FileSystem:
             assert f.read(size) == data[offset:]
             assert f.read(size) == b""
 
+    @pytest.mark.parametrize(
+        "cache_type", ["none", "bytes", "readahead", "blockcache", "background"]
+    )
+    def test_read_with_cache_type(self, cache_type):
+        # The cache types named in the documentation read the object across
+        # blocks, also after seeking back.
+        data = bytes(range(256)) * 2
+        fs, _ = self._make_object_fs(data)
+
+        with fs.open("s3://bucket/key", "rb", cache_type=cache_type, block_size=16) as f:
+            assert f.cache.name == cache_type
+            assert f.read(10) == data[:10]
+            assert f.read(40) == data[10:50]
+            f.seek(5)
+            assert f.read(20) == data[5:25]
+            assert f.read() == data[25:]
+
     def test_read_parallel_ranges_in_order(self):
         # The ranges of a parallel read are joined in their order, also when
         # the first range finishes last.

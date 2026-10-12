@@ -248,6 +248,14 @@ Pass the class through `csv_reader` in the cursor constructor or an individual `
 
 The reader is used only for result files; managed query results are read through the Athena API.
 
+(s3fs-s3-read-options)=
+
+### S3 read options
+
+S3FSCursor reads a CSV result file in 32 MiB blocks with the `"background"` {ref}`fsspec cache <filesystem-read-caching>`, which reads the next block while rows are converted and keeps two blocks.
+With `block_size` given to `execute()`, the file is read in blocks of that size with the `"bytes"` cache.
+A `filesystem_class` other than PyAthena's `S3FileSystem` and `AioS3FileSystem`, including a subclass, reads the file with its own default cache type.
+
 ### Limitations
 
 S3FSCursor has some limitations compared to ArrowCursor or PandasCursor:
