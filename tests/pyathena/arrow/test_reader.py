@@ -39,8 +39,8 @@ class _ImmediateExecutor:
         return future
 
 
-class _CountingFile(AbstractBufferedFile):
-    """A local file read through fsspec's caches, counting the bytes it fetches."""
+class _RecordingFile(AbstractBufferedFile):
+    """A local file read through fsspec's caches, recording the ranges it fetches."""
 
     def __init__(self, fs, path, **kwargs):
         with open(path, "rb") as f:
@@ -48,27 +48,27 @@ class _CountingFile(AbstractBufferedFile):
         super().__init__(fs, path, size=len(self.data), **kwargs)
 
     def _fetch_range(self, start, end):
-        data = self.data[start:end]
-        self.fs.fetched += len(data)
-        return data
+        end = min(end, len(self.data))
+        self.fs.fetched.append((start, end))
+        return self.data[start:end]
 
 
-class _CountingFileSystem(AbstractFileSystem):
+class _RecordingFileSystem(AbstractFileSystem):
     """Local files opened as buffered files, like ``S3File``, with a "bytes" cache by default."""
 
-    # A new instance for every test, so that its count starts at zero.
+    # A new instance for every test, so that its record starts empty.
     cachable = False
 
     def __init__(self, block_size):
         super().__init__()
         self.block_size = block_size
-        self.fetched = 0
+        self.fetched = []
 
     def size(self, path):
         return os.path.getsize(path)
 
     def _open(self, path, mode="rb", block_size=None, cache_type="bytes", **kwargs):
-        return _CountingFile(
+        return _RecordingFile(
             self, path, block_size=block_size or self.block_size, cache_type=cache_type, **kwargs
         )
 
@@ -179,27 +179,44 @@ class TestParquetChunkReader:
         assert opened == paths[:1]
 
     @pytest.mark.parametrize("cache_type", [None, "bytes"], ids=["default", "bytes"])
-    def test_streamed_file_bytes(self, tmp_path, monkeypatch, cache_type):
-        """A streamed file is read without read-ahead unless a cache type is given.
+    def test_streamed_file_row_groups(self, tmp_path, monkeypatch, cache_type):
+        """A streamed file is read one pre-buffered row group at a time, when needed.
 
-        Read-ahead around pyarrow's reads of column chunks, in pieces of at most
-        ``BUFFER_SIZE`` bytes, is largely discarded or fetched again.
+        With the default cache, each row group is fetched as one range of exactly its
+        column chunks; a given cache type adds its read-ahead to each range.
         """
         monkeypatch.setattr(ParquetChunkReader, "MAX_PREFETCH_SIZE", -1)
-        monkeypatch.setattr(ParquetChunkReader, "BUFFER_SIZE", 64 * 2**10)
-        path = tmp_path / "wide.parquet"
-        # Incompressible column chunks of about 256 KiB, larger than BUFFER_SIZE.
-        columns = {f"c{i}": pa.array([os.urandom(1024) for _ in range(256)]) for i in range(3)}
-        pq.write_table(pa.table(columns), path, compression="none")
-        size = path.stat().st_size
-        fs = _CountingFileSystem(block_size=32 * 2**10)
-        with ParquetChunkReader(fs, [str(path)], 64, cache_type=cache_type) as reader:
-            assert sum(table.num_rows for table in reader) == 256
+        path = tmp_path / "groups.parquet"
+        columns = {f"c{i}": pa.array([os.urandom(256) for _ in range(300)]) for i in range(3)}
+        pq.write_table(pa.table(columns), path, compression="none", row_group_size=100)
+        metadata = pq.read_metadata(path)
+        spans = []
+        for index in range(metadata.num_row_groups):
+            chunks = [metadata.row_group(index).column(c) for c in range(metadata.num_columns)]
+            starts = [c.dictionary_page_offset or c.data_page_offset for c in chunks]
+            spans.append(
+                (
+                    min(starts),
+                    max(s + c.total_compressed_size for s, c in zip(starts, chunks, strict=True)),
+                )
+            )
+        assert len(spans) == 3
+        fs = _RecordingFileSystem(block_size=32 * 2**10)
+        with ParquetChunkReader(fs, [str(path)], 50, cache_type=cache_type) as reader:
+            assert next(reader).num_rows == 50
+            # The first fetch reads the footer; the first chunk needs the first row group.
+            first = fs.fetched[1:]
+            assert sum(table.num_rows for table in reader) == 250
+        ranges = fs.fetched[1:]
         if cache_type is None:
-            # Only pyarrow's footer read, the last 64 KiB, overlaps the column chunks.
-            assert fs.fetched <= size + 64 * 2**10
+            assert first == spans[:1]
+            assert ranges == spans
         else:
-            assert fs.fetched > 1.2 * size
+            assert [start for start, _ in ranges] == [start for start, _ in spans]
+            assert all(
+                end > span_end
+                for (_, end), (_, span_end) in zip(ranges[:2], spans[:2], strict=True)
+            )
 
     def test_no_files(self):
         assert list(ParquetChunkReader(LocalFileSystem(), [], 4)) == []

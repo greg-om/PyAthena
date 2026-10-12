@@ -809,7 +809,8 @@ class AthenaPolarsResultSet(AthenaResultSet):
         Without read options given to ``execute()``, and with pyarrow installed, the
         files of the data manifest are read one at a time through PyAthena's
         filesystem with ``ParquetChunkReader``, so that memory use depends on the
-        chunk size rather than on the row groups of the files. Otherwise Polars scans
+        chunk size and on the row group being read, not on the size of the result.
+        Otherwise Polars scans
         the unload location with the given options, decoding whole row groups ahead
         of the chunks it returns.
 

@@ -25,21 +25,20 @@ if TYPE_CHECKING:
 class ParquetChunkReader(abc.Iterator):  # type: ignore[type-arg]
     """Iterator over Parquet files as Arrow tables of a fixed number of rows.
 
-    The files are decoded one at a time, in the given order, with
-    ``pyarrow.parquet.ParquetFile.iter_batches()``, without pre-buffering the row
-    groups. Memory use therefore depends on the chunk size and the column chunks
-    being decoded, not on the size of the result or its row groups. Every table
-    has ``chunksize`` rows except the last, which has the remaining rows; rows
-    carry over from one file to the next.
+    The files are decoded one at a time, in the given order, one row group at a
+    time, with ``pyarrow.parquet.ParquetFile.iter_batches()``. Memory use
+    therefore depends on the chunk size and on one row group of the file being
+    read, not on the size of the result. Every table has ``chunksize`` rows except
+    the last, which has the remaining rows; rows carry over from one row group and
+    file to the next.
 
     A file of at most ``MAX_PREFETCH_SIZE`` bytes is read whole with one
     ``cat_file()`` call, and the next file is read in a background thread while
-    the current one is decoded. Larger files are read in ``BUFFER_SIZE`` pieces
-    through ``open()``, by default without the filesystem's read-ahead cache:
-    pyarrow reads the column chunks in pieces of at most ``BUFFER_SIZE`` bytes, in
-    the order it decodes them, and read-ahead around those reads is largely
-    discarded or fetched again. Pre-buffering, which would read the pieces
-    together, would hold a whole row group in memory.
+    the current one is decoded. A larger file is opened with ``open()``, by default
+    without the filesystem's read-ahead cache, and the column chunks of each row
+    group are pre-buffered: pyarrow reads them in large coalesced ranges, which
+    PyAthena's filesystem splits into parallel requests, and holds them until the
+    row group is decoded.
 
     The files must have the same schema, as the files of one UNLOAD query do.
 
@@ -51,8 +50,6 @@ class ParquetChunkReader(abc.Iterator):  # type: ignore[type-arg]
         ...         process(table)
     """
 
-    #: Bytes that pyarrow reads at once from a column chunk of a larger file.
-    BUFFER_SIZE: int = 8 * 2**20
     #: The largest file that is read whole, ahead of decoding.
     MAX_PREFETCH_SIZE: int = 32 * 2**20
 
@@ -73,7 +70,7 @@ class ParquetChunkReader(abc.Iterator):  # type: ignore[type-arg]
             columns: The names of the top-level columns to read; all columns if None.
             cache_type: The fsspec cache type that opens a file larger than
                 ``MAX_PREFETCH_SIZE``. If None, ``"none"``, which reads only the
-                bytes that pyarrow requests.
+                ranges that pyarrow requests.
 
         Raises:
             ValueError: If ``chunksize`` is not positive or ``columns`` is empty.
@@ -167,16 +164,20 @@ class ParquetChunkReader(abc.Iterator):  # type: ignore[type-arg]
         """
         import pyarrow.parquet as pq
 
-        parquet_file = pq.ParquetFile(source, pre_buffer=False, buffer_size=self.BUFFER_SIZE)
+        parquet_file = pq.ParquetFile(source, pre_buffer=True)
         if self._columns is not None and (
             missing := set(self._columns) - set(parquet_file.schema_arrow.names)
         ):
             # pyarrow would select nested fields by dotted paths, or no column, whose
             # tables keep their rows when sliced.
             raise ValueError(f"No top-level columns {sorted(missing)}.")
-        for batch in parquet_file.iter_batches(batch_size=self._chunksize, columns=self._columns):
-            if batch.num_rows:
-                yield batch
+        for row_group in range(parquet_file.num_row_groups):
+            # One row group at a time, so that only its column chunks are pre-buffered.
+            for batch in parquet_file.iter_batches(
+                batch_size=self._chunksize, row_groups=[row_group], columns=self._columns
+            ):
+                if batch.num_rows:
+                    yield batch
 
     def _open_files(self) -> Generator[Any]:
         """Open the files in order, each next file in a background thread.
