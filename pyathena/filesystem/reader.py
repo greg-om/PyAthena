@@ -74,16 +74,13 @@ class ReadAheadStream(io.RawIOBase):
         super().__init__()
         part_size = self.DEFAULT_PART_SIZE if part_size is None else part_size
         max_parts = self.DEFAULT_MAX_PARTS if max_parts is None else max_parts
-        error = None
-        if part_size < 1:
-            error = ValueError(f"part_size must be positive, got {part_size}.")
-        elif max_parts < 1:
-            error = ValueError(f"max_parts must be positive, got {max_parts}.")
-        if error is not None:
+        if part_size < 1 or max_parts < 1:
             # Closed as io.RawIOBase, so that finalizing the stream does not call
             # close() of this class, nor on_close.
             super().close()
-            raise error
+            if part_size < 1:
+                raise ValueError(f"part_size must be positive, got {part_size}.")
+            raise ValueError(f"max_parts must be positive, got {max_parts}.")
         self._read_range = read_range
         self._size = size
         self._part_size = part_size
@@ -95,6 +92,7 @@ class ReadAheadStream(io.RawIOBase):
         self._position = 0
         self._buffer = memoryview(b"")
         self._error: BaseException | None = None
+        self._closing = False
 
     @override
     def readable(self) -> bool:
@@ -116,9 +114,9 @@ class ReadAheadStream(io.RawIOBase):
             the end of the file.
 
         Raises:
-            ValueError: If the stream is closed.
+            ValueError: If the stream is closed, or its closing was interrupted.
         """
-        if self.closed:
+        if self.closed or self._closing:
             raise ValueError("I/O operation on closed file.")
         view = memoryview(buffer).cast("B")
         filled = 0
@@ -138,10 +136,11 @@ class ReadAheadStream(io.RawIOBase):
 
         If the wait is interrupted, the stream stays open and ``on_close`` is not
         called, so that the file is not closed under the running reads; closing
-        again waits for them.
+        again waits for them. Reads raise ``ValueError`` from then on.
         """
         if self.closed:
             return
+        self._closing = True
         self._executor.shutdown(wait=False, cancel_futures=True)
         # The running reads are awaited by their futures, not by joining the threads,
         # which an interrupt can leave marked as finished on Python 3.11. The

@@ -159,13 +159,12 @@ class TestParquetChunkReader:
             next(ParquetChunkReader(LocalFileSystem(), paths, 2))
         assert opened == paths[:1]
 
-    def test_prefetched_file(self, paths, monkeypatch):
-        """A file read whole is opened without a cache, in blocks of PREFETCH_PART_SIZE."""
-        monkeypatch.setattr(ParquetChunkReader, "PREFETCH_PART_SIZE", 64)
+    def test_prefetched_file(self, paths):
+        """A file read whole is opened without a cache, in the filesystem's block size."""
         fs = _RecordingFileSystem(block_size=32 * 2**10)
         with ParquetChunkReader(fs, paths[2:], 10) as reader:
             assert next(reader).num_rows == 7
-        assert fs.opened == [(64, "none")]
+        assert fs.opened == [(None, "none")]
         # One read of exactly the file, which PyAthena's filesystem splits into blocks.
         assert fs.fetched == [(0, os.path.getsize(paths[2]))]
 

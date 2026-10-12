@@ -223,6 +223,9 @@ class TestReadAheadStream:
                 stream.close()
             assert not file.closed
             assert not stream.closed
+            # The stream reads nothing more once closing started.
+            with pytest.raises(ValueError, match="I/O operation on closed file"):
+                stream.read(10)
             closer.start()
             closer.join(0.2)
             # A read of a later part is still blocked, so the retried close has not
