@@ -239,7 +239,8 @@ uv run --no-sync python -m pyathena_bench run \
   --suite filesystem --scale large
 ```
 
-The transfers are bounded by the host's sustained network bandwidth: 3.75 Gbps on `r7g.2xlarge` and 25 Gbps on `c8gn.2xlarge`, both with 8 vCPUs, so that the default executor of an event loop has 12 threads on either.
+Reads and writes are bounded by the host's sustained network bandwidth: 3.75 Gbps on `r7g.2xlarge` and 25 Gbps on `c8gn.2xlarge`, both with 8 vCPUs, so that the default executor of an event loop has 12 threads on either.
+Copies are not: their UploadPartCopy requests name the source range, and S3 copies the bytes.
 `c8gn.2xlarge` has 16 GiB of memory, in which the 6 GiB read, holding about twice the object, leaves no margin below the default RSS limit; on it, select reads and writes up to large, where copies are unsupported, and writes and copies at xlarge:
 
 ```bash
