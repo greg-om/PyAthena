@@ -1009,7 +1009,10 @@ def run_attempt(
         except Exception as exc:
             # A job without trials, or with unreadable records, still gets its done marker.
             report_error = f"{type(exc).__name__}: {exc}"
-        if claim.key in watch.lost:
+        if claim.key in watch.lost or (
+            watch.stop_requested.is_set() and not watch.interrupted.is_set()
+        ):
+            # The claim was taken over or expired while the job was settled or reported.
             return Outcome("lost")
         # The first done marker wins, so a worker that lost the claim unnoticed
         # cannot replace the outcome that the claim's new owner recorded.
