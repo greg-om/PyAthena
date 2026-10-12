@@ -1037,8 +1037,12 @@ class AthenaPandasResultSet(AthenaResultSet):
         dtype.update(renamed_dtypes)
         if labels is not None:
             # By position, as pandas gives a column that it renames, such as x.1, the
-            # dtype of the first column with the name, and not its position.
-            dtype.update({i: object for i, label in enumerate(labels) if label in json_converters})
+            # dtype of the first column with the name, and not its position. pandas
+            # prefers a dtype keyed by name, which a converter used to override.
+            for i, label in enumerate(labels):
+                if label in json_converters:
+                    dtype.pop(label, None)
+                    dtype[i] = object
         else:
             dtype.update(dict.fromkeys(json_converters, object))
         read_csv_kwargs["dtype"] = dtype

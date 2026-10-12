@@ -628,14 +628,16 @@ def test_read_csv_json_multi_index_level():
             id="defaultdict",
         ),
         pytest.param("str", {"n": "str", 1: object}, id="scalar"),
+        pytest.param({"n": "int32", "j": "Int64"}, {"n": "int32", 1: object}, id="json-column"),
     ],
 )
 def test_read_csv_json_with_dtype(engine, dtype, expected):
-    """A dtype given to execute() still applies to the other columns."""
+    """A dtype given to execute() applies to the other columns, not to json columns."""
     df, options = _read_csv_result(
         "n,j\n1,2\n3,\n", {"n": "integer", "j": "json"}, engine=engine, dtype=dtype
     )
     assert {key: options["dtype"][key] for key in expected} == expected
+    assert "j" not in options["dtype"]
     if isinstance(dtype, dict):
         assert 1 not in dtype
     assert df["n"].dtype == expected["n"]
