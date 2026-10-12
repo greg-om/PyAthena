@@ -80,12 +80,7 @@ class ReadAheadStream(io.RawIOBase):
         self._on_close: Callable[[], None] | None = None
         self._parts: deque[tuple[int, Future[bytes]]] = deque()
         self._buffer = memoryview(b"")
-        part_size = self.DEFAULT_PART_SIZE if part_size is None else part_size
-        max_parts = self.DEFAULT_MAX_PARTS if max_parts is None else max_parts
-        if part_size < 1:
-            raise ValueError(f"part_size must be positive, got {part_size}.")
-        if max_parts < 1:
-            raise ValueError(f"max_parts must be positive, got {max_parts}.")
+        part_size, max_parts = self._resolve_options(part_size, max_parts)
         self._read_range = read_range
         self._size = size
         self._part_size = part_size
@@ -95,6 +90,28 @@ class ReadAheadStream(io.RawIOBase):
         self._error: BaseException | None = None
         self._executor = ThreadPoolExecutor(max_workers=max_parts)
         self._on_close = on_close
+
+    @classmethod
+    def _resolve_options(cls, part_size: int | None, max_parts: int | None) -> tuple[int, int]:
+        """Apply the defaults to the part size and number of parts, and check them.
+
+        Args:
+            part_size: The given part size, or None for ``DEFAULT_PART_SIZE``.
+            max_parts: The given number of parts, or None for ``DEFAULT_MAX_PARTS``.
+
+        Returns:
+            The part size and the number of parts.
+
+        Raises:
+            ValueError: If either is not positive.
+        """
+        part_size = cls.DEFAULT_PART_SIZE if part_size is None else part_size
+        max_parts = cls.DEFAULT_MAX_PARTS if max_parts is None else max_parts
+        if part_size < 1:
+            raise ValueError(f"part_size must be positive, got {part_size}.")
+        if max_parts < 1:
+            raise ValueError(f"max_parts must be positive, got {max_parts}.")
+        return part_size, max_parts
 
     @classmethod
     def from_arrow_file(
@@ -159,11 +176,14 @@ class ReadAheadStream(io.RawIOBase):
 
         Raises:
             FileNotFoundError: If the object does not exist.
+            ValueError: If ``part_size`` or ``max_parts`` is not positive; the
+                object is not opened then.
         """
-        part_size = cls.DEFAULT_PART_SIZE if part_size is None else part_size
-        # A part no larger than the block size is read with one request, not split
-        # into parallel ones by the file.
-        kwargs.setdefault("block_size", part_size)
+        part_size, max_parts = cls._resolve_options(part_size, max_parts)
+        if kwargs.get("block_size") is None:
+            # A part no larger than the block size is read with one request, not
+            # split into parallel ones by the file.
+            kwargs["block_size"] = part_size
         file = fs.open(path, "rb", **kwargs)
         try:
             return cls(
@@ -215,19 +235,23 @@ class ReadAheadStream(io.RawIOBase):
 
     @override
     def close(self) -> None:
+        """Cancel the queued reads, wait for the running ones, and call ``on_close``.
+
+        If the wait is interrupted, the stream stays open and ``on_close`` is not
+        called, so that the file is not closed under the running reads; closing
+        again waits for them.
+        """
         if self.closed:
             return
+        if self._executor is not None:
+            self._executor.shutdown(wait=True, cancel_futures=True)
+        self._parts.clear()
+        self._buffer = memoryview(b"")
         try:
-            if self._executor is not None:
-                self._executor.shutdown(wait=True, cancel_futures=True)
-            self._parts.clear()
-            self._buffer = memoryview(b"")
+            if self._on_close is not None:
+                self._on_close()
         finally:
-            try:
-                if self._on_close is not None:
-                    self._on_close()
-            finally:
-                super().close()
+            super().close()
 
     def _next_part(self) -> bool:
         """Wait for the next part and make it the buffer being consumed.
@@ -243,15 +267,18 @@ class ReadAheadStream(io.RawIOBase):
         self._read_ahead()
         if not self._parts:
             return False
-        expected, part = self._parts.popleft()
-        try:
+        expected, part = self._parts[0]
+        # An interrupt of the wait leaves the part queued for the next read.
+        error = part.exception()
+        self._parts.popleft()
+        if error is None:
             data = part.result()
             if len(data) != expected:
-                raise OSError(f"Read {len(data)} bytes of a range of {expected} bytes.")
-        except BaseException as e:
+                error = OSError(f"Read {len(data)} bytes of a range of {expected} bytes.")
+        if error is not None:
             # The part is gone, so a later read must not continue past it.
-            self._error = e
-            raise
+            self._error = error
+            raise error
         self._buffer = memoryview(data)
         self._read_ahead()
         return True

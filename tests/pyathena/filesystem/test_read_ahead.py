@@ -8,6 +8,7 @@
 import gc
 import threading
 import uuid
+from concurrent.futures import Future
 from unittest.mock import MagicMock
 
 import pyarrow as pa
@@ -47,6 +48,49 @@ class _RecordingRandomAccessFile:
 
     def close(self):
         self.closed = True
+
+
+class _InterruptedFuture(Future):
+    """A future whose first ``interrupts`` waits for the outcome are interrupted."""
+
+    def __init__(self, interrupts):
+        super().__init__()
+        self.interrupts = interrupts
+
+    def exception(self, timeout=None):
+        if self.interrupts:
+            self.interrupts -= 1
+            raise KeyboardInterrupt
+        return super().exception(timeout)
+
+
+class _InterruptedWaitExecutor(ImmediateExecutor):
+    """An executor that runs each call when it is submitted, whose first wait for the
+    outcome of the first call is interrupted."""
+
+    def __init__(self, max_workers=None):
+        super().__init__(max_workers)
+        self.submitted = 0
+
+    def submit(self, fn, *args, **kwargs):
+        future = _InterruptedFuture(1 if self.submitted == 0 else 0)
+        self.submitted += 1
+        future.set_result(fn(*args, **kwargs))
+        return future
+
+
+class _InterruptedShutdownExecutor(ImmediateExecutor):
+    """An executor that runs each call when it is submitted, whose first shutdown is
+    interrupted."""
+
+    def __init__(self, max_workers=None):
+        super().__init__(max_workers)
+        self.shutdown_interrupts = 1
+
+    def shutdown(self, wait=True, cancel_futures=False):
+        if self.shutdown_interrupts:
+            self.shutdown_interrupts -= 1
+            raise KeyboardInterrupt
 
 
 class TestReadAheadStream:
@@ -174,6 +218,36 @@ class TestReadAheadStream:
         with pytest.raises(ValueError, match="I/O operation on closed file"):
             stream.read(5)
 
+    def test_interrupted_wait(self, monkeypatch):
+        """An interrupt while waiting for a part leaves the part to the next read."""
+        monkeypatch.setattr(
+            "pyathena.filesystem.read_ahead.ThreadPoolExecutor", _InterruptedWaitExecutor
+        )
+        data = bytes(range(30))
+        file = _RecordingRandomAccessFile(data)
+        stream = ReadAheadStream.from_arrow_file(file, part_size=10, max_parts=2)
+        with pytest.raises(KeyboardInterrupt):
+            stream.read(10)
+        assert stream.read(10) == data[:10]
+        assert stream.read(5) == data[10:15]
+        assert sorted(file.reads) == [(0, 10), (10, 10), (20, 10)]
+        stream.close()
+
+    def test_interrupted_close(self, monkeypatch):
+        """An interrupted close leaves the file open until the stream is closed again."""
+        monkeypatch.setattr(
+            "pyathena.filesystem.read_ahead.ThreadPoolExecutor", _InterruptedShutdownExecutor
+        )
+        file = _RecordingRandomAccessFile(bytes(30))
+        stream = ReadAheadStream.from_arrow_file(file, part_size=10, max_parts=2)
+        with pytest.raises(KeyboardInterrupt):
+            stream.close()
+        assert not file.closed
+        assert not stream.closed
+        stream.close()
+        assert file.closed
+        assert stream.closed
+
     def test_close_waits_for_running_reads(self):
         """Closing waits for the reads in flight before closing the file."""
         gate = threading.Event()
@@ -203,6 +277,26 @@ class TestReadAheadStream:
             table = pa_csv.read_csv(source, read_options=read_options)
         assert table.equals(pa_csv.read_csv(pa.BufferReader(data), read_options=read_options))
         assert file.closed
+
+    def test_from_s3_invalid_options(self):
+        fs = MagicMock()
+        with pytest.raises(ValueError, match="part_size must be positive"):
+            ReadAheadStream.from_s3(fs, "s3://bucket/key", part_size=0)
+        # The object is not opened.
+        fs.open.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("kwargs", "block_size"),
+        [({}, 10), ({"block_size": None}, 10), ({"block_size": 5}, 5)],
+        ids=["default", "none", "given"],
+    )
+    def test_from_s3_block_size(self, kwargs, block_size):
+        """The object is opened with the part size as the block size unless one is given."""
+        fs = MagicMock()
+        fs.open.return_value.size = 0
+        ReadAheadStream.from_s3(fs, "s3://bucket/key", part_size=10, **kwargs).close()
+        fs.open.assert_called_once_with("s3://bucket/key", "rb", block_size=block_size)
+        fs.open.return_value.close.assert_called_once_with()
 
     @pytest.fixture(scope="class")
     def fs(self):
