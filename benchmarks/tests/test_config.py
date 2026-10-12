@@ -33,6 +33,7 @@ def test_identifier_rejects_sql_and_path_syntax(value):
         {"filesystem_sizes": {"small": 0}},
         {"filesystem_block_size": 2**20},
         {"filesystem_sizes": {"small": 10_001 * 8 * 2**20}},
+        {"filesystem_sizes": {"small": 8 * 2**20}},
         {"filesystem_max_workers": []},
         {"filesystem_pool_connections": [0]},
     ],

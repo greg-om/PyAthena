@@ -101,11 +101,12 @@ class Settings:
         # S3's minimum part size, below which a multipart upload cannot complete.
         if type(self.filesystem_block_size) is not int or self.filesystem_block_size < 5 * 2**20:
             raise ValueError("filesystem block_size must be at least 5 MiB")
+        # A size up to block_size would be one request instead of parallel ranges or parts.
         if any(
-            -(-size // self.filesystem_block_size) > 10_000
+            not self.filesystem_block_size < size <= 10_000 * self.filesystem_block_size
             for size in self.filesystem_sizes.values()
         ):
-            raise ValueError("Filesystem sizes must fit in 10,000 parts of block_size")
+            raise ValueError("Filesystem sizes must take 2 to 10,000 parts of block_size")
         for name in ("filesystem_max_workers", "filesystem_pool_connections"):
             values = getattr(self, name)
             if not values or any(type(v) is not int or v < 1 for v in values):

@@ -84,7 +84,14 @@ async def transfer(
         The number of bytes read, written, or copied.
     """
     if case.transport == "copy":
-        options = {"max_workers": case.max_workers, "block_size": block_size}
+        # The generated objects have no tags or annotations, so neither is copied:
+        # copying them would read them first, which the benchmark role cannot.
+        options = {
+            "max_workers": case.max_workers,
+            "block_size": block_size,
+            "TaggingDirective": "REPLACE",
+            "AnnotationDirective": "EXCLUDE",
+        }
         if case.api == "aio":
             await fs._cp_file(source, destination, **options)
         else:
@@ -148,10 +155,15 @@ async def run_filesystem(
         await asyncio.sleep(0)
         start = time.perf_counter()
         try:
-            transferred = await transfer(
-                fs, case, source, destination, size, settings.filesystem_block_size
-            )
-            elapsed = time.perf_counter() - start
+            try:
+                transferred = await transfer(
+                    fs, case, source, destination, size, settings.filesystem_block_size
+                )
+                elapsed = time.perf_counter() - start
+            finally:
+                # The event loop's lag is sampled during the transfer only.
+                stop.set()
+                await monitor
             # Checked after the measurement: the written or copied object is complete.
             if case.transport != "read":
                 bucket, key = parse_output_location(destination)

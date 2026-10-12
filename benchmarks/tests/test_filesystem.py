@@ -8,6 +8,7 @@
 import asyncio
 import io
 import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -82,9 +83,13 @@ def test_copy_passes_the_case_workers_and_block_size(api, method):
     case = Case("s3", api, "copy", "bytes", suite="filesystem", max_workers=8)
     copied = asyncio.run(transfer(fs, case, "s3://b/source", "s3://b/destination", 20, 5))
     assert copied == 20
-    assert fs.copies == [
-        (method, "s3://b/source", "s3://b/destination", {"max_workers": 8, "block_size": 5})
-    ]
+    options = {
+        "max_workers": 8,
+        "block_size": 5,
+        "TaggingDirective": "REPLACE",
+        "AnnotationDirective": "EXCLUDE",
+    }
+    assert fs.copies == [(method, "s3://b/source", "s3://b/destination", options)]
 
 
 @pytest.mark.parametrize(
@@ -92,8 +97,8 @@ def test_copy_passes_the_case_workers_and_block_size(api, method):
     [
         ("copy", 5 * 2**30, False),
         ("copy", 5 * 2**30 + 1, True),
-        ("read", 2**20, True),
-        ("write", 2**20, True),
+        ("read", 16 * 2**20, True),
+        ("write", 16 * 2**20, True),
     ],
 )
 def test_only_multipart_copies_run(operation, size, runs):
@@ -151,6 +156,19 @@ class TestRunFilesystem:
         assert result["status"] == "error"
         assert result["queries"][0]["status"] == "size_mismatch"
         assert result["queries"][0]["bytes"] == 9
+
+    def test_loop_lag_covers_the_transfer_but_not_the_size_check(self, s3_client, monkeypatch):
+        head_object = s3_client.head_object
+
+        def slow_head_object(**params):
+            # Blocks the event loop, as the synchronous client does.
+            time.sleep(0.2)
+            return head_object(**params)
+
+        monkeypatch.setattr(s3_client, "head_object", slow_head_object)
+        result = self.run("write")
+        assert result["status"] == "ok"
+        assert max(result["loop_lag_seconds"], default=0) < 0.1
 
     def test_failed_size_check_is_recorded_as_the_transfer_error(self, s3_client):
         s3_client.head_error = RuntimeError("Forbidden")

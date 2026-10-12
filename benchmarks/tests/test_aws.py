@@ -96,16 +96,16 @@ class TestObjects:
     ):
         store = ObjectStore()
         monkeypatch.setattr("pyathena_bench.aws.client", lambda session_, service: store)
-        settings = Settings(filesystem_sizes={"small": 3 * 2**20, "large": 2**20})
+        settings = Settings(filesystem_sizes={"small": 24 * 2**20, "large": 16 * 2**20})
         data = manifest()
         path = tmp_path / "manifest.json"
         prepare_objects(settings, data, path, ["small"])
         prepare_objects(settings, data, path, ["small", "large"])
-        assert sorted(store.sizes.values()) == [2**20, 3 * 2**20]
+        assert sorted(store.sizes.values()) == [16 * 2**20, 24 * 2**20]
         assert read_json(path)["objects"] == data["objects"]
         location = data["objects"]["small"]["location"]
         assert location.startswith(f"s3://temporary/runs/{RUN}/objects/small-")
-        assert data["objects"]["small"]["size"] == 3 * 2**20
+        assert data["objects"]["small"]["size"] == 24 * 2**20
         validate_objects(settings, data, ["small", "large"])
 
     @pytest.mark.parametrize(
