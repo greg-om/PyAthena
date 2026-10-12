@@ -11,9 +11,12 @@ from unittest.mock import ANY, MagicMock, PropertyMock, patch, sentinel
 
 import pandas as pd
 import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
+from fsspec.implementations.local import LocalFileSystem
 from pandas.testing import assert_frame_equal
 
+from pyathena.error import OperationalError
 from pyathena.pandas.converter import DefaultPandasTypeConverter
 from pyathena.pandas.result_set import (
     AthenaPandasResultSet,
@@ -186,6 +189,33 @@ class TestAthenaPandasResultSet:
         assert stream.closed
 
     @pytest.mark.parametrize(
+        ("chunksize", "execute_kwargs", "expected"),
+        [
+            (None, {}, False),
+            (10, {}, True),
+            (10, {"columns": ["a", "b"]}, True),
+            (10, {"columns": ("a",)}, True),
+            (10, {"dtype_backend": "numpy_nullable"}, True),
+            (10, {"dtype_backend": "pyarrow", "columns": ["a"]}, True),
+            (10, {"columns": []}, False),
+            (10, {"columns": ["a", "a"]}, False),
+            (10, {"columns": "a"}, False),
+            (10, {"columns": [0]}, False),
+            (10, {"columns": ["s.a"]}, False),
+            (10, {"dtype_backend": None}, False),
+            (10, {"dtype_backend": "invalid"}, False),
+            (10, {"filters": [("a", "=", 1)]}, False),
+            (10, {"storage_options": {}}, False),
+        ],
+    )
+    def test_reads_parquet_in_chunks(self, chunksize, execute_kwargs, expected):
+        """Only chunksize with supported read options reads UNLOAD results in chunks."""
+        result_set = AthenaPandasResultSet.__new__(AthenaPandasResultSet)
+        result_set._chunksize = chunksize
+        result_set._kwargs = execute_kwargs
+        assert result_set._reads_parquet_in_chunks() is expected
+
+    @pytest.mark.parametrize(
         ("block_size", "cache_type", "prefetch", "expected"),
         [
             (
@@ -248,6 +278,52 @@ class TestAthenaPandasResultSet:
             **execute_kwargs,
             **filesystem_kwargs,
         }
+
+    def test_iter_parquet_chunks_null_in_later_file(self, tmp_path):
+        """Top-level integer and boolean columns with NULL anywhere convert alike in every chunk."""
+        chunks, _ = _read_unload_result(
+            tmp_path,
+            [
+                pa.table({"i": pa.array([1, 2], pa.int64()), "b": [True, False]}),
+                pa.table({"i": pa.array([None, 4], pa.int64()), "b": [None, True]}),
+            ],
+            chunksize=1,
+        )
+        whole = pd.read_parquet(tmp_path)
+        assert [len(chunk) for chunk in chunks] == [1, 1, 1, 1]
+        for chunk in chunks:
+            assert chunk.dtypes.tolist() == whole.dtypes.tolist()
+        assert_frame_equal(pd.concat(chunks), whole, check_exact=True)
+
+    @pytest.mark.parametrize("write_statistics", [True, False])
+    def test_iter_parquet_chunks_large_integers(self, tmp_path, write_statistics):
+        """Integers without NULL stay exact, with or without Parquet statistics."""
+        chunks, whole = _read_unload_result(
+            tmp_path,
+            [pa.table({"i": pa.array([9007199254740993, 1], pa.int64())})],
+            chunksize=1,
+            write_statistics=write_statistics,
+        )
+        assert [chunk["i"].dtype for chunk in chunks] == ["int64", "int64"]
+        assert [int(chunk["i"].iloc[0]) for chunk in chunks] == [9007199254740993, 1]
+        assert_frame_equal(pd.concat(chunks), whole, check_exact=True)
+
+    def test_iter_parquet_chunks_nested_values(self, tmp_path):
+        """Nested values convert per chunk; with dtype_backend="pyarrow" they do not."""
+        table = pa.table({"li": pa.array([[1], [None]], pa.list_(pa.int64()))})
+        chunks, _ = _read_unload_result(tmp_path, [table], chunksize=1)
+        assert [chunk["li"].iloc[0].dtype for chunk in chunks] == ["int64", "float64"]
+        chunks, whole = _read_unload_result(
+            tmp_path / "pyarrow", [table], chunksize=1, dtype_backend="pyarrow"
+        )
+        for chunk in chunks:
+            assert chunk.dtypes.tolist() == whole.dtypes.tolist()
+        assert_frame_equal(pd.concat(chunks), whole, check_exact=True)
+
+    def test_iter_parquet_chunks_reader_error(self, tmp_path):
+        """Errors from creating the chunk reader are raised as OperationalError."""
+        with pytest.raises(OperationalError, match="chunksize must be positive"):
+            _read_unload_result(tmp_path, [pa.table({"i": [1]})], chunksize=0)
 
 
 _READ_MODES = [
@@ -361,6 +437,32 @@ def _pyarrow_read_csv_kwargs(types, tab_separated=False, dtype_overrides=None, *
             result_set._kwargs["dtype"] = {**result_set.dtypes, **dtype_overrides}
         assert result_set._reads_csv_with_pyarrow()
         return result_set._get_csv_read_options("pyarrow", None)
+
+
+def _read_unload_result(tmp_path, tables, chunksize, write_statistics=True, **kwargs):
+    """Write Parquet files and read them in chunks through the result set, without AWS.
+
+    Returns:
+        The chunks, and the whole result read by pandas.read_parquet() with the same
+        options.
+    """
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    paths = []
+    for index, table in enumerate(tables):
+        path = tmp_path / f"{index}.parquet"
+        pq.write_table(table, path, write_statistics=write_statistics)
+        paths.append(str(path))
+    result_set = AthenaPandasResultSet.__new__(AthenaPandasResultSet)  # bypass __init__
+    result_set._fs = LocalFileSystem()
+    result_set._chunksize = chunksize
+    result_set._kwargs = kwargs
+    result_set._unload_location = None
+    result_set._parquet_null_dtypes = {}
+    with patch.object(AthenaPandasResultSet, "_read_data_manifest", return_value=paths):
+        assert result_set._read_parquet_footers()[0] == sum(t.num_rows for t in tables)
+    chunks = list(result_set._iter_parquet_chunks())
+    whole = pd.concat([pd.read_parquet(path, **kwargs) for path in paths], ignore_index=True)
+    return chunks, whole
 
 
 def _read_csv_result(data, types, engine="c", chunksize=None, **kwargs):

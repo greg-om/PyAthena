@@ -14,7 +14,7 @@ import pandas as pd
 import pytest
 from pandas.io.parsers import TextFileReader
 
-from pyathena.error import DatabaseError, ProgrammingError
+from pyathena.error import DatabaseError, OperationalError, ProgrammingError
 from pyathena.filesystem.s3 import S3FileSystem
 from pyathena.model import AthenaQueryExecution
 from pyathena.pandas.converter import DefaultPandasTypeConverter
@@ -848,6 +848,98 @@ class TestPandasCursor:
                 Decimal("0.1"),
             )
         ]
+
+    @pytest.mark.parametrize(
+        ("pandas_cursor", "chunksize", "options", "sizes"),
+        [
+            ({"cursor_kwargs": {"unload": True}}, 1, {}, [1, 1, 1]),
+            ({"cursor_kwargs": {"unload": True}}, 2, {}, [2, 1]),
+            ({"cursor_kwargs": {"unload": True}}, 10, {}, [3]),
+            (
+                {"cursor_kwargs": {"unload": True}},
+                1,
+                {"dtype_backend": "numpy_nullable"},
+                [1, 1, 1],
+            ),
+            ({"cursor_kwargs": {"unload": True}}, 2, {"columns": ["k", "i"]}, [2, 1]),
+        ],
+        indirect=["pandas_cursor"],
+    )
+    def test_unload_chunks(self, pandas_cursor, chunksize, options, sizes):
+        """Chunked UNLOAD results match the whole result, including dtypes with NULL."""
+        query = """
+            SELECT * FROM (
+              VALUES
+                (1, 1, true, 'a', BIGINT '9007199254740993'),
+                (2, NULL, NULL, NULL, BIGINT '2'),
+                (3, 3, false, 'c', BIGINT '3')
+            ) AS t(k, i, b, s, x)
+            """
+        whole = pandas_cursor.execute(query, **options).as_pandas()
+        chunks = list(pandas_cursor.execute(query, chunksize=chunksize, **options).as_pandas())
+        assert [len(chunk) for chunk in chunks] == sizes
+        for chunk in chunks:
+            pd.testing.assert_series_equal(chunk.dtypes, whole.dtypes)
+        combined = pd.concat(chunks)
+        assert combined.index.tolist() == list(range(len(combined)))
+        pd.testing.assert_frame_equal(
+            combined.sort_values("k").reset_index(drop=True),
+            whole.sort_values("k").reset_index(drop=True),
+            check_exact=True,
+        )
+
+    @pytest.mark.parametrize(
+        "pandas_cursor", [{"cursor_kwargs": {"unload": True}}], indirect=["pandas_cursor"]
+    )
+    @pytest.mark.parametrize("columns", [["missing"], ["k", "missing"]])
+    def test_unload_chunks_unknown_columns(self, pandas_cursor, columns):
+        """Columns that are not in the result raise with chunks as without them."""
+        query = "SELECT * FROM (VALUES (1, 'a')) AS t(k, s)"
+        with pytest.raises(OperationalError):
+            pandas_cursor.execute(query, columns=columns)
+        with pytest.raises(OperationalError):
+            pandas_cursor.execute(query, chunksize=1, columns=columns)
+
+    @pytest.mark.parametrize(
+        "pandas_cursor", [{"cursor_kwargs": {"unload": True}}], indirect=["pandas_cursor"]
+    )
+    def test_unload_chunks_empty(self, pandas_cursor):
+        chunks = pandas_cursor.execute("SELECT * FROM one_row LIMIT 0", chunksize=2).as_pandas()
+        df = pd.concat(list(chunks), ignore_index=True)
+        assert df.shape == (0, 0)
+        assert pandas_cursor.fetchall() == []
+
+    @pytest.mark.parametrize(
+        "pandas_cursor", [{"cursor_kwargs": {"unload": True}}], indirect=["pandas_cursor"]
+    )
+    def test_unload_chunks_complex(self, pandas_cursor):
+        """Chunks of complex-typed UNLOAD results convert as the whole result does."""
+        # NOT_SUPPORTED: Unsupported Hive type: time, json
+        query = """
+            SELECT
+              col_boolean
+              ,col_tinyint
+              ,col_smallint
+              ,col_int
+              ,col_bigint
+              ,col_float
+              ,col_double
+              ,col_string
+              ,col_varchar
+              ,col_timestamp
+              ,col_date
+              ,col_binary
+              ,col_array
+              ,col_map
+              ,col_struct
+              ,col_decimal
+            FROM one_row_complex
+            """
+        whole = pandas_cursor.execute(query).as_pandas()
+        chunks = list(pandas_cursor.execute(query, chunksize=1).as_pandas())
+        assert len(chunks) == 1
+        pd.testing.assert_series_equal(chunks[0].dtypes, whole.dtypes)
+        pd.testing.assert_frame_equal(chunks[0], whole)
 
     @pytest.mark.parametrize(
         ("pandas_cursor", "parquet_engine"),
