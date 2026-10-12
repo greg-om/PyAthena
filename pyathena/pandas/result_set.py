@@ -1000,21 +1000,26 @@ class AthenaPandasResultSet(AthenaResultSet):
             for label, converter in converters.items()
             if label not in json_converters
         }
-        renamed_dtypes = {}
-        if labels is None:
+        renamed_dtypes: dict[Any, Any] = {}
+        description = self.description or []
+        names = [d[0] for d in description]
+        if labels is None and len(set(names)) != len(names):
+            import pandas as pd
+
             # Without labels, the options are keyed by name. pandas renames a repeated
             # name in the header, such as x.1, and reads the renamed column with the
             # dtype of the first column with the name, which would be text.
-            seen: dict[Any, int] = {}
-            for d in self.description or []:
-                count = seen[d[0]] = seen.get(d[0], -1) + 1
-                if count == 0 or d[0] not in json_converters:
+            renamed = self._resolve_csv_column_names(names, {}, pd.read_csv)[0]
+            for label, d in zip(renamed, description, strict=True):
+                if label == d[0] or d[0] not in json_converters:
                     continue
-                label = f"{d[0]}.{count}"
                 if d[1] == "json":
                     json_converters.setdefault(label, json_converters[d[0]])
-                elif "dtype" not in self._kwargs:
-                    renamed_dtypes[label] = self._converter.get_dtype(d[1], d[4], d[5])
+                elif (
+                    "dtype" not in self._kwargs
+                    and (value := self._converter.get_dtype(d[1], d[4], d[5])) is not None
+                ):
+                    renamed_dtypes[label] = value
         dtype = read_csv_kwargs.get("dtype")
         if isinstance(dtype, defaultdict):
             dtype = defaultdict(dtype.default_factory, dtype)
@@ -1026,7 +1031,7 @@ class AthenaPandasResultSet(AthenaResultSet):
             dtype = defaultdict(lambda: column_dtype)
         else:
             dtype = {}
-        dtype.update({label: value for label, value in renamed_dtypes.items() if value is not None})
+        dtype.update(renamed_dtypes)
         dtype.update(dict.fromkeys(json_converters, object))
         read_csv_kwargs["dtype"] = dtype
 
