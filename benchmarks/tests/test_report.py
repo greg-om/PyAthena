@@ -110,6 +110,28 @@ class TestReport:
         assert "Init (s)" in markdown
         assert "RSS increase (B)" in markdown
 
+    def test_report_shows_the_throughput_of_filesystem_transfers(self, tmp_path):
+        base = {
+            "case_id": "filesystem-s3-sync-read-w8-p10",
+            "scale": "small",
+            "status": "ok",
+            "successful_queries_per_second": 0.5,
+            "rss_peak_bytes": 100,
+            "max_threads": 12,
+        }
+        trials = [
+            {**base, "repetition": r, "queries": [{"bytes": 2**30, "total_seconds": s}]}
+            for r, s in enumerate((2, 4, 8))
+        ]
+        (tmp_path / "trials.jsonl").write_text("".join(json.dumps(t) + "\n" for t in trials))
+        report(tmp_path)
+        row = summarize(trials)[0]
+        assert row["median_mib_per_second"] == 256
+        assert row["peak_threads"] == 12
+        markdown = (tmp_path / "summary.md").read_text()
+        assert "Throughput (MiB/s)" in markdown
+        assert "| 256.0 |" in markdown
+
     def test_report_shows_the_most_output_files_and_the_largest_file(self, tmp_path):
         base = {
             "case_id": "case",

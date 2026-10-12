@@ -245,6 +245,42 @@ def test_unload_trials_record_their_output_files(monkeypatch, tmp_path, run_stub
     )
 
 
+def test_filesystem_trials_transfer_the_prepared_object_within_the_scratch_bucket(
+    monkeypatch, tmp_path, run_stubs
+):
+    monkeypatch.setattr(
+        "pyathena_bench.runner.validate_manifest",
+        lambda *args: {"ScratchDatabase": "s", "Bucket": "scratch", "Results": "s3://res/p/"},
+    )
+    monkeypatch.setattr(
+        "pyathena_bench.runner.validate_inputs",
+        lambda *args: pytest.fail("The filesystem suite reads no snapshot"),
+    )
+    validated = []
+    monkeypatch.setattr(
+        "pyathena_bench.runner.validate_objects", lambda *args: validated.append(args[2])
+    )
+    payloads = []
+    monkeypatch.setattr(
+        "pyathena_bench.runner.supervise",
+        lambda payload, events, settings: payloads.append(payload) or {"status": "ok"},
+    )
+    source = "s3://scratch/runs/r/objects/small-x"
+    manifest = {**RUN_MANIFEST, "objects": {"small": {"location": source, "size": 64}}}
+    case = Case(
+        "s3", "aio", "write", "bytes", suite="filesystem", max_workers=8, pool_connections=10
+    )
+    settings = replace(Settings(), warmups=0, repetitions=1)
+    assert run(settings, manifest, [case], ["small"], tmp_path / "run")
+    assert validated == [["small"]]
+    [payload] = payloads
+    assert payload["source"] == source
+    assert payload["size"] == 64
+    trials = f"s3://scratch/runs/{RUN_MANIFEST['run_id']}/trials/"
+    assert payload["destination"] == f"{trials}{payload['trial']}/object"
+    assert "sql" not in payload
+
+
 class TestResume:
     def test_finished_trials_are_skipped_and_outputs_go_to_the_results_location(
         self, monkeypatch, tmp_path, run_stubs

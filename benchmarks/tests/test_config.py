@@ -30,6 +30,11 @@ def test_identifier_rejects_sql_and_path_syntax(value):
         {"scales": {"small": True}},
         {"poll_interval": float("nan")},
         {"memory_fraction": 1},
+        {"filesystem_sizes": {"small": 0}},
+        {"filesystem_block_size": 2**20},
+        {"filesystem_sizes": {"small": 10_001 * 8 * 2**20}},
+        {"filesystem_max_workers": []},
+        {"filesystem_pool_connections": [0]},
     ],
 )
 def test_invalid_measurement_settings(changes):
@@ -91,6 +96,33 @@ def test_concurrency_and_init_matrices_are_bounded():
     initializers = matrix(Settings(), "init", "flat")
     assert {c.api for c in initializers} == {"direct", "to_thread"}
     assert len({c.id for c in initializers}) == len(initializers)
+
+
+def test_filesystem_matrix_sweeps_workers_and_pools_for_each_api_and_operation():
+    settings = replace(Settings(), filesystem_max_workers=[8, 40], filesystem_pool_connections=[10])
+    cases = matrix(settings, "filesystem", "flat")
+    assert len(cases) == 3 * 2 * 2
+    assert {(c.transport, c.api) for c in cases} == {
+        (operation, api) for operation in ("read", "write", "copy") for api in ("sync", "aio")
+    }
+    assert {(c.max_workers, c.pool_connections) for c in cases} == {(8, 10), (40, 10)}
+    assert "filesystem-s3-aio-copy-w40-p10" in {c.id for c in cases}
+    # The suite does not query Athena, so the other shapes add no cases.
+    assert matrix(settings, "filesystem", "nested") == []
+
+
+def test_filesystem_section_is_loaded_with_its_own_scales(tmp_path):
+    config = tmp_path / "config.toml"
+    config.write_text(
+        "[scales]\nsmall = 10000\n"
+        "[filesystem]\nsizes = { large = 1073741824 }\nblock_size = 16777216\n"
+        "max_workers = [4]\npool_connections = [4, 16]\n"
+    )
+    settings = Settings.load(config)
+    assert settings.suite_scales("filesystem") == {"large": 2**30}
+    assert settings.suite_scales("single") == {"small": 10000}
+    assert settings.filesystem_block_size == 16 * 2**20
+    assert settings.filesystem_pool_connections == [4, 16]
 
 
 def test_flat_projection_and_nested_projection_share_the_snapshot():

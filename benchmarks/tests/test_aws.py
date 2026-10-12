@@ -13,11 +13,13 @@ from botocore.exceptions import ClientError
 from pyathena_bench.aws import (
     cleanup,
     prepare,
+    prepare_objects,
     run_locations,
     split_location,
     stack_resources,
     validate_inputs,
     validate_manifest,
+    validate_objects,
 )
 from pyathena_bench.config import Settings, read_json
 
@@ -73,6 +75,57 @@ def test_unusable_snapshots_fail_before_any_measurement(change):
         validate_inputs(Settings(), data, ["small"])
 
 
+class ObjectStore:
+    """S3 client fake that keeps the size of each uploaded object."""
+
+    def __init__(self):
+        self.sizes = {}
+
+    def upload_fileobj(self, stream, bucket, key):
+        data = stream.read()
+        assert data == bytes(len(data))
+        self.sizes[(bucket, key)] = len(data)
+
+    def head_object(self, **params):
+        return {"ContentLength": self.sizes[(params["Bucket"], params["Key"])]}
+
+
+class TestObjects:
+    def test_missing_objects_are_uploaded_once_below_the_run(
+        self, aws_metadata, monkeypatch, tmp_path
+    ):
+        store = ObjectStore()
+        monkeypatch.setattr("pyathena_bench.aws.client", lambda session_, service: store)
+        settings = Settings(filesystem_sizes={"small": 3 * 2**20, "large": 2**20})
+        data = manifest()
+        path = tmp_path / "manifest.json"
+        prepare_objects(settings, data, path, ["small"])
+        prepare_objects(settings, data, path, ["small", "large"])
+        assert sorted(store.sizes.values()) == [2**20, 3 * 2**20]
+        assert read_json(path)["objects"] == data["objects"]
+        location = data["objects"]["small"]["location"]
+        assert location.startswith(f"s3://temporary/runs/{RUN}/objects/small-")
+        assert data["objects"]["small"]["size"] == 3 * 2**20
+        validate_objects(settings, data, ["small", "large"])
+
+    @pytest.mark.parametrize(
+        ("change", "message"),
+        [("missing", "Prepare"), ("cleaned", "Prepare"), ("size", "Prepared object size")],
+    )
+    def test_unusable_objects_fail_before_any_measurement(self, change, message):
+        data = manifest()
+        data["objects"] = {"small": {"location": "s3://temporary/o", "size": 64 * 2**20}}
+        scales = ["small"]
+        if change == "missing":
+            scales = ["small", "large"]
+        elif change == "cleaned":
+            data["cleaned"] = True
+        else:
+            data["objects"]["small"]["size"] = 1
+        with pytest.raises(ValueError, match=message):
+            validate_objects(Settings(filesystem_sizes={"small": 64 * 2**20}), data, scales)
+
+
 class TestAwsLifecycle:
     @pytest.mark.parametrize("change", ["bucket", "table", "region", "date"])
     def test_manifest_rejects_changed_or_foreign_targets(self, aws_metadata, change):
@@ -102,6 +155,17 @@ class TestAwsLifecycle:
         with pytest.raises(RuntimeError, match="CTAS failed"):
             prepare(Settings(), "stack", path, ["small"])
         assert read_json(path)["scales"]["small"]["location"].startswith("s3://temporary/runs/")
+
+    def test_preparation_without_scales_records_only_the_stack(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("pyathena_bench.aws.preflight", lambda settings, stack: RESOURCES)
+        monkeypatch.setattr(
+            "pyathena_bench.aws.execute_query",
+            lambda *args: pytest.fail("No snapshot is created without scales"),
+        )
+        path = tmp_path / "input.json"
+        prepare(Settings(), "stack", path, [])
+        assert read_json(path)["resources"] == RESOURCES
+        assert read_json(path)["scales"] == {}
 
 
 class TestCleanup:

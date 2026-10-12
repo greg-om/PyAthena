@@ -43,9 +43,11 @@ from pyathena_bench.aws import (
     split_location,
     validate_inputs,
     validate_manifest,
+    validate_objects,
 )
 from pyathena_bench.cases import Case
 from pyathena_bench.config import Settings, select_sql, write_json
+from pyathena_bench.filesystem import run_filesystem
 from pyathena_bench.report import CHECKPOINT, read_trials, trial_key
 
 _logger = logging.getLogger(__name__)
@@ -116,14 +118,25 @@ def worker(pipe: Connection, payload: dict[str, Any]) -> None:
         case = Case(**payload["case"])
         session_ = session(settings)
         observer.register(session_)
-        adapter = Adapter(
-            settings, case, session_, payload["database"], payload["output"], payload["temp_table"]
-        )
+        if case.suite == "filesystem":
+            measurement = run_filesystem(
+                settings, case, session_, payload["source"], payload["destination"], payload["size"]
+            )
+        else:
+            adapter = Adapter(
+                settings,
+                case,
+                session_,
+                payload["database"],
+                payload["output"],
+                payload["temp_table"],
+            )
+            measurement = run_adapter(
+                adapter, payload["sql"], payload["expected_rows"], payload.get("fixture")
+            )
         observer.send({"event": "ready"})
         pipe.recv()
-        result = asyncio.run(
-            run_adapter(adapter, payload["sql"], payload["expected_rows"], payload.get("fixture"))
-        )
+        result = asyncio.run(measurement)
         result["athena"] = list(observer.completed.values())
         for query in result["queries"]:
             if query.get("query_id") is None and len(observer.completed) == 1:
@@ -457,13 +470,17 @@ def run(
     """
     completed = completed or set()
     resources = validate_manifest(settings, manifest)
-    validate_inputs(settings, manifest, scales)
+    if any(case.suite == "filesystem" for case in cases):
+        validate_objects(settings, manifest, scales)
+    if any(case.suite != "filesystem" for case in cases):
+        validate_inputs(settings, manifest, scales)
     output.mkdir(parents=True, exist_ok=False)
     write_json(output / "environment.json", environment(settings))
     write_json(output / "manifest.json", manifest)
     success = True
     s3 = client(session(settings), "s3")
-    results_root = run_locations(resources, manifest["run_id"])["results"]
+    locations = run_locations(resources, manifest["run_id"])
+    results_root = locations["results"]
     for scale in scales:
         for case in cases:
             if case.unsupported:
@@ -490,7 +507,7 @@ def run(
                 if repetition >= 0 and (scale, case.id, repetition) in completed:
                     continue
                 trial = uuid.uuid4().hex
-                payload = {
+                payload: dict[str, Any] = {
                     "settings": asdict(settings),
                     "case": asdict(case),
                     "trial": trial,
@@ -498,15 +515,27 @@ def run(
                     "scale": scale,
                     "repetition": repetition,
                     "warmup": repetition < 0,
-                    "database": resources["ScratchDatabase"],
-                    "output": f"{results_root}trials/{trial}/",
-                    "temp_table": f"b_{manifest['run_id']}_{trial}",
-                    "sql": select_sql(
-                        resources["ScratchDatabase"], manifest["scales"][scale]["table"], case.shape
-                    ),
-                    "expected_rows": manifest["scales"][scale]["rows"],
-                    "fixture": manifest["fixtures"].get(f"{scale}-{case.shape}-{case.transport}"),
                 }
+                if case.suite == "filesystem":
+                    # Written to the scratch bucket, from which the source is read or copied.
+                    payload.update(
+                        source=manifest["objects"][scale]["location"],
+                        destination=f"{locations['scratch']}trials/{trial}/object",
+                        size=manifest["objects"][scale]["size"],
+                    )
+                else:
+                    payload.update(
+                        database=resources["ScratchDatabase"],
+                        output=f"{results_root}trials/{trial}/",
+                        temp_table=f"b_{manifest['run_id']}_{trial}",
+                        sql=select_sql(
+                            resources["ScratchDatabase"],
+                            manifest["scales"][scale]["table"],
+                            case.shape,
+                        ),
+                        expected_rows=manifest["scales"][scale]["rows"],
+                        fixture=manifest["fixtures"].get(f"{scale}-{case.shape}-{case.transport}"),
+                    )
                 start = {"event": "trial_start", **payload}
                 append_json(output / "events.jsonl", start)
                 if checkpoint:

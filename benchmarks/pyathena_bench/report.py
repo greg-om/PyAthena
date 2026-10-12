@@ -46,6 +46,12 @@ def summarize(trials: list[dict[str, Any]]) -> list[dict[str, Any]]:
             for q in t.get("queries", [])
             if "post_completion_setup_seconds" in q and "consume_seconds" in q
         ]
+        throughput = [
+            q["bytes"] / 2**20 / q["total_seconds"]
+            for t in good
+            for q in t.get("queries", [])
+            if "bytes" in q
+        ]
         lag = [v for t in good for v in (t.get("loop_lag_seconds") or [])]
         phases = {}
         for key in ("execute_seconds", "consume_seconds", "post_completion_setup_seconds"):
@@ -104,6 +110,7 @@ def summarize(trials: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "p95_seconds": percentile(latency, 0.95),
                 "median_init_seconds": percentile(init, 0.5),
                 "median_client_result_seconds": percentile(retrieval, 0.5),
+                "median_mib_per_second": percentile(throughput, 0.5),
                 **phases,
                 "median_queries_per_second": statistics.median(
                     [t["successful_queries_per_second"] for t in good]
@@ -273,12 +280,13 @@ def report(directory: Path) -> None:
         "Thread counts include SDK and native library threads, not just executor workers.",
         "Peak temp dir is the per-trial Polars temporary directory, which is outside the RSS.",
         "Output files: the most Parquet files an UNLOAD or CTAS trial wrote, and the largest.",
+        "Throughput: the filesystem suite's object size per total time, in MiB per second.",
         "",
         "| Scale | Case | OK | Fail | Warmup fail | Unsupported | Total (s) | "
-        "Client result (s) | Init (s) | Peak RSS (B) | RSS increase (B) | "
-        "Peak temp dir (B) | Output files | Largest file (B) | Notes |",
-        "| --- | --- | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: "
-        "| ---: | ---: | --- |",
+        "Client result (s) | Init (s) | Throughput (MiB/s) | Peak RSS (B) | RSS increase (B) | "
+        "Peak temp dir (B) | Output files | Largest file (B) | Peak threads | Notes |",
+        "| --- | --- | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: "
+        "| ---: | ---: | ---: | --- |",
     ]
     for row in rows:
         values = [
@@ -293,11 +301,13 @@ def report(directory: Path) -> None:
                 "median_seconds",
                 "median_client_result_seconds",
                 "median_init_seconds",
+                "median_mib_per_second",
                 "peak_rss_bytes",
                 "median_rss_increase_bytes",
                 "peak_temp_dir_bytes",
                 "max_output_files",
                 "max_output_file_bytes",
+                "peak_threads",
                 "notes",
             )
         ]
