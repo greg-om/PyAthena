@@ -36,11 +36,11 @@ class ParquetChunkReader(abc.Iterator):  # type: ignore[type-arg]
     decoding: it is opened without a cache and with a block size of
     ``PREFETCH_PART_SIZE`` bytes, in which PyAthena's filesystem splits the read
     into parallel range requests, and the next file is read in a background
-    thread while the current one is decoded. A larger file is opened with ``open()``, by default
-    without the filesystem's read-ahead cache, and the column chunks of each row
-    group are pre-buffered: pyarrow reads them in large coalesced ranges, which
-    PyAthena's filesystem splits into parallel requests, and holds them until the
-    row group is decoded.
+    thread while the current one is decoded. A larger file is opened with
+    ``open()``, by default without the filesystem's read-ahead cache, and the
+    column chunks of each row group are pre-buffered: pyarrow reads them in large
+    coalesced ranges, which PyAthena's filesystem splits into parallel requests,
+    and holds them until the row group is decoded.
 
     The files must have the same schema, as the files of one UNLOAD query do.
 

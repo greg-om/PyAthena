@@ -195,7 +195,12 @@ class ReadAheadStream(io.RawIOBase):
         Returns:
             The number of bytes read, less than the size of ``buffer`` only at
             the end of the file.
+
+        Raises:
+            ValueError: If the stream is closed.
         """
+        if self.closed:
+            raise ValueError("I/O operation on closed file.")
         view = memoryview(buffer).cast("B")
         filled = 0
         while filled < len(view):

@@ -171,6 +171,8 @@ class TestReadAheadStream:
         assert stream.closed
         assert len(file.reads) <= 3
         stream.close()
+        with pytest.raises(ValueError, match="I/O operation on closed file"):
+            stream.read(5)
 
     def test_close_waits_for_running_reads(self):
         """Closing waits for the reads in flight before closing the file."""
