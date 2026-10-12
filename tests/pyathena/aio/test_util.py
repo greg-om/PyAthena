@@ -111,12 +111,12 @@ async def test_create_in_thread_cancelled_after_construction(monkeypatch):
         created.append(resource)
         return resource
 
-    async def cancelled_after(future):
+    async def cancelled_after(futures):
         # The construction completes, then the caller is cancelled before it resumes.
-        await future
+        await next(iter(futures))
         raise asyncio.CancelledError
 
-    monkeypatch.setattr("pyathena.aio.util.asyncio.shield", cancelled_after)
+    monkeypatch.setattr("pyathena.aio.util.asyncio.wait", cancelled_after)
     with pytest.raises(asyncio.CancelledError):
         await create_in_thread(factory)
 

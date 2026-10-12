@@ -110,7 +110,9 @@ async def create_in_thread(
         None, contextvars.copy_context().run, construct
     )
     try:
-        result = await asyncio.shield(future)
+        # Unlike asyncio.shield(), asyncio.wait() reports nothing when the
+        # construction fails after the caller is cancelled.
+        await asyncio.wait((future,))
     except asyncio.CancelledError:
         with lock:
             cancelled.set()
@@ -119,4 +121,4 @@ async def create_in_thread(
         if constructed:
             threading.Thread(target=constructed[0].close, name="create_in_thread-close").start()
         raise
-    return cast(_ClosableT, result)
+    return cast(_ClosableT, future.result())
