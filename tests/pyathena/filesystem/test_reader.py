@@ -8,7 +8,7 @@
 import gc
 import threading
 import uuid
-from concurrent.futures import Future, wait
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from unittest.mock import MagicMock
 
 import pyarrow as pa
@@ -233,7 +233,7 @@ class TestReadAheadStream:
             return wait(futures, *args, **kwargs)
 
         monkeypatch.setattr("pyathena.filesystem.reader.wait", interrupted_wait)
-        closer = threading.Thread(target=stream.close)
+        closer = threading.Thread(target=stream.close, daemon=True)
         try:
             assert stream.read(10) == bytes(10)
             assert file.gated_read_started.wait(EVENT_TIMEOUT)
@@ -253,6 +253,28 @@ class TestReadAheadStream:
                 closer.join(EVENT_TIMEOUT)
         assert file.closed
         assert stream.closed
+
+    def test_close_with_queued_reads(self, monkeypatch):
+        """Closing cancels a part that no worker has started and does not wait for it."""
+        monkeypatch.setattr(
+            "pyathena.filesystem.reader.ThreadPoolExecutor",
+            lambda max_workers: ThreadPoolExecutor(max_workers=1),
+        )
+        gate = threading.Event()
+        file = _RecordingRandomAccessFile(bytes(100), gate=gate)
+        stream = ReadAheadStream.from_arrow_file(file, part_size=10, max_parts=2)
+        # The one worker blocks in the read of the second part, and the third waits.
+        assert stream.read(10) == bytes(10)
+        assert file.gated_read_started.wait(EVENT_TIMEOUT)
+        closer = threading.Thread(target=stream.close, daemon=True)
+        closer.start()
+        closer.join(0.2)
+        assert closer.is_alive()
+        gate.set()
+        closer.join(EVENT_TIMEOUT)
+        assert not closer.is_alive()
+        assert file.closed
+        assert (20, 10) not in file.reads
 
     def test_close_waits_for_running_reads(self):
         """Closing waits for the reads in flight before closing the file."""
@@ -297,7 +319,7 @@ class TestReadAheadStream:
             ({}, 1),
             ({"max_workers": None}, 1),
             ({"max_workers": 4}, 4),
-            ({"cache_type": "all"}, 1),
+            ({"cache_type": "all", "cache_options": {"trim": False}}, 1),
         ],
         ids=["default", "none", "given", "cache_type"],
     )

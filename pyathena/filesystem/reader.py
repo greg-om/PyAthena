@@ -174,7 +174,7 @@ class ReadAheadStream(io.RawIOBase):
                 ``version_id`` or ``s3_additional_kwargs``. Unless ``max_workers``
                 is given, the file is opened with ``max_workers=1``, so that each
                 part is read with one GetObject request. The file is opened without
-                a cache, whatever ``cache_type`` is given.
+                a cache, whatever ``cache_type`` and ``cache_options`` are given.
 
         Returns:
             The stream over the object.
@@ -192,6 +192,7 @@ class ReadAheadStream(io.RawIOBase):
         # The parts bypass the cache of the file, which would only add reads, such
         # as the whole object that the "all" cache reads when the file is opened.
         kwargs["cache_type"] = "none"
+        kwargs.pop("cache_options", None)
         file = fs.open(path, "rb", **kwargs)
         try:
             return cls(
@@ -253,8 +254,9 @@ class ReadAheadStream(io.RawIOBase):
             return
         self._executor.shutdown(wait=False, cancel_futures=True)
         # The running reads are awaited by their futures, not by joining the threads,
-        # which an interrupt can leave marked as finished on Python 3.11.
-        wait([part for _, part in self._parts])
+        # which an interrupt can leave marked as finished on Python 3.11. The
+        # cancelled ones are left out: wait() never counts them as done.
+        wait([part for _, part in self._parts if not part.cancelled()])
         self._parts.clear()
         self._buffer = memoryview(b"")
         try:
