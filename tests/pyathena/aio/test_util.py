@@ -71,30 +71,35 @@ async def test_create_in_thread_cancelled_construction_error():
     loop = asyncio.get_running_loop()
     errors = []
     loop.set_exception_handler(lambda _, context: errors.append(context))
+    # One worker runs the construction and then, in order, the no-op below.
+    executor = ThreadPoolExecutor(max_workers=1)
+    loop.set_default_executor(executor)
     started = threading.Event()
     release = threading.Event()
-    finished = threading.Event()
 
     def factory():
         started.set()
         assert release.wait(EVENT_TIMEOUT)
-        finished.set()
         raise OSError("read failed")
 
-    task = asyncio.create_task(create_in_thread(factory))
-    assert await asyncio.to_thread(started.wait, EVENT_TIMEOUT)
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    release.set()
-    assert await asyncio.to_thread(finished.wait, EVENT_TIMEOUT)
-    # Let the executor future complete and be collected.
-    for _ in range(3):
-        await asyncio.sleep(0)
-    await asyncio.to_thread(lambda: None)
-    gc.collect()
-    await asyncio.sleep(0)
-    assert errors == []
+    with ThreadPoolExecutor(max_workers=1) as waiter:
+        try:
+            task = asyncio.create_task(create_in_thread(factory))
+            assert await loop.run_in_executor(waiter, started.wait, EVENT_TIMEOUT)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            del task
+            release.set()
+            # The construction has completed once the no-op behind it has run.
+            await loop.run_in_executor(None, lambda: None)
+            await asyncio.sleep(0)
+            gc.collect()
+            await asyncio.sleep(0)
+            assert errors == []
+        finally:
+            release.set()
+            executor.shutdown(wait=True)
 
 
 async def test_create_in_thread_cancelled_after_construction(monkeypatch):
