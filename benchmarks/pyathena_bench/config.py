@@ -28,6 +28,8 @@ FLAT_COLUMNS = (
 NESTED_COLUMNS = (
     '"timestamp", country_code, url, project, file, details, http, tls_protocol, tls_cipher'
 )
+# The flat projection with one column of Athena's json type, NULL where details is NULL.
+JSON_COLUMNS = f"{FLAT_COLUMNS}, CAST(details AS JSON) AS details_json"
 
 
 def identifier(value: str) -> str:
@@ -100,9 +102,22 @@ class Settings:
 
 
 def select_sql(database: str, table: str, shape: str) -> str:
-    if shape not in {"flat", "nested"}:
+    """Return the measured query of a shape over a snapshot table.
+
+    Args:
+        database: Database of the snapshot.
+        table: Snapshot table.
+        shape: ``flat``, ``nested``, or ``json``.
+
+    Returns:
+        The SELECT statement without a ``LIMIT``.
+
+    Raises:
+        ValueError: If the shape is unknown.
+    """
+    columns = {"flat": FLAT_COLUMNS, "nested": NESTED_COLUMNS, "json": JSON_COLUMNS}.get(shape)
+    if columns is None:
         raise ValueError(f"Unknown shape: {shape}")
-    columns = FLAT_COLUMNS if shape == "flat" else NESTED_COLUMNS
     return f'SELECT {columns} FROM "{identifier(database)}"."{identifier(table)}"'
 
 

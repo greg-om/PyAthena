@@ -16,7 +16,8 @@ import pytest
 from fsspec.implementations.local import LocalFileSystem
 from pandas.testing import assert_frame_equal
 
-from pyathena.error import OperationalError
+from pyathena.arrow.util import to_column_info
+from pyathena.error import OperationalError, ProgrammingError
 from pyathena.pandas.converter import DefaultPandasTypeConverter
 from pyathena.pandas.result_set import (
     AthenaPandasResultSet,
@@ -318,6 +319,19 @@ class TestAthenaPandasResultSet:
             assert chunk.dtypes.tolist() == whole.dtypes.tolist()
         assert_frame_equal(pd.concat(chunks), whole, check_exact=True)
 
+    def test_as_pandas_parquet_chunks_engine(self, tmp_path):
+        """Chunks of an UNLOAD result need the pyarrow engine, as the whole result does."""
+        result_set, paths = _unload_result_set(tmp_path, [pa.table({"i": [1]})], chunksize=1)
+        result_set._engine = "c"
+        with (
+            patch.object(AthenaPandasResultSet, "_read_data_manifest", return_value=paths),
+            patch.object(
+                AthenaPandasResultSet, "is_unload", new_callable=PropertyMock, return_value=True
+            ),
+            pytest.raises(ProgrammingError, match="Engine must be `pyarrow`"),
+        ):
+            result_set._as_pandas()
+
     def test_iter_parquet_chunks_reader_error(self, tmp_path):
         """Errors from creating the chunk reader are raised as OperationalError."""
         with pytest.raises(OperationalError, match="chunksize must be positive"):
@@ -430,12 +444,11 @@ def _pyarrow_read_csv_kwargs(types, tab_separated=False, dtype_overrides=None, *
         return result_set._get_csv_read_options("pyarrow", None)
 
 
-def _read_unload_result(tmp_path, tables, chunksize, write_statistics=True, **kwargs):
-    """Write Parquet files and read them in chunks through the result set, without AWS.
+def _unload_result_set(tmp_path, tables, chunksize, write_statistics=True, **kwargs):
+    """Write Parquet files and create a result set of an UNLOAD result in them, without AWS.
 
     Returns:
-        The chunks, and the whole result read by pandas.read_parquet() with the same
-        options.
+        The result set, and the paths of the files in the order of the data manifest.
     """
     tmp_path.mkdir(parents=True, exist_ok=True)
     paths = []
@@ -445,13 +458,42 @@ def _read_unload_result(tmp_path, tables, chunksize, write_statistics=True, **kw
         paths.append(str(path))
     result_set = AthenaPandasResultSet.__new__(AthenaPandasResultSet)  # bypass __init__
     result_set._fs = LocalFileSystem()
+    result_set._engine = "auto"
     result_set._chunksize = chunksize
+    result_set._cache_type = None
+    result_set._connection = MagicMock()
+    result_set._connection.s3_client.meta.config.max_pool_connections = 2
     result_set._kwargs = kwargs
     result_set._unload_location = None
     result_set._parquet_null_dtypes = {}
-    with patch.object(AthenaPandasResultSet, "_read_data_manifest", return_value=paths):
-        assert result_set._read_parquet_footers()[0] == sum(t.num_rows for t in tables)
-    chunks = list(result_set._iter_parquet_chunks())
+    return result_set, paths
+
+
+def _read_unload_result(tmp_path, tables, chunksize, write_statistics=True, **kwargs):
+    """Read Parquet files in chunks through the result set, without AWS.
+
+    The column metadata must be what the dataset of the files reports, read without
+    listing the unload location.
+
+    Returns:
+        The chunks, and the whole result read by pandas.read_parquet() with the same
+        options.
+    """
+    result_set, paths = _unload_result_set(
+        tmp_path, tables, chunksize, write_statistics=write_statistics, **kwargs
+    )
+    with (
+        patch.object(AthenaPandasResultSet, "_read_data_manifest", return_value=paths),
+        patch.object(
+            AthenaPandasResultSet, "is_unload", new_callable=PropertyMock, return_value=True
+        ),
+        patch.object(AthenaPandasResultSet, "_read_parquet_schema") as read_parquet_schema,
+    ):
+        reader = result_set._as_pandas()
+    read_parquet_schema.assert_not_called()
+    dataset = pq.ParquetDataset(str(tmp_path), filesystem=LocalFileSystem())
+    assert result_set._metadata == to_column_info(dataset.schema)
+    chunks = list(reader)
     whole = pd.concat([pd.read_parquet(path, **kwargs) for path in paths], ignore_index=True)
     return chunks, whole
 

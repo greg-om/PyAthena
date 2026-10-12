@@ -5,6 +5,7 @@
 #
 # SPDX-License-Identifier: MIT
 
+import os
 import threading
 from concurrent.futures import Future
 
@@ -12,7 +13,9 @@ import pyarrow as pa
 import pyarrow.csv as pa_csv
 import pyarrow.parquet as pq
 import pytest
+from fsspec import AbstractFileSystem
 from fsspec.implementations.local import LocalFileSystem
+from fsspec.spec import AbstractBufferedFile
 
 from pyathena.arrow.reader import ParquetChunkReader, ReadAheadStream
 from tests.pyathena.util import EVENT_TIMEOUT
@@ -40,6 +43,40 @@ class _ImmediateExecutor:
         except Exception as e:
             future.set_exception(e)
         return future
+
+
+class _RecordingFile(AbstractBufferedFile):
+    """A local file read through fsspec's caches, recording the ranges it fetches."""
+
+    def __init__(self, fs, path, **kwargs):
+        with open(path, "rb") as f:
+            self.data = f.read()
+        super().__init__(fs, path, size=len(self.data), **kwargs)
+
+    def _fetch_range(self, start, end):
+        end = min(end, len(self.data))
+        self.fs.fetched.append((start, end))
+        return self.data[start:end]
+
+
+class _RecordingFileSystem(AbstractFileSystem):
+    """Local files opened as buffered files, like ``S3File``, with a "bytes" cache by default."""
+
+    # A new instance for every test, so that its record starts empty.
+    cachable = False
+
+    def __init__(self, block_size):
+        super().__init__()
+        self.block_size = block_size
+        self.fetched = []
+
+    def size(self, path):
+        return os.path.getsize(path)
+
+    def _open(self, path, mode="rb", block_size=None, cache_type="bytes", **kwargs):
+        return _RecordingFile(
+            self, path, block_size=block_size or self.block_size, cache_type=cache_type, **kwargs
+        )
 
 
 class TestParquetChunkReader:
@@ -147,6 +184,46 @@ class TestParquetChunkReader:
             next(ParquetChunkReader(LocalFileSystem(), paths, 2))
         assert opened == paths[:1]
 
+    @pytest.mark.parametrize("cache_type", [None, "bytes"], ids=["default", "bytes"])
+    def test_streamed_file_row_groups(self, tmp_path, monkeypatch, cache_type):
+        """A streamed file is read one pre-buffered row group at a time, when needed.
+
+        With the default cache, each row group is fetched as one range of exactly its
+        column chunks; a given cache type adds its read-ahead to each range.
+        """
+        monkeypatch.setattr(ParquetChunkReader, "MAX_PREFETCH_SIZE", -1)
+        path = tmp_path / "groups.parquet"
+        columns = {f"c{i}": pa.array([os.urandom(256) for _ in range(300)]) for i in range(3)}
+        pq.write_table(pa.table(columns), path, compression="none", row_group_size=100)
+        metadata = pq.read_metadata(path)
+        spans = []
+        for index in range(metadata.num_row_groups):
+            chunks = [metadata.row_group(index).column(c) for c in range(metadata.num_columns)]
+            starts = [c.dictionary_page_offset or c.data_page_offset for c in chunks]
+            spans.append(
+                (
+                    min(starts),
+                    max(s + c.total_compressed_size for s, c in zip(starts, chunks, strict=True)),
+                )
+            )
+        assert len(spans) == 3
+        fs = _RecordingFileSystem(block_size=32 * 2**10)
+        with ParquetChunkReader(fs, [str(path)], 50, cache_type=cache_type) as reader:
+            assert next(reader).num_rows == 50
+            # The first fetch reads the footer; the first chunk needs the first row group.
+            first = fs.fetched[1:]
+            assert sum(table.num_rows for table in reader) == 250
+        ranges = fs.fetched[1:]
+        if cache_type is None:
+            assert first == spans[:1]
+            assert ranges == spans
+        else:
+            assert [start for start, _ in ranges] == [start for start, _ in spans]
+            assert all(
+                end > span_end
+                for (_, end), (_, span_end) in zip(ranges[:2], spans[:2], strict=True)
+            )
+
     def test_no_files(self):
         assert list(ParquetChunkReader(LocalFileSystem(), [], 4)) == []
 
@@ -174,7 +251,7 @@ class TestParquetChunkReader:
         assert list(reader) == []
 
 
-class _RecordingFile:
+class _RecordingRandomAccessFile:
     """A random-access file over bytes that records its reads."""
 
     def __init__(self, data, short=False, error_at=None, gate=None):
@@ -209,7 +286,7 @@ class TestReadAheadStream:
     @pytest.mark.parametrize("read_size", [1, 5, 7, 100])
     def test_read(self, size, read_size):
         data = bytes(range(256))[:size]
-        file = _RecordingFile(data)
+        file = _RecordingRandomAccessFile(data)
         stream = ReadAheadStream(file, part_size=7, max_parts=2)
         chunks = []
         while chunk := stream.read(read_size):
@@ -225,7 +302,7 @@ class TestReadAheadStream:
     def test_parts_in_flight(self, monkeypatch):
         """At most max_parts parts are requested ahead of the one being consumed."""
         monkeypatch.setattr("pyathena.arrow.reader.ThreadPoolExecutor", _ImmediateExecutor)
-        file = _RecordingFile(bytes(100))
+        file = _RecordingRandomAccessFile(bytes(100))
         stream = ReadAheadStream(file, part_size=10, max_parts=3)
         assert file.reads == []
         assert stream.read(1) == bytes(1)
@@ -236,14 +313,16 @@ class TestReadAheadStream:
         stream.close()
 
     def test_short_read(self):
-        stream = ReadAheadStream(_RecordingFile(bytes(20), short=True), part_size=10, max_parts=2)
+        stream = ReadAheadStream(
+            _RecordingRandomAccessFile(bytes(20), short=True), part_size=10, max_parts=2
+        )
         with pytest.raises(OSError, match="Read 9 bytes of a range of 10 bytes"):
             stream.read(20)
         stream.close()
 
     def test_read_error(self):
         """An error is raised by the read that reaches the failed part."""
-        file = _RecordingFile(bytes(30), error_at=10)
+        file = _RecordingRandomAccessFile(bytes(30), error_at=10)
         stream = ReadAheadStream(file, part_size=10, max_parts=2)
         assert stream.read(10) == bytes(10)
         with pytest.raises(OSError, match="read failed"):
@@ -256,7 +335,7 @@ class TestReadAheadStream:
 
     def test_close_before_end(self):
         """Closing cancels the queued reads and closes the file."""
-        file = _RecordingFile(bytes(1000))
+        file = _RecordingRandomAccessFile(bytes(1000))
         stream = ReadAheadStream(file, part_size=10, max_parts=2)
         assert stream.read(5) == bytes(5)
         stream.close()
@@ -268,7 +347,7 @@ class TestReadAheadStream:
     def test_close_waits_for_running_reads(self):
         """Closing waits for the reads in flight before closing the file."""
         gate = threading.Event()
-        file = _RecordingFile(bytes(100), gate=gate)
+        file = _RecordingRandomAccessFile(bytes(100), gate=gate)
         stream = ReadAheadStream(file, part_size=10, max_parts=2)
         closer = threading.Thread(target=stream.close)
         try:

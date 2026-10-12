@@ -329,7 +329,7 @@ If reading a chunk fails, iteration raises `OperationalError` instead of ending 
 
 The chunked iteration also works with the unload option.
 With pyarrow installed, the Parquet files of the result are read one at a time through PyAthena's S3 filesystem,
-and each chunk is converted from pyarrow, so memory usage depends on the size of each chunk rather than on the files.
+and each chunk is converted from pyarrow, so memory usage depends on the size of each chunk and of the row group being read, not on the size of the result.
 With read options given to `execute()`, or without pyarrow, Polars' `scan_parquet()` reads the files with those options;
 it decodes whole row groups and reads ahead, so `chunksize` does not limit memory usage:
 

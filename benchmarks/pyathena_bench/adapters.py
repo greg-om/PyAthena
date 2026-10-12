@@ -20,6 +20,8 @@ import pandas as pd
 import polars as pl
 import pyarrow as pa
 from botocore.config import Config
+from sqlalchemy import create_engine
+from sqlalchemy.pool import NullPool
 
 from pyathena import connect
 from pyathena.aio.arrow.cursor import AioArrowCursor
@@ -43,7 +45,7 @@ from pyathena.result_set import AthenaDictResultSet, AthenaResultSet
 from pyathena.s3fs.async_cursor import AsyncS3FSCursor
 from pyathena.s3fs.cursor import S3FSCursor
 from pyathena.s3fs.result_set import AthenaS3FSResultSet
-from pyathena_bench.cases import Case
+from pyathena_bench.cases import SQLALCHEMY_FAMILIES, Case
 from pyathena_bench.config import Settings
 
 BACKEND_VERSIONS = {
@@ -158,41 +160,103 @@ class Adapter:
     output: str
     temp_table: str
 
-    def connection(self) -> Any:
-        return connect(
-            session=self.session,
-            region_name=self.settings.region,
-            schema_name=self.database,
-            work_group=self.settings.workgroup,
-            s3_staging_dir=self.output,
-            poll_interval=self.settings.poll_interval,
-            result_reuse_enable=False,
-            config=Config(
+    def connection_kwargs(self) -> dict[str, Any]:
+        """Return the ``pyathena.connect()`` arguments shared by every PyAthena case.
+
+        Returns:
+            The connection arguments, with Athena result reuse disabled.
+        """
+        return {
+            "session": self.session,
+            "region_name": self.settings.region,
+            "schema_name": self.database,
+            "work_group": self.settings.workgroup,
+            "s3_staging_dir": self.output,
+            "poll_interval": self.settings.poll_interval,
+            "result_reuse_enable": False,
+            "config": Config(
                 max_pool_connections=max(
                     10, 2 * self.settings.executor_workers, self.case.concurrency
                 ),
                 connect_timeout=10,
                 read_timeout=60,
             ),
-        )
+        }
 
-    def cursor(self, connection: Any) -> Any:
+    def connection(self) -> Any:
+        return connect(**self.connection_kwargs())
+
+    def cursor_kwargs(self, family: str) -> dict[str, Any]:
+        """Return the cursor options of the case for a cursor family.
+
+        Args:
+            family: The cursor family, or the SQLAlchemy driver of a
+                ``read_sql_query()`` case, whose cursor takes the options of the
+                family of the same name.
+
+        Returns:
+            The keyword arguments that the family's cursor accepts.
+        """
         case = self.case
         kwargs: dict[str, Any] = {"arraysize": case.arraysize}
         if case.api == "thread":
             kwargs["max_workers"] = self.settings.executor_workers
-        if case.family in {"pandas", "polars"}:
+        if family in {"pandas", "polars"}:
             kwargs["s3_max_workers"] = self.settings.executor_workers
-        if case.family in {"pandas", "polars", "arrow"}:
+        if family in {"pandas", "polars", "arrow"}:
             kwargs["unload"] = case.transport == "unload"
-        if case.family in {"pandas", "polars"}:
+        if family in {"pandas", "polars"}:
             kwargs["chunksize"] = case.chunksize
-        if case.family == "pandas" and case.transport == "unload":
+        if family == "pandas" and case.transport == "unload":
             kwargs["engine"] = "pyarrow"
-        cursor = connection.cursor(CURSORS[case.api][case.family], **kwargs)
+        return kwargs
+
+    def cursor(self, connection: Any) -> Any:
+        case = self.case
+        cursor = connection.cursor(
+            CURSORS[case.api][case.family], **self.cursor_kwargs(case.family)
+        )
         # Some cursor bases reset arraysize during construction.
         cursor.arraysize = case.arraysize
         return cursor
+
+    def engine(self) -> Any:
+        """Create the SQLAlchemy engine of a ``read_sql_query()`` case.
+
+        The engine connects with the same arguments as the cursor cases, and its
+        connections create cursors with the cursor options of the driver's
+        name, including ``chunksize`` for the pandas and Polars drivers, so a
+        chunked read also streams the result file. ``NullPool`` opens one
+        connection per query. Result reuse is disabled through the connection's
+        ``result_reuse_enable``, and the client cache stays off because the
+        dialect executes statements without ``cache_size``, which defaults to 0.
+
+        Returns:
+            The engine.
+        """
+        driver = SQLALCHEMY_FAMILIES[self.case.family]
+        return create_engine(
+            f"awsathena+{driver}://athena.{self.settings.region}.amazonaws.com:443/{self.database}",
+            poolclass=NullPool,
+            connect_args={
+                **self.connection_kwargs(),
+                "cursor_kwargs": self.cursor_kwargs(driver),
+            },
+        )
+
+    def execute_kwargs(self) -> dict[str, Any]:
+        """Return the ``execute()`` options of a cursor case.
+
+        The client cache and Athena result reuse are disabled, and pandas cases
+        that set ``dtype_backend`` pass it.
+
+        Returns:
+            The keyword arguments for the cursor's ``execute()``.
+        """
+        options: dict[str, Any] = {"cache_size": 0, "result_reuse_enable": False}
+        if self.case.dtype_backend:
+            options["dtype_backend"] = self.case.dtype_backend
+        return options
 
     def wrangler(self, sql: str) -> Any:
         options: dict[str, Any] = {
@@ -247,25 +311,30 @@ async def measure_query(adapter: Adapter, cursor: Any, sql: str, expected: int) 
     case = adapter.case
     result = None
     try:
-        if case.family == "wrangler":
-            result = adapter.wrangler(sql)
+        if case.family == "wrangler" or case.family in SQLALCHEMY_FAMILIES:
+            # The "cursor" of a SQLAlchemy case is its connection, opened during setup.
+            result = (
+                adapter.wrangler(sql)
+                if case.family == "wrangler"
+                else pd.read_sql_query(sql, cursor, chunksize=case.chunksize)
+            )
             ready = time.perf_counter()
             count = consume(result, case)
             query_id = None  # The botocore observer captures IDs even for iterators.
         elif case.api == "thread":
             query_id, future = await asyncio.to_thread(
-                cursor.execute, sql, cache_size=0, result_reuse_enable=False
+                cursor.execute, sql, **adapter.execute_kwargs()
             )
             result = await asyncio.wrap_future(future)
             ready = time.perf_counter()
             count = await asyncio.to_thread(consume, result, case)
         elif case.api == "aio":
-            await cursor.execute(sql, cache_size=0, result_reuse_enable=False)
+            await cursor.execute(sql, **adapter.execute_kwargs())
             ready = time.perf_counter()
             query_id = cursor.query_id
             count = await consume_aio(cursor, case)
         else:
-            cursor.execute(sql, cache_size=0, result_reuse_enable=False)
+            cursor.execute(sql, **adapter.execute_kwargs())
             ready = time.perf_counter()
             query_id = cursor.query_id
             count = consume(cursor.result_set, case)
@@ -305,20 +374,27 @@ async def run_adapter(
     loop.set_default_executor(ThreadPoolExecutor(max_workers=adapter.settings.executor_workers))
     setup_start = time.perf_counter()
     case = adapter.case
-    connection = None if case.family == "wrangler" else adapter.connection()
+    sqlalchemy = case.family in SQLALCHEMY_FAMILIES
+    connection = None if case.family == "wrangler" or sqlalchemy else adapter.connection()
+    engine = adapter.engine() if sqlalchemy else None
     cursors: list[Any] = []
-    if case.suite != "init" and connection is not None:
-        # AsyncCursor owns one shared pool; Aio cursors carry per-query state.
-        cursors = [
-            adapter.cursor(connection) for _ in range(case.concurrency if case.api == "aio" else 1)
-        ]
-    setup_seconds = time.perf_counter() - setup_start
-    samples: list[float] = []
-    stop = asyncio.Event()
-    monitor = asyncio.create_task(heartbeat(adapter.settings.heartbeat_interval, stop, samples))
-    await asyncio.sleep(0)
-    start = time.perf_counter()
+    monitor = None
     try:
+        if engine is not None:
+            # Like a cursor, the SQLAlchemy connection is set up outside the measurement.
+            cursors = [engine.connect()]
+        if case.suite != "init" and connection is not None:
+            # AsyncCursor owns one shared pool; Aio cursors carry per-query state.
+            cursors = [
+                adapter.cursor(connection)
+                for _ in range(case.concurrency if case.api == "aio" else 1)
+            ]
+        setup_seconds = time.perf_counter() - setup_start
+        samples: list[float] = []
+        stop = asyncio.Event()
+        monitor = asyncio.create_task(heartbeat(adapter.settings.heartbeat_interval, stop, samples))
+        await asyncio.sleep(0)
+        start = time.perf_counter()
         if case.suite == "init":
             if fixture is None:
                 raise ValueError("Missing completed query fixture")
@@ -365,8 +441,9 @@ async def run_adapter(
             else None,
         }
     finally:
-        stop.set()
-        await monitor
+        if monitor is not None:
+            stop.set()
+            await monitor
         for cursor in cursors:
             if case.api == "thread":
                 cursor.close(wait=True)
@@ -374,3 +451,5 @@ async def run_adapter(
                 cursor.close()
         if connection is not None:
             connection.close()
+        if engine is not None:
+            engine.dispose()

@@ -98,7 +98,8 @@ class AsyncPolarsCursor(AsyncCursor):
             result_reuse_enable: Enable Athena query result reuse.
             result_reuse_minutes: Minutes to reuse cached results.
             block_size: S3 read block size.
-            cache_type: S3 caching strategy.
+            cache_type: S3 caching strategy. Without ``cache_type``, PyAthena's filesystem reads a
+                Parquet file of a chunked UNLOAD result that is larger than 32 MiB without a cache.
             chunksize: Number of rows per chunk for memory-efficient processing.
                       If specified, data is loaded lazily in chunks for all data
                       access methods including fetchone(), fetchmany(), and iter_chunks().

@@ -1019,7 +1019,7 @@ dependencies = [
     { name = "awswrangler" },
     { name = "polars" },
     { name = "psutil" },
-    { name = "pyathena", extra = ["arrow", "pandas", "polars"] },
+    { name = "pyathena", extra = ["arrow", "pandas", "polars", "sqlalchemy"] },
 ]
 
 [package.dev-dependencies]
@@ -1036,7 +1036,7 @@ requires-dist = [
     { name = "awswrangler", specifier = ">=3.17,<4" },
     { name = "polars" },
     { name = "psutil", specifier = ">=7,<8" },
-    { name = "pyathena", extras = ["pandas", "arrow", "polars"], editable = "." },
+    { name = "pyathena", extras = ["pandas", "arrow", "polars", "sqlalchemy"], editable = "." },
 ]
 
 [package.metadata.requires-dev]
