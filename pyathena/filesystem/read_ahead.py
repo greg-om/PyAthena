@@ -13,7 +13,7 @@ import io
 from collections import deque
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 from pyathena.util import override
 
@@ -74,22 +74,24 @@ class ReadAheadStream(io.RawIOBase):
             ValueError: If ``part_size`` or ``max_parts`` is not positive.
         """
         super().__init__()
-        # Set before the checks, for the close() that finalizing a stream that
-        # failed to initialize calls; on_close is not called then.
-        self._executor: ThreadPoolExecutor | None = None
-        self._on_close: Callable[[], None] | None = None
-        self._parts: deque[tuple[int, Future[bytes]]] = deque()
-        self._buffer = memoryview(b"")
-        part_size, max_parts = self._resolve_options(part_size, max_parts)
+        try:
+            part_size, max_parts = self._resolve_options(part_size, max_parts)
+        except BaseException:
+            # Closed as io.RawIOBase, so that finalizing the stream does not call
+            # close() of this class, nor on_close.
+            super().close()
+            raise
         self._read_range = read_range
         self._size = size
         self._part_size = part_size
         self._max_parts = max_parts
+        self._on_close = on_close
+        self._executor = ThreadPoolExecutor(max_workers=max_parts)
+        self._parts: deque[tuple[int, Future[bytes]]] = deque()
         self._next_offset = 0
         self._position = 0
+        self._buffer = memoryview(b"")
         self._error: BaseException | None = None
-        self._executor = ThreadPoolExecutor(max_workers=max_parts)
-        self._on_close = on_close
 
     @classmethod
     def _resolve_options(cls, part_size: int | None, max_parts: int | None) -> tuple[int, int]:
@@ -169,7 +171,9 @@ class ReadAheadStream(io.RawIOBase):
             max_parts: The most parts read ahead at once; if None,
                 ``DEFAULT_MAX_PARTS``.
             **kwargs: Additional arguments passed to ``fs.open()``, such as
-                ``version_id`` or ``s3_additional_kwargs``.
+                ``version_id`` or ``s3_additional_kwargs``. Unless ``max_workers``
+                is given, the file is opened with ``max_workers=1``, so that each
+                part is read with one GetObject request.
 
         Returns:
             The stream over the object.
@@ -180,10 +184,10 @@ class ReadAheadStream(io.RawIOBase):
                 object is not opened then.
         """
         part_size, max_parts = cls._resolve_options(part_size, max_parts)
-        if kwargs.get("block_size") is None:
-            # A part no larger than the block size is read with one request, not
-            # split into parallel ones by the file.
-            kwargs["block_size"] = part_size
+        if kwargs.get("max_workers") is None:
+            # Each part is read with one request, not split into parallel ones on
+            # a thread pool of the file.
+            kwargs["max_workers"] = 1
         file = fs.open(path, "rb", **kwargs)
         try:
             return cls(
@@ -243,8 +247,7 @@ class ReadAheadStream(io.RawIOBase):
         """
         if self.closed:
             return
-        if self._executor is not None:
-            self._executor.shutdown(wait=True, cancel_futures=True)
+        self._executor.shutdown(wait=True, cancel_futures=True)
         self._parts.clear()
         self._buffer = memoryview(b"")
         try:
@@ -285,9 +288,8 @@ class ReadAheadStream(io.RawIOBase):
 
     def _read_ahead(self) -> None:
         """Start reading parts until ``max_parts`` are in flight or the file is read."""
-        executor = cast(ThreadPoolExecutor, self._executor)
         while len(self._parts) < self._max_parts and self._next_offset < self._size:
             size = min(self._part_size, self._size - self._next_offset)
-            part = executor.submit(self._read_range, self._next_offset, size)
+            part = self._executor.submit(self._read_range, self._next_offset, size)
             self._parts.append((size, part))
             self._next_offset += size

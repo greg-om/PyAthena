@@ -251,12 +251,15 @@ class ImmediateExecutor:
         pass
 
     def submit(self, fn, *args, **kwargs):
-        future = Future()
+        future = self._new_future()
         try:
             future.set_result(fn(*args, **kwargs))
         except Exception as e:
             future.set_exception(e)
         return future
+
+    def _new_future(self):
+        return Future()
 
 
 def interrupt_start_waits(started, release, interrupts=1):

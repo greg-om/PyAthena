@@ -15,10 +15,10 @@ import pyarrow as pa
 import pyarrow.csv as pa_csv
 import pytest
 
-from pyathena import connect
 from pyathena.filesystem.read_ahead import ReadAheadStream
 from pyathena.filesystem.s3 import S3FileSystem
 from tests import ENV
+from tests.pyathena.conftest import connect
 from tests.pyathena.util import EVENT_TIMEOUT, ImmediateExecutor
 
 
@@ -51,15 +51,15 @@ class _RecordingRandomAccessFile:
 
 
 class _InterruptedFuture(Future):
-    """A future whose first ``interrupts`` waits for the outcome are interrupted."""
+    """A future whose first wait for the outcome is interrupted."""
 
-    def __init__(self, interrupts):
+    def __init__(self):
         super().__init__()
-        self.interrupts = interrupts
+        self.interrupted = False
 
     def exception(self, timeout=None):
-        if self.interrupts:
-            self.interrupts -= 1
+        if not self.interrupted:
+            self.interrupted = True
             raise KeyboardInterrupt
         return super().exception(timeout)
 
@@ -70,13 +70,13 @@ class _InterruptedWaitExecutor(ImmediateExecutor):
 
     def __init__(self, max_workers=None):
         super().__init__(max_workers)
-        self.submitted = 0
+        self.submitted = False
 
-    def submit(self, fn, *args, **kwargs):
-        future = _InterruptedFuture(1 if self.submitted == 0 else 0)
-        self.submitted += 1
-        future.set_result(fn(*args, **kwargs))
-        return future
+    def _new_future(self):
+        if self.submitted:
+            return super()._new_future()
+        self.submitted = True
+        return _InterruptedFuture()
 
 
 class _InterruptedShutdownExecutor(ImmediateExecutor):
@@ -85,11 +85,11 @@ class _InterruptedShutdownExecutor(ImmediateExecutor):
 
     def __init__(self, max_workers=None):
         super().__init__(max_workers)
-        self.shutdown_interrupts = 1
+        self.interrupted = False
 
     def shutdown(self, wait=True, cancel_futures=False):
-        if self.shutdown_interrupts:
-            self.shutdown_interrupts -= 1
+        if not self.interrupted:
+            self.interrupted = True
             raise KeyboardInterrupt
 
 
@@ -286,16 +286,17 @@ class TestReadAheadStream:
         fs.open.assert_not_called()
 
     @pytest.mark.parametrize(
-        ("kwargs", "block_size"),
-        [({}, 10), ({"block_size": None}, 10), ({"block_size": 5}, 5)],
+        ("kwargs", "max_workers"),
+        [({}, 1), ({"max_workers": None}, 1), ({"max_workers": 4}, 4)],
         ids=["default", "none", "given"],
     )
-    def test_from_s3_block_size(self, kwargs, block_size):
-        """The object is opened with the part size as the block size unless one is given."""
+    def test_from_s3_max_workers(self, kwargs, max_workers):
+        """The object is opened with one worker, which reads each part with one request,
+        unless the number of workers is given."""
         fs = MagicMock()
         fs.open.return_value.size = 0
         ReadAheadStream.from_s3(fs, "s3://bucket/key", part_size=10, **kwargs).close()
-        fs.open.assert_called_once_with("s3://bucket/key", "rb", block_size=block_size)
+        fs.open.assert_called_once_with("s3://bucket/key", "rb", max_workers=max_workers)
         fs.open.return_value.close.assert_called_once_with()
 
     @pytest.fixture(scope="class")
