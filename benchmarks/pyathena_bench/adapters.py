@@ -309,12 +309,10 @@ async def measure_query(adapter: Adapter, cursor: Any, sql: str, expected: int) 
             count = consume(result, case)
             query_id = None  # The botocore observer captures IDs even for iterators.
         elif case.family in SQLALCHEMY_FAMILIES:
-            # The "cursor" of a SQLAlchemy case is its engine; the connection stays
-            # open while chunks are read.
-            with cursor.connect() as connection:
-                result = pd.read_sql_query(sql, connection, chunksize=case.chunksize)
-                ready = time.perf_counter()
-                count = consume(result, case)
+            # The "cursor" of a SQLAlchemy case is its connection, opened during setup.
+            result = pd.read_sql_query(sql, cursor, chunksize=case.chunksize)
+            ready = time.perf_counter()
+            count = consume(result, case)
             query_id = None
         elif case.api == "thread":
             query_id, future = await asyncio.to_thread(cursor.execute, sql, **options)
@@ -369,7 +367,9 @@ async def run_adapter(
     case = adapter.case
     sqlalchemy = case.family in SQLALCHEMY_FAMILIES
     connection = None if case.family == "wrangler" or sqlalchemy else adapter.connection()
-    cursors: list[Any] = [adapter.engine()] if sqlalchemy else []
+    engine = adapter.engine() if sqlalchemy else None
+    # Like a cursor, the SQLAlchemy connection is set up outside the measurement.
+    cursors: list[Any] = [engine.connect()] if engine is not None else []
     if case.suite != "init" and connection is not None:
         # AsyncCursor owns one shared pool; Aio cursors carry per-query state.
         cursors = [
@@ -431,11 +431,11 @@ async def run_adapter(
         stop.set()
         await monitor
         for cursor in cursors:
-            if sqlalchemy:
-                cursor.dispose()
-            elif case.api == "thread":
+            if case.api == "thread":
                 cursor.close(wait=True)
             else:
                 cursor.close()
         if connection is not None:
             connection.close()
+        if engine is not None:
+            engine.dispose()

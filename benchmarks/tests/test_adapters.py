@@ -8,7 +8,6 @@
 import asyncio
 import weakref
 from concurrent.futures import Future
-from contextlib import contextmanager
 from io import BytesIO
 from types import SimpleNamespace
 
@@ -198,11 +197,6 @@ class TestAdapter:
                 return pd.DataFrame({"a": range(5)})
             return (pd.DataFrame({"a": range(n)}) for n in (2, 2, 1))
 
-        class Engine:
-            @contextmanager
-            def connect(self):
-                yield "connection"
-
         monkeypatch.setattr(pd, "read_sql_query", read_sql_query)
         for chunksize in (None, 2):
             adapter = Adapter(
@@ -213,10 +207,39 @@ class TestAdapter:
                 "s3://out/",
                 "temp",
             )
-            result = await measure_query(adapter, Engine(), "SELECT a", 5)
+            result = await measure_query(adapter, "connection", "SELECT a", 5)
             assert result["status"] == "ok", result
             assert result["rows"] == 5
         assert calls == [("SELECT a", None), ("SELECT a", 2)]
+
+    async def test_read_sql_query_connects_during_setup(self, monkeypatch):
+        events = []
+
+        class Connection:
+            def close(self):
+                events.append("close")
+
+        class Engine:
+            def connect(self):
+                events.append("connect")
+                return Connection()
+
+            def dispose(self):
+                events.append("dispose")
+
+        async def measure(adapter, cursor, sql, expected):
+            assert isinstance(cursor, Connection)
+            events.append("measure")
+            return {"status": "ok", "rows": expected}
+
+        monkeypatch.setattr(Adapter, "engine", lambda self: Engine())
+        monkeypatch.setattr("pyathena_bench.adapters.measure_query", measure)
+        adapter = Adapter(
+            Settings(), Case("sqla_rest", output="native"), None, "scratch", "s3://out/", "temp"
+        )
+        result = await run_adapter(adapter, "SELECT a", 5)
+        assert result["status"] == "ok"
+        assert events == ["connect", "measure", "close", "dispose"]
 
     def test_pandas_dtype_backend_is_an_execute_option(self):
         adapter = Adapter(

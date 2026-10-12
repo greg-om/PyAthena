@@ -249,6 +249,7 @@ When the temporary directory is a tmpfs, as `/tmp` is on Amazon Linux 2023, file
 
 The SQLAlchemy families `sqla_rest`, `sqla_pandas`, `sqla_arrow`, `sqla_polars`, and `sqla_s3fs` read with the synchronous API in the single-query suite only, and the result-file drivers also read UNLOAD results.
 Their engines connect with the same workgroup, output location, polling interval, and disabled result reuse as the cursor cases, and their cursors take the same cursor options; with `chunksize`, the pandas and Polars drivers' cursors also read the result file in chunks.
+As a cursor is, the engine's connection is opened during setup, outside `total_seconds`.
 `pandas.read_sql_query()` builds DataFrames from the rows of `fetchall()` or `fetchmany()`, so these cases include the driver's row output; `sqla_rest` pages through GetQueryResults like Cursor.
 
 The [Wrangler API documentation](https://aws-sdk-pandas.readthedocs.io/en/stable/stubs/awswrangler.athena.read_sql_query.html) describes its CSV nested-type restriction.
