@@ -10,13 +10,13 @@ from sqlalchemy import cast, literal, select, text, types
 from sqlalchemy.sql.schema import Column, MetaData, Table
 from sqlalchemy.util.concurrency import greenlet_spawn
 
-from pyathena.aio.sqlalchemy.base import AsyncAdapt_pyathena_cursor
+from pyathena.aio.sqlalchemy.base import AthenaAioAdaptedCursor
 from pyathena.sqlalchemy.types import AthenaArray
 from tests import ENV
 from tests.pyathena.util import throttle_metadata_api
 
 
-class TestAsyncAdaptPyathenaCursor:
+class TestAthenaAioAdaptedCursor:
     @pytest.mark.parametrize(
         "error",
         [ValueError("conversion failed"), asyncio.CancelledError()],
@@ -29,7 +29,7 @@ class TestAsyncAdaptPyathenaCursor:
         cursor.fetchall = AsyncMock(side_effect=error)
         closes = []
         cursor.close.side_effect = lambda: closes.append(threading.get_ident())
-        adapted = AsyncAdapt_pyathena_cursor(cursor)
+        adapted = AthenaAioAdaptedCursor(cursor)
 
         with pytest.raises(type(error)):
             await greenlet_spawn(adapted.execute, "SELECT 1")
@@ -48,7 +48,7 @@ class TestAsyncAdaptPyathenaCursor:
         cursor.description = [("col", "varchar", None, None, None, None, None)]
         cursor.fetchall = AsyncMock(side_effect=error)
         cursor.close.side_effect = ValueError("generator already executing")
-        adapted = AsyncAdapt_pyathena_cursor(cursor)
+        adapted = AthenaAioAdaptedCursor(cursor)
 
         with pytest.raises(type(error)) as raised:
             await greenlet_spawn(adapted.execute, "SELECT 1")
