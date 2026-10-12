@@ -709,8 +709,11 @@ class WithAsyncFetch(WithResultSet, AioBaseCursor, CursorIterator):
     and provides async fetch, ``executemany``, and ``cancel``, async
     iteration, and the async context manager protocol. The fetch methods run
     the result set's synchronous fetch with ``asyncio.to_thread``; a subclass
-    whose result set fetches asynchronously overrides them. Synchronous
-    iteration raises ``TypeError``.
+    whose result set fetches asynchronously overrides them. Closing the
+    previous result set when a query is executed, and closing the cursor at
+    the end of an ``async with`` block, also run in a thread, because closing
+    a result stream can wait for a read in progress. Synchronous iteration
+    raises ``TypeError``.
 
     Subclasses override ``execute()`` and optionally ``__init__`` and
     format-specific helpers.
@@ -741,7 +744,7 @@ class WithAsyncFetch(WithResultSet, AioBaseCursor, CursorIterator):
                 An empty parameter list makes no ``execute()`` call, so it does
                 not report unsupported keyword names.
         """
-        self._reset_state()
+        await asyncio.to_thread(self._reset_state)
         rowcount = 0
         try:
             for parameters in seq_of_parameters:
@@ -750,10 +753,10 @@ class WithAsyncFetch(WithResultSet, AioBaseCursor, CursorIterator):
                 rowcount = rowcount + count if rowcount >= 0 and count >= 0 else -1
         except BaseException:
             # Keep the query ID available for diagnostics and explicit cancellation.
-            self.close()
+            await asyncio.to_thread(self.close)
             self.result_set = None
             raise
-        self._reset_state()
+        await asyncio.to_thread(self._reset_state)
         self._rowcount = rowcount
 
     async def cancel(self) -> None:
@@ -852,4 +855,4 @@ class WithAsyncFetch(WithResultSet, AioBaseCursor, CursorIterator):
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        self.close()
+        await asyncio.to_thread(self.close)

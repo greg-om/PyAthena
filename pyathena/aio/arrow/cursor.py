@@ -153,7 +153,7 @@ class AioArrowCursor(WithAsyncFetch):
             Self reference for method chaining.
         """
         self._validate_execute_kwargs(kwargs, ("block_size", "connect_timeout", "request_timeout"))
-        self._reset_state()
+        await asyncio.to_thread(self._reset_state)
         options = ExecuteOptions.resolve(
             options,
             work_group=work_group,

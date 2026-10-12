@@ -181,7 +181,7 @@ class AioPandasCursor(WithAsyncFetch):
         Returns:
             Self reference for method chaining.
         """
-        self._reset_state()
+        await asyncio.to_thread(self._reset_state)
         options = ExecuteOptions.resolve(
             options,
             work_group=work_group,
