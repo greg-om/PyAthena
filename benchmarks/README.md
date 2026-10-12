@@ -98,7 +98,7 @@ Instance size and disk size are parameters, so a later run can deliberately test
 The hosts are Spot Instances of one instance type by default; `Purchase=on-demand` launches On-Demand Instances of that type instead.
 The Auto Scaling group spreads the hosts over `Zones` Availability Zones (4 by default, or 3) with the price-capacity-optimized allocation strategy and never mixes instance types, so every host stays identical.
 The template uses the first `Zones` zones that `Fn::GetAZs` returns, which depends on the zones in which the account's default VPC has default subnets; `us-west-2`, the default region, has four, and the fourth widens Spot capacity, which was missing in two of three zones in the 4.0.0 run.
-Where `Fn::GetAZs` returns three zones, deploy with `Zones=3`; with the default, the deployment fails with a template error before it creates any resource.
+Where `Fn::GetAZs` returns three zones, deploy with `Zones=3`; with the default, the deployment fails with a stack error.
 The group replaces an interrupted Spot Instance; with `QueueName` set, the replacement's worker continues the interrupted job, see [Running on a fleet](#running-on-a-fleet).
 `environment.json` does not record the instance type or purchase option; a worker started with `--terminate-host` records both under `hosts/` in its queue, and the recovered `instances.json` lists the hosts that still exist.
 The AMI parameter resolves the current AL2023 image at deployment; record the resulting AMI when comparing environments.
@@ -404,6 +404,7 @@ A claim, like each API slot under `slots/`, is a lease that its worker renews ev
 When a worker dies, its claim and slots expire, and another worker takes them over with a conditional write, so the job and the slots return to the fleet without manual steps.
 A worker releases a slot by overwriting its lease as released, never by deleting it, so a slot that another worker took over stays held.
 A worker whose claim was taken over, or whose renewals failed until the claim expired, stops the attempt, quiesces its queries as after a failed job, and records nothing for the job; the new owner continues it, and the first `done` marker of a job is never replaced.
+If that worker cannot confirm that the queries stopped, it raises an error and keeps its host, because the job may have no other worker.
 A lost API slot does not stop the job; the `done` marker lists it under `lost_slots`.
 Each attempt of a job writes to `results/<job>/attempt-<n>/`, and the worker uploads its trial records within seconds of each trial's start and end, so a lost host loses only its running trial.
 A trial whose start was not uploaded before its host died is not quiesced by the next attempt; its queries write to their own trial prefix and are cancelled by `cleanup`.

@@ -967,21 +967,23 @@ def run_attempt(
 
     def progress() -> None:
         # Upload at trial boundaries: when a trial starts (its output prefix is
-        # needed to quiesce it) and when it is recorded (needed to resume).
+        # needed to quiesce it) and when it is recorded (needed to resume). A
+        # boundary stays pending until its upload succeeds.
         events, trials = output / "events.jsonl", output / "trials.jsonl"
-        boundary = False
         if events.exists():
             with events.open("rb") as stream:
                 stream.seek(checked.get("events", 0))
-                boundary = b'"trial_start"' in stream.read()
+                if b'"trial_start"' in stream.read():
+                    checked["pending"] = 1
                 checked["events"] = stream.tell()
         if trials.exists() and trials.stat().st_size != checked.get("trials"):
             checked["trials"] = trials.stat().st_size
-            boundary = True
-        if boundary:
+            checked["pending"] = 1
+        if checked.get("pending"):
             for path in (events, trials):
                 if path.exists():
                     queue.s3.upload_file(str(path), queue.bucket, queue.key(*remote, path.name))
+            checked["pending"] = 0
 
     with JobWatch(queue, [claim, *slots], lease_seconds, renew_seconds, progress, notice) as watch:
 
@@ -1131,6 +1133,8 @@ def work(
             ``wait`` is false, or a job needs more API slots than ``api_slots``.
         SpotInterruptionError: After an interruption notice, once the running attempt's
             records are uploaded and its claim is released as interrupted.
+        RuntimeError: If an attempt stopped by a lost claim could not be quiesced;
+            the worker's host is then kept.
     """
     while not queue.exists("queue.json"):
         if not wait:
@@ -1210,6 +1214,12 @@ def work(
                 )
                 if outcome.state == "interrupted":
                     raise SpotInterruptionError(completed)
+                if outcome.state == "lost" and outcome.errors:
+                    # The job is unfinished, so the host is kept rather than retired.
+                    raise RuntimeError(
+                        f"Could not quiesce a stopped attempt of {job['id']}: "
+                        + "; ".join(outcome.errors)
+                    )
                 if outcome.state == "done":
                     completed.append(job["id"])
                 if outcome.errors:

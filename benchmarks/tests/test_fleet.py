@@ -1232,3 +1232,58 @@ class TestReviewRepairs:
         argv = ["--config", str(config), "worker", "--stack", "s", "--name", "q"]
         assert main(argv) == 0
         assert not Path("interruption-notice").exists()
+
+
+class TestReviewRepairsFollowUp:
+    def test_an_unconfirmed_stopped_attempt_keeps_the_host(self, tmp_path, monkeypatch):
+        s3, queue = queue_with([job("a")], tmp_path)
+
+        def runner(item, workdir, out, resume, stop):
+            s3.put_object(
+                Key=queue.key("claims", "a"),
+                Body=json.dumps(
+                    {"host": "other", "job": "a", "attempt": 2, "state": "running",
+                     "renewed": time.time(), "expires": time.time() + 600}
+                ).encode(),
+            )  # fmt: skip
+            assert stop.wait(5)
+            return 130
+
+        with pytest.raises(RuntimeError, match="Could not quiesce a stopped attempt of a"):
+            work(
+                queue,
+                tmp_path / "w",
+                api_slots=1,
+                runner=runner,
+                settle=lambda output: ["q1: still RUNNING"],
+                renew_seconds=0.01,
+            )
+        assert not queue.names("done")
+
+    def test_a_failed_trial_start_upload_is_retried(self, tmp_path):
+        s3, queue = queue_with([job("a")], tmp_path)
+        events_key = queue.key("results", "a", "attempt-1", "events.jsonl")
+        original = s3.upload_file
+        failures = []
+
+        def flaky(filename, bucket, key):
+            if key == events_key and not failures:
+                failures.append(key)
+                raise ClientError({"Error": {"Code": "SlowDown"}}, "PutObject")
+            return original(filename, bucket, key)
+
+        s3.upload_file = flaky
+
+        def runner(item, workdir, out, resume, stop):
+            out.mkdir(parents=True)
+            (out / "events.jsonl").write_text(json.dumps({"event": "trial_start"}) + "\n")
+            deadline = time.monotonic() + 5
+            while events_key not in s3.objects and time.monotonic() < deadline:
+                time.sleep(0.01)
+            # The trial is still running; its start was uploaded after one failure.
+            assert failures == [events_key]
+            assert events_key in s3.objects
+            return 0
+
+        assert work(queue, tmp_path / "w", api_slots=1, runner=runner, settle=no_queries,
+                    renew_seconds=0.01) == ["a"]  # fmt: skip
