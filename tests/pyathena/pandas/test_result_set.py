@@ -334,6 +334,26 @@ class TestAthenaPandasResultSet:
         ):
             result_set._as_pandas()
 
+    def test_read_parquet_footers_failure_stops_reads(self, tmp_path):
+        """A footer that fails to read stops the footer reads that have not started."""
+        result_set, paths = _unload_result_set(tmp_path, [pa.table({"i": [1]})] * 10, chunksize=1)
+        result_set._connection.s3_client.meta.config.max_pool_connections = 1
+        read = []
+
+        def read_parquet_footer(path):
+            read.append(path)
+            raise OSError(f"cannot read {path}")
+
+        with (
+            patch.object(AthenaPandasResultSet, "_read_data_manifest", return_value=paths),
+            patch.object(result_set, "_read_parquet_footer", side_effect=read_parquet_footer),
+            pytest.raises(OperationalError, match="cannot read"),
+        ):
+            result_set._read_parquet_footers()
+        # The one worker may start the next read before the rest are cancelled.
+        assert read[0] == paths[0]
+        assert len(read) <= 2
+
     def test_iter_parquet_chunks_reader_error(self, tmp_path):
         """Errors from creating the chunk reader are raised as OperationalError."""
         with pytest.raises(OperationalError, match="chunksize must be positive"):
@@ -470,9 +490,8 @@ def _unload_result_set(tmp_path, tables, chunksize, write_statistics=True, **kwa
     result_set._engine = "auto"
     result_set._chunksize = chunksize
     result_set._cache_type = None
-    result_set._max_workers = 2
     result_set._connection = MagicMock()
-    result_set._connection.s3_client.meta.config.max_pool_connections = 10
+    result_set._connection.s3_client.meta.config.max_pool_connections = 2
     result_set._kwargs = kwargs
     result_set._unload_location = None
     result_set._parquet_null_dtypes = {}
@@ -482,8 +501,8 @@ def _unload_result_set(tmp_path, tables, chunksize, write_statistics=True, **kwa
 def _read_unload_result(tmp_path, tables, chunksize, write_statistics=True, **kwargs):
     """Read Parquet files in chunks through the result set, without AWS.
 
-    The column metadata must come from the footer of the first file, without listing
-    the unload location.
+    The column metadata must be what the dataset of the files reports, read without
+    listing the unload location.
 
     Returns:
         The chunks, and the whole result read by pandas.read_parquet() with the same
@@ -501,7 +520,8 @@ def _read_unload_result(tmp_path, tables, chunksize, write_statistics=True, **kw
     ):
         reader = result_set._as_pandas()
     read_parquet_schema.assert_not_called()
-    assert result_set._metadata == to_column_info(pq.read_schema(paths[0]))
+    dataset = pq.ParquetDataset(str(tmp_path), filesystem=LocalFileSystem())
+    assert result_set._metadata == to_column_info(dataset.schema)
     chunks = list(reader)
     whole = pd.concat([pd.read_parquet(path, **kwargs) for path in paths], ignore_index=True)
     return chunks, whole

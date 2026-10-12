@@ -234,8 +234,9 @@ class AthenaPolarsResultSet(AthenaResultSet):
             unload: Whether this is an UNLOAD query result.
             unload_location: S3 location for UNLOAD results.
             block_size: Block size for S3 file reading.
-            cache_type: Cache type for S3 file system. Without ``cache_type``, a Parquet file of
-                a chunked UNLOAD result that is larger than 32 MiB is read without a cache.
+            cache_type: Cache type for S3 file system. Without ``cache_type``, PyAthena's filesystem
+                reads a Parquet file of a chunked UNLOAD result that is larger than 32 MiB without a
+                cache.
             max_workers: Maximum number of worker threads.
             chunksize: Number of rows per chunk for memory-efficient processing.
                       If specified, data is loaded lazily in chunks for all data

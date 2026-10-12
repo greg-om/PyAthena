@@ -557,8 +557,8 @@ class AthenaPandasResultSet(AthenaResultSet):
                 file that ``pandas.read_csv()`` reads in one call, without ``chunksize`` or
                 ``iterator``, is read in 32 MiB blocks with fsspec's background cache, which reads
                 the next block while pandas parses the current one.
-                Without ``cache_type``, a Parquet file of a chunked UNLOAD result that is larger
-                than 32 MiB is read without a cache.
+                Without ``cache_type``, PyAthena's filesystem reads a Parquet file of a chunked
+                UNLOAD result that is larger than 32 MiB without a cache.
             max_workers: Maximum worker threads for parallel operations.
             auto_optimize_chunksize: Enable automatic chunksize determination
                                    for large files when chunksize is None.
@@ -1473,10 +1473,9 @@ class AthenaPandasResultSet(AthenaResultSet):
     def _read_parquet_footers(self) -> list[FileMetaData]:
         """Read the data manifest and the footers of its Parquet files.
 
-        The footers are read concurrently, with at most ``max_workers`` threads and no
-        more threads than the connection pool of the S3 client. It sets the unload
-        location, and the whole-result dtypes of the columns that
-        ``_get_parquet_null_dtypes()`` finds in any file.
+        The footers are read concurrently, with no more threads than the connection pool
+        of the S3 client. It sets the unload location, and the whole-result dtypes of the
+        columns that ``_get_parquet_null_dtypes()`` finds in any file.
 
         Returns:
             The footers of the files, in the order of the data manifest.
@@ -1492,11 +1491,11 @@ class AthenaPandasResultSet(AthenaResultSet):
         # More threads than the S3 client's connection pool would discard connections,
         # each with a warning from urllib3.
         workers = min(
-            self._max_workers,
             self.connection.s3_client.meta.config.max_pool_connections,
             len(self._data_manifest),
         )
         try:
+            # When a read fails, map() cancels the reads that have not started.
             with ThreadPoolExecutor(max_workers=workers) as executor:
                 footers = list(executor.map(self._read_parquet_footer, self._data_manifest))
         except Exception as e:
