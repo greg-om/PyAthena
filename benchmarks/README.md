@@ -405,7 +405,7 @@ A worker whose claim was taken over, or whose renewals failed until the claim ex
 A lost API slot does not stop the job; the `done` marker lists it under `lost_slots`.
 Each attempt of a job writes to `results/<job>/attempt-<n>/`, and the worker uploads changed trial records every five seconds, so a lost host loses its running trial and at most the records of the last seconds.
 A trial whose start was not uploaded before its host died is not quiesced by the next attempt; its queries write to their own trial prefix and are cancelled by `cleanup`.
-After a job, the worker uploads the attempt's output directory and its log to `logs/`, renews its claim conditionally to confirm that it still owns the job, writes `results/<job>/summary.csv` and `summary.md` from every attempt, and then creates `done/<job>` with the exit code, attempt, host, and times.
+After a job, the worker uploads the attempt's output directory and its log to `logs/`, renews its claim conditionally to confirm that it still owns the job, writes `job-summary.csv` and `job-summary.md` from every attempt into its attempt directory, and then creates `done/<job>` with the exit code, attempt, host, times, and the summary's attempt directory under `summary`.
 A failed trial stops only its own job; `status` lists jobs with a non-zero exit code, the claims of running jobs, and the slots in use, each with its host, attempt, and whether its lease has expired.
 After a failed job, the worker stops the job's reported queries and every queued or running query in the workgroup that writes under the job's trial output prefixes, which also covers queries whose IDs were never reported before a trial process died.
 It waits until they stop before claiming another job; this scans the workgroup's query history.
@@ -416,6 +416,7 @@ On a notice, the worker interrupts the running trial with SIGINT, which cancels 
 A separate thread watches for the notice, so slow S3 requests do not delay it.
 The group replaces the reclaimed instance, and the new host's worker takes over the interrupted claim as the next attempt: it downloads the earlier attempts, quiesces their trials as after a failed job, and runs only the repetitions that they did not record as successful, through `run --resume`.
 The job's summary merges the attempts and leaves out a failed or incomplete trial whose repetition succeeded in a later attempt, so it reports the trials of an uninterrupted run.
+`report results/recovered/fleet/<name>/results/<job>` produces the same merged summary from the recovered attempts.
 Rebalance recommendations are not acted on; an interruption does not always follow them, and the notice leaves enough time to stop a trial.
 
 Workers exit when no job is left to claim and every other unfinished job's claim has been renewed since they found nothing to claim and is still fresh, which takes up to a renewal interval.
@@ -468,7 +469,7 @@ uv run --env-file ../.env --locked aws autoscaling terminate-instance-in-auto-sc
 ```
 
 The group launches a replacement whose worker continues the job as `attempt-2` and then retires the host.
-The pilot passes when `done/<job>` records `attempt` 2 and exit code 0, every case in `results/<job>/summary.csv` reports six successful trials and no failures, `hosts/` records the replacement with lifecycle `spot`, and the group's desired capacity drops to zero.
+The pilot passes when `done/<job>` records `attempt` 2 and exit code 0, every case in `results/<job>/attempt-2/job-summary.csv` reports six successful trials and no failures, `hosts/` records the replacement with lifecycle `spot`, and the group's desired capacity drops to zero.
 AWS Fault Injection Service (`aws:ec2:send-spot-instance-interruptions`) sends a real notice instead, but needs its own IAM role and experiment template.
 
 ## Reports and recovery

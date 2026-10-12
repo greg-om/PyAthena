@@ -920,10 +920,12 @@ def run_attempt(
     2 or later) first downloads the earlier attempts, quiesces their trials,
     and passes them to the runner so that completed trials are not repeated.
     Changed trial records are uploaded every few seconds. An interruption
-    notice or a lost lease stops the runner; after a notice, the claim is
-    released as interrupted before the attempt is uploaded. Otherwise, after a
-    final check that the claim is still held, the job-level report merges
-    every attempt, and the ``done`` marker records the exit code.
+    notice or a lost claim stops the runner; after a notice, the attempt is
+    uploaded and the claim released as interrupted. Otherwise, after a
+    conditional renewal confirms that the claim is still held, the job's
+    report merges every attempt into ``job-summary.csv`` and
+    ``job-summary.md`` of this attempt, and the first ``done`` marker of the
+    job records the exit code and names that attempt.
 
     Args:
         queue: Queue of the job.
@@ -1019,10 +1021,11 @@ def run_attempt(
             # The claim was taken over or expired; its new owner records the job.
             return Outcome("lost")
         if report_error is None:
-            # Summaries go first, so a recorded job always has them.
+            # The job's summary goes below this attempt, which the done marker names,
+            # so a former owner's late upload cannot replace the recorded summary.
             for name in ("summary.csv", "summary.md"):
                 queue.s3.upload_file(
-                    str(job_dir / name), queue.bucket, queue.key("results", job["id"], name)
+                    str(job_dir / name), queue.bucket, queue.key(*remote, f"job-{name}")
                 )
         if time.time() >= claim.body["expires"]:
             # Publication outlasted the renewed claim, which another worker may own now.
@@ -1038,6 +1041,7 @@ def run_attempt(
                 "end": now(),
                 "quiesce_errors": errors,
                 "report_error": report_error,
+                "summary": None if report_error else "/".join(remote[1:]),
                 "lost_slots": [key for key in watch.lost if key != claim.key],
             },
             IfNoneMatch="*",

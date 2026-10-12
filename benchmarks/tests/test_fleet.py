@@ -789,10 +789,12 @@ class TestInterruption:
         assert runs == [("heavy", "attempt-2", ["attempt-1"]), ("next", "attempt-1", [])]
         # The interrupted attempt's queries are quiesced before the job continues.
         assert settled == ["attempt-1"]
-        order = [key for key in writes if key.endswith(("heavy/summary.csv", "done/heavy"))]
-        # A recorded job always has its summary.
-        assert order == [queue.key("results", "heavy", "summary.csv"), queue.key("done", "heavy")]
-        summary = s3.objects[queue.key("results", "heavy", "summary.csv")].decode()
+        summary_key = queue.key("results", "heavy", "attempt-2", "job-summary.csv")
+        order = [key for key in writes if key in {summary_key, queue.key("done", "heavy")}]
+        # A recorded job always has its summary, below the attempt that the marker names.
+        assert order == [summary_key, queue.key("done", "heavy")]
+        assert json.loads(queue.read("done", "heavy"))["summary"] == "heavy/attempt-2"
+        summary = s3.objects[summary_key].decode()
         row = next(csv.DictReader(io.StringIO(summary)))
         assert (row["successful_trials"], row["failed_trials"]) == ("3", "0")
         assert json.loads(queue.read("done", "heavy"))["attempt"] == 2
@@ -1028,17 +1030,16 @@ class TestLeaseExpiry:
 
         queue.renew = stall
         watch = JobWatch(queue, [claim], 600, 0.01, lambda: None, lambda: False)
-        try:
-            with watch:
+        with watch:
+            try:
                 assert stalled.wait(5)
                 # The claim expires while its renewal is still blocked in S3.
                 assert watch.stop_requested.wait(5)
                 assert not watch.interrupted.is_set()
-                assert stalled.is_set()
                 assert not watch.lost
+            finally:
+                # Unblock the renewal before leaving the block joins the thread.
                 released.set()
-        finally:
-            released.set()
 
     def test_losing_a_slot_does_not_stop_the_job(self, tmp_path):
         s3, queue = queue_with([job("heavy", heavy=True)], tmp_path)
@@ -1103,7 +1104,7 @@ class TestLeaseExpiry:
         monkeypatch.setattr("pyathena_bench.fleet.time.sleep", sleep)
         assert work(queue, tmp_path / "w", api_slots=1, runner=runner, settle=no_queries) == []
         assert not queue.names("done")
-        assert queue.key("results", "a", "summary.csv") not in s3.objects
+        assert not [key for key in s3.objects if key.endswith("job-summary.csv")]
 
 
 def test_a_claim_renewed_once_then_stale_does_not_let_the_worker_exit(tmp_path, monkeypatch):
