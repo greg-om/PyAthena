@@ -16,6 +16,7 @@ import pytest
 from fsspec.implementations.local import LocalFileSystem
 from pandas.testing import assert_frame_equal
 
+from pyathena.error import OperationalError
 from pyathena.pandas.converter import DefaultPandasTypeConverter
 from pyathena.pandas.result_set import (
     AthenaPandasResultSet,
@@ -336,6 +337,11 @@ class TestParquetChunkDtypes:
         assert [chunk["i"].dtype for chunk in chunks] == ["int64", "int64"]
         assert [int(chunk["i"].iloc[0]) for chunk in chunks] == [9007199254740993, 1]
         assert_frame_equal(pd.concat(chunks), whole, check_exact=True)
+
+    def test_reader_errors_raise_operational_error(self, tmp_path):
+        """Errors from creating the chunk reader are raised as OperationalError."""
+        with pytest.raises(OperationalError, match="chunksize must be positive"):
+            _read_parquet_chunks(tmp_path, [pa.table({"i": [1]})], chunksize=0)
 
     def test_nested_values_convert_per_chunk(self, tmp_path):
         """Nested values convert per chunk; with dtype_backend="pyarrow" they do not."""

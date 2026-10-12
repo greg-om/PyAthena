@@ -1420,15 +1420,14 @@ class AthenaPandasResultSet(AthenaResultSet):
         Raises:
             OperationalError: If reading the Parquet files fails.
         """
-        reader = ParquetChunkReader(
-            self._fs,
-            self._data_manifest,
-            cast(int, self._chunksize),
-            columns=self._kwargs.get("columns"),
-        )
         start = 0
         try:
-            with reader:
+            with ParquetChunkReader(
+                self._fs,
+                self._data_manifest,
+                cast(int, self._chunksize),
+                columns=self._kwargs.get("columns"),
+            ) as reader:
                 for table in reader:
                     df = self._convert_parquet_chunk(table, start)
                     start += len(df)
