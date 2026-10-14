@@ -770,29 +770,30 @@ def quiesce(settings: Settings, output: Path) -> list[str]:
         Queries that could not be confirmed as stopped, with the reason.
 
     Raises:
-        ClientError: If Athena still throttled a request after its retries;
-            see :func:`is_throttling`.
+        ClientError: If Athena still throttled a request after its retries
+            (see :func:`is_throttling`) and nothing else kept the queries from
+            being confirmed as stopped; every known query was asked to stop.
     """
     reported, prefixes = trial_evidence(output)
     athena = client(session(settings), "athena", max_retries=QUIESCE_RETRIES)
     stop_errors: dict[str, str] = {}
+    throttled: list[ClientError] = []
 
     def stop(ids: Iterable[str]) -> None:
-        throttled = None
         for query_id in sorted(ids):
             try:
                 athena.stop_query_execution(QueryExecutionId=query_id)
             except ClientError as exc:
                 if is_throttling(exc):
-                    throttled = throttled or exc
+                    throttled.append(exc)
                 stop_errors[query_id] = str(exc)
-        if throttled:
-            # The other queries were still asked to stop.
-            raise throttled
 
     stop(reported)
     found = active_queries(athena, settings.workgroup, prefixes) if prefixes else set()
     stop(found - reported)
+    if throttled:
+        # Raised only after every known query was asked to stop.
+        raise throttled[0]
     errors = []
     deadline = time.monotonic() + settings.timeout_seconds
     for query_id in sorted(reported | found):
@@ -803,7 +804,7 @@ def quiesce(settings: Settings, output: Path) -> list[str]:
                 ]["State"]
             except ClientError as exc:
                 if is_throttling(exc):
-                    raise
+                    throttled.append(exc)
                 errors.append(f"{query_id}: {stop_errors.get(query_id, exc)}")
                 break
             if state not in {"QUEUED", "RUNNING"}:
@@ -812,6 +813,9 @@ def quiesce(settings: Settings, output: Path) -> list[str]:
                 errors.append(f"{query_id}: still {state}; {stop_errors.get(query_id, '')}")
                 break
             time.sleep(settings.poll_interval)
+    if errors and len(throttled) == len(errors):
+        # Only throttling kept the queries from being confirmed as stopped.
+        raise throttled[0]
     return errors
 
 
@@ -1059,15 +1063,15 @@ def run_attempt(
             upload_attempt()
             queue.end_lease(claim, "interrupted")
             return Outcome("interrupted")
-        if deferred:
-            # Nothing ran, so the next attempt resumes from the same earlier attempts.
-            watch.stop()
-            queue.end_lease(claim, "released")
-            return Outcome("deferred")
-        if code and not errors:
+        if code and not errors and not deferred:
             # A failed or stopped run can leave queries running.
             errors = safe_settle(output)
         upload_attempt()
+
+    if deferred:
+        # Nothing ran, so the next attempt resumes from the same earlier attempts.
+        queue.end_lease(claim, "released")
+        return Outcome("deferred")
 
     def abandon() -> Outcome:
         # A claim lost only by its local expiry, for example while a renewal that

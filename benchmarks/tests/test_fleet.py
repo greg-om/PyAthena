@@ -768,16 +768,41 @@ class TestQuiesce:
     def test_a_throttled_stop_does_not_skip_the_other_queries(self, tmp_path, use_athena):
         write_events(
             tmp_path,
+            {"event": "trial_start", "trial": "t1", "output": "s3://b/trials/t1/"},
             *({"event": "query", "trial": "t1", "query_id": q} for q in ("first", "second")),
         )
         athena = FakeAthena(
-            {"first": "RUNNING", "second": "RUNNING"}, stop_errors={"first": "ThrottlingException"}
+            {"first": "RUNNING", "second": "RUNNING", "unreported": "RUNNING"},
+            stop_errors={"first": "ThrottlingException"},
         )
-        use_athena(athena)
+        use_athena(athena, lambda client_, workgroup, prefixes: {"unreported"})
         with pytest.raises(ClientError, match="ThrottlingException"):
             quiesce(Settings(poll_interval=0.01), tmp_path)
-        assert athena.stopped == ["first", "second"]
-        assert athena.states["second"] == "CANCELLED"
+        # The history scan still found and stopped the unreported query.
+        assert athena.stopped == ["first", "second", "unreported"]
+        assert athena.states["second"] == athena.states["unreported"] == "CANCELLED"
+
+    def test_throttling_does_not_hide_a_query_that_did_not_stop(self, tmp_path, use_athena):
+        write_events(
+            tmp_path,
+            *({"event": "query", "trial": "t1", "query_id": q} for q in ("first", "second")),
+        )
+        athena = FakeAthena(
+            {"first": "RUNNING", "second": "RUNNING"},
+            stop_errors={"first": "InvalidRequestException"},
+        )
+        status = athena.get_query_execution
+
+        def throttled_second(**kwargs):
+            if kwargs["QueryExecutionId"] == "second":
+                raise throttling("GetQueryExecution")
+            return status(**kwargs)
+
+        athena.get_query_execution = throttled_second
+        use_athena(athena)
+        first, second = quiesce(Settings(poll_interval=0.01, timeout_seconds=0.05), tmp_path)
+        assert first.startswith("first: still RUNNING")
+        assert second.startswith("second: An error occurred (ThrottlingException)")
 
     def test_a_throttled_status_check_raises(self, tmp_path, use_athena):
         write_events(tmp_path, {"event": "query", "trial": "t1", "query_id": "reported"})
@@ -1374,7 +1399,7 @@ class TestWork:
         assert queue.read_lease(queue.key("claims", "a")).body["state"] == "released"
 
     def test_a_throttled_takeover_releases_the_job_for_a_later_attempt(self, tmp_path):
-        _, queue = queue_with([job("a"), job("b")], tmp_path)
+        _, queue = queue_with([job("a", heavy=True), job("b")], tmp_path)
         # The host of the first attempt was lost during a trial.
         queue.acquire(queue.key("claims", "a"), {"host": "dead", "job": "a"}, -1)
         start = {"event": "trial_start", "trial": "t1", "output": "s3://r/runs/x/trials/t1/",
@@ -1400,6 +1425,7 @@ class TestWork:
         assert calls == [("b", "attempt-1", []), ("a", "attempt-3", ["attempt-1"])]
         assert json.loads(queue.read("done", "a"))["attempt"] == 3
         assert status(queue)["failed"] == {}
+        assert not live_slots(queue)
 
     def test_throttling_after_an_unconfirmed_query_fails_the_takeover(self, tmp_path):
         _, queue = queue_with([job("a"), job("b")], tmp_path)
