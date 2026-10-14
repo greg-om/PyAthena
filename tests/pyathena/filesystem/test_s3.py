@@ -7108,10 +7108,60 @@ class TestS3File:
         fs.core.complete_multipart_upload.assert_not_called()
 
     @pytest.mark.parametrize("autocommit", [True, False])
-    def test_write_failed_part_while_waiting(self, autocommit):
-        # GH-1158: a part that fails while a write waits for it is reported
-        # by commit(), which aborts the upload, as before writes waited for
-        # parts.
+    @pytest.mark.parametrize("max_workers", [1, 2, 3])
+    def test_write_failed_part_while_waiting(self, autocommit, max_workers):
+        # GH-1173: a part found failed when a write waits for a part stops the
+        # write with its error and closes the file without committing it, also
+        # inside a transaction (autocommit=False). The write used to upload
+        # the rest of the data, and the failed parts kept their data until
+        # commit().
+        fs = self._make_append_fs(b"")
+        fs.core.upload_part.side_effect = PermissionError("Access Denied")
+        executor = S3ThreadPoolExecutor(max_workers=max_workers)
+        submit_to = executor.submit_to
+        submitted = []
+
+        def record_upload(future, fn, *args, **kwargs):
+            if "body" in kwargs:
+                submitted.append(kwargs["part_number"])
+            submit_to(future, fn, *args, **kwargs)
+
+        executor.submit_to = record_upload  # type: ignore[method-assign]
+        f = S3File(
+            fs,
+            "s3://bucket/key.txt",
+            mode="wb",
+            block_size=4,
+            autocommit=autocommit,
+            max_workers=max_workers,
+            executor=executor,
+        )
+        for _ in range(max_workers):
+            f.write(b"a" * 4)
+        with pytest.raises(PermissionError, match="Access Denied"):
+            f.write(b"a" * 4)
+
+        # Only the parts submitted before the first wait were scheduled, and
+        # the cleanup cancelled the ones that had not started.
+        assert submitted == list(range(1, max_workers + 1))
+        assert 1 <= fs.core.upload_part.call_count <= max_workers
+        fs._call.assert_called_once_with(
+            S3_CLIENT.abort_multipart_upload, Bucket="bucket", Key="key.txt", UploadId="uploadid"
+        )
+        assert f.closed
+        assert f.buffer is None
+        assert f.multipart_upload is None
+        # The failed parts and their data are no longer referenced.
+        assert f.multipart_upload_parts == []
+        f.close()
+        f.commit()
+        fs._call.assert_called_once()
+        fs.core.complete_multipart_upload.assert_not_called()
+
+    @pytest.mark.parametrize("autocommit", [True, False])
+    def test_write_failed_part_after_last_wait(self, autocommit):
+        # GH-1158: a part that fails after the last wait of the writes is
+        # reported by commit(), which aborts the upload.
         fs = self._make_append_fs(b"")
         respond = fs.core.upload_part.side_effect
 
@@ -7127,7 +7177,7 @@ class TestS3File:
             mode="wb",
             block_size=4,
             autocommit=autocommit,
-            max_workers=1,
+            max_workers=3,
         )
         for _ in range(3):
             f.write(b"a" * 4)

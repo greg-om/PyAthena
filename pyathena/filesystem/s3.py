@@ -3078,7 +3078,8 @@ class S3File(AbstractBufferedFile):
         which uploads it with PutObject. Otherwise, the buffered data is
         uploaded as parts, and a part is submitted only while fewer than
         ``max_workers`` uploaded parts are in flight; the write waits for
-        one of them to finish first. A failed part is reported by
+        one of them to finish first. A part found failed by that wait stops
+        the write with its error; one that fails afterwards is reported by
         :meth:`commit`. If the upload of the chunk fails or is interrupted,
         the file is closed without committing it.
 
@@ -3115,9 +3116,13 @@ class S3File(AbstractBufferedFile):
             ):
                 if len(self._uploads_in_flight) >= self.max_workers:
                     # Otherwise the parts waiting for a worker pile up in memory.
-                    _, self._uploads_in_flight = wait(
+                    done, self._uploads_in_flight = wait(
                         self._uploads_in_flight, return_when=FIRST_COMPLETED
                     )
+                    for upload in done:
+                        # A failed part would otherwise keep its data until
+                        # commit() while the rest of the data is uploaded.
+                        upload.result()
                 # Tracked before it is scheduled, so that an interrupt while
                 # it is being scheduled still lets discard() cancel it or wait
                 # for it before the abort.
