@@ -479,14 +479,17 @@ Each attempt of a job writes to `results/<job>/attempt-<n>/`; between trials, it
 A trial whose start checkpoint could not be written, which the run logs, is not quiesced by the next attempt; its queries write to their own trial prefix and are cancelled by `cleanup`.
 After a job, the worker uploads the attempt's output directory and its log to `logs/`, renews its claim conditionally to confirm that it still owns the job, writes `job-summary.csv` and `job-summary.md` from every attempt into its attempt directory, and then creates `done/<job>` with the exit code, attempt, host, times, and the summary's attempt directory under `summary`.
 A failed trial stops only its own job; `status` lists jobs with a non-zero exit code or a report error, the claims of running jobs, and the slots in use, each with its host, attempt, and whether its lease has expired.
-After a failed job, the worker stops the job's reported queries and every queued or running query in the workgroup that writes under the job's trial output prefixes, which also covers queries whose IDs were never reported before a trial process died.
-It waits until they stop before claiming another job; this scans the workgroup's query history.
-If it cannot confirm that, it records the errors in the `done` marker and exits.
+After a failed job, the worker stops the queries that the job's trials reported, except those of trials recorded as successful.
+Then it stops every queued or running query in the workgroup that writes under the output prefixes of those trials, which also covers queries whose IDs were never reported before a trial process stopped; this scans the workgroup's query history, and is skipped when every started trial succeeded.
+It waits until they stop before claiming another job.
+Each of these Athena requests is retried up to 10 times, compared with 5 elsewhere, and each retry waits with jittered exponential backoff of up to 20 seconds.
+If it cannot confirm that the queries stopped, it records the errors in the `done` marker and exits.
 
 Each worker checks instance metadata for a Spot interruption notice (`spot/instance-action`), which EC2 publishes about two minutes before it reclaims an instance.
 On a notice, the worker interrupts the running trial with SIGINT, which cancels the trial's reported queries, uploads the attempt, releases its claim as `interrupted` and its slots, and exits without terminating the host.
 A separate thread watches for the notice, so slow S3 requests do not delay it.
 The group replaces the reclaimed instance, and the new host's worker takes over the interrupted claim as the next attempt: it downloads the earlier attempts, quiesces their trials as after a failed job, and runs its own warmups and then only the measured repetitions that they did not record as successful, through `run --resume`.
+If Athena still throttles a request after its retries while the worker quiesces an earlier attempt, the worker releases the claim without running or recording the job and continues with the next pending job; a later attempt on any host quiesces the earlier attempts again, and the worker keeps its host while the job is pending.
 The job's summary merges the attempts and leaves a failed or incomplete trial whose repetition succeeded in a later attempt out of `failed_trials`, noting its reason as `Superseded: ...`, so it reports the trials of an uninterrupted run without hiding failures.
 `report results/recovered/fleet/<name>/results/<job>` produces the same merged summary from the recovered attempts.
 Rebalance recommendations are not acted on; an interruption does not always follow them, and the notice leaves enough time to stop a trial.

@@ -33,7 +33,7 @@ from botocore.exceptions import ClientError
 from pyathena_bench.aws import active_queries, client, session
 from pyathena_bench.cases import Case, matrix
 from pyathena_bench.config import Settings
-from pyathena_bench.report import read_trial_starts, report
+from pyathena_bench.report import read_records, read_trial_starts, read_trials, report
 
 # Row cursors page through GetQueryResults, which has an account-wide request-rate quota;
 # so does read_sql_query() through the REST driver.
@@ -50,6 +50,11 @@ _logger = logging.getLogger(__name__)
 METADATA_ERRORS = (OSError, http.client.HTTPException)
 # S3 errors of a conditional write whose condition failed.
 PRECONDITION_ERRORS = {"PreconditionFailed", "ConditionalRequestConflict"}
+# Error codes of requests that Athena throttled.
+THROTTLING_ERRORS = {"ThrottlingException", "TooManyRequestsException"}
+# Retries per Athena request while quiescing; the default client's 5 retries did
+# not outlast the throttling of concurrent history scans in a fleet.
+QUIESCE_RETRIES = 10
 
 
 @dataclass(frozen=True)
@@ -698,65 +703,114 @@ def run_job(
 
 
 def trial_evidence(output: Path) -> tuple[set[str], tuple[str, ...]]:
-    """Collect the query IDs and output prefixes that a job's trials used.
+    """Collect the queries of a job's trials that may still be active.
+
+    A trial recorded as successful ran its queries to completion. Any other
+    started trial may also have started queries whose IDs it never reported,
+    even if it reported others: a trial can run several queries, and its
+    process can be stopped while a query starts.
 
     Args:
         output: Job output directory with ``events.jsonl`` or the checkpoint
             of a fleet attempt.
 
     Returns:
-        Reported query IDs and the S3 output prefixes of started trials; both
-        are empty if the job wrote no events.
+        The query IDs that trials not recorded as successful reported, in
+        events or in their records, and the S3 output prefixes of those
+        trials; both are empty if the job wrote no events or checkpoint.
     """
-    events = output / "events.jsonl"
-    ids: set[str] = set()
-    if events.exists():
-        for line in events.read_text().splitlines():
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if event.get("event") == "query" and event.get("query_id"):
-                ids.add(event["query_id"])
-    prefixes = {e["output"] for e in read_trial_starts(output) if e.get("output")}
+    records = read_trials(output)
+    succeeded = {t.get("trial") for t in records if t.get("status") == "ok"}
+    ids = {
+        e["query_id"]
+        for e in read_records(output / "events.jsonl")
+        if e.get("event") == "query" and e.get("query_id") and e.get("trial") not in succeeded
+    }
+    for record in records:
+        if record.get("trial") not in succeeded:
+            ids.update(record.get("query_ids", []))
+    prefixes = {
+        e["output"]
+        for e in read_trial_starts(output)
+        if e.get("output") and e.get("trial") not in succeeded
+    }
     return ids, tuple(sorted(prefixes))
 
 
-def quiesce(settings: Settings, output: Path) -> list[str]:
-    """Stop a failed job's queries and wait until none is active.
+def is_throttling(error: BaseException) -> bool:
+    """Return whether an AWS request failed because it was throttled.
 
-    Besides the reported query IDs, the workgroup history is scanned for queries
-    that write under the job's trial prefixes, which covers queries whose IDs
-    were never reported before a trial process died.
+    Args:
+        error: Exception raised by a client request.
+
+    Returns:
+        True for a :class:`ClientError` with a code in ``THROTTLING_ERRORS``.
+    """
+    return (
+        isinstance(error, ClientError)
+        and error.response.get("Error", {}).get("Code") in THROTTLING_ERRORS
+    )
+
+
+def quiesce(settings: Settings, output: Path) -> list[str]:
+    """Stop a job's queries and wait until none is active.
+
+    The reported queries of trials not recorded as successful are stopped
+    first. Then the workgroup history is scanned for queries that write under
+    those trials' output prefixes, which covers queries whose IDs were never
+    reported before a trial process stopped; without such a trial, nothing is
+    scanned. Each Athena request is retried up to ``QUIESCE_RETRIES`` times.
 
     Args:
         settings: Configuration with the AWS region, workgroup, and timeouts.
-        output: Job output directory with ``events.jsonl``.
+        output: Job output directory with ``events.jsonl`` or the checkpoint
+            of a fleet attempt.
 
     Returns:
         Queries that could not be confirmed as stopped, with the reason.
+
+    Raises:
+        ClientError: If Athena still throttled a request after its retries
+            (see :func:`is_throttling`) and nothing else kept the queries from
+            being confirmed as stopped; every known query was asked to stop.
     """
     reported, prefixes = trial_evidence(output)
-    athena = client(session(settings), "athena")
-    ids = set(reported)
-    if prefixes:
-        ids |= active_queries(athena, settings.workgroup, prefixes)
+    athena = client(session(settings), "athena", max_retries=QUIESCE_RETRIES)
     stop_errors: dict[str, str] = {}
-    for query_id in sorted(ids):
-        try:
-            athena.stop_query_execution(QueryExecutionId=query_id)
-        except ClientError as exc:
-            stop_errors[query_id] = str(exc)
+    # Queries left unconfirmed by throttled requests; they are not polled.
+    throttled: dict[str, ClientError] = {}
+
+    def stop(ids: Iterable[str]) -> None:
+        for query_id in sorted(ids):
+            try:
+                athena.stop_query_execution(QueryExecutionId=query_id)
+            except ClientError as exc:
+                if is_throttling(exc):
+                    throttled[query_id] = exc
+                else:
+                    stop_errors[query_id] = str(exc)
+
+    stop(reported)
+    found: set[str] = set()
+    try:
+        if prefixes:
+            active_queries(athena, settings.workgroup, prefixes, found)
+    finally:
+        # Queries found before a failed scan are still asked to stop.
+        stop(found - reported)
     errors = []
     deadline = time.monotonic() + settings.timeout_seconds
-    for query_id in sorted(ids):
+    for query_id in sorted((reported | found) - throttled.keys()):
         while True:
             try:
                 state = athena.get_query_execution(QueryExecutionId=query_id)["QueryExecution"][
                     "Status"
                 ]["State"]
             except ClientError as exc:
-                errors.append(f"{query_id}: {stop_errors.get(query_id, exc)}")
+                if is_throttling(exc):
+                    throttled[query_id] = exc
+                else:
+                    errors.append(f"{query_id}: {stop_errors.get(query_id, exc)}")
                 break
             if state not in {"QUEUED", "RUNNING"}:
                 break
@@ -764,7 +818,10 @@ def quiesce(settings: Settings, output: Path) -> list[str]:
                 errors.append(f"{query_id}: still {state}; {stop_errors.get(query_id, '')}")
                 break
             time.sleep(settings.poll_interval)
-    return errors
+    if throttled and not errors:
+        # Only throttling kept the queries from being confirmed as stopped.
+        raise next(iter(throttled.values()))
+    return errors + [f"{query_id}: {exc}" for query_id, exc in sorted(throttled.items())]
 
 
 class SpotInterruptionError(Exception):
@@ -902,9 +959,11 @@ class Outcome:
     """Result of one job attempt.
 
     ``state`` is ``done`` when the attempt recorded the job's outcome,
-    ``interrupted`` after a Spot interruption notice, and ``lost`` when another
-    worker took over the job's claim or a slot. ``errors`` lists queries that
-    could not be confirmed as stopped.
+    ``interrupted`` after a Spot interruption notice, ``lost`` when another
+    worker took over the job's claim or a slot, and ``deferred`` when Athena
+    throttled the quiescing of an earlier attempt, so the job was released
+    without running. ``errors`` lists queries that could not be confirmed as
+    stopped.
     """
 
     state: str
@@ -928,6 +987,8 @@ def run_attempt(
     writes per-trial checkpoints there between trials. A takeover (attempt 2
     or later) first downloads the earlier attempts, quiesces their trials,
     and passes them to the runner so that completed trials are not repeated.
+    If quiescing failed only because Athena throttled it, the claim is
+    released for a later attempt, which quiesces the earlier attempts again.
     An interruption notice or a lost claim stops the runner: after a notice,
     the attempt is uploaded and the claim released as interrupted; after a
     lost claim, the attempt's queries are quiesced and nothing is recorded.
@@ -943,7 +1004,8 @@ def run_attempt(
         slots: API slot leases held for the job.
         workdir: Local working directory.
         runner: Function that runs the attempt; see :func:`run_job`.
-        settle: Function that quiesces an output directory and returns errors.
+        settle: Function that quiesces an output directory and returns errors;
+            it raises a throttling error as :func:`quiesce` does.
         lease_seconds: Seconds a lease lasts without renewal.
         notice: Function that returns whether an interruption notice exists.
 
@@ -961,11 +1023,14 @@ def run_attempt(
         if log.exists():
             queue.s3.upload_file(str(log), queue.bucket, queue.key("logs", log.name))
 
+    def settle_error(path: Path, exc: Exception) -> str:
+        return f"Could not quiesce {path.name}: {type(exc).__name__}: {exc}"
+
     def safe_settle(path: Path) -> list[str]:
         try:
             return settle(path)
         except Exception as exc:
-            return [f"Could not quiesce {path.name}: {type(exc).__name__}: {exc}"]
+            return [settle_error(path, exc)]
 
     with JobWatch(queue, claim, slots, lease_seconds, notice) as watch:
         start = now()
@@ -976,9 +1041,18 @@ def run_attempt(
                 job_dir / f"attempt-{earlier}", "results", job["id"], f"attempt-{earlier}"
             )
         ]
-        errors = [error for earlier in resume for error in safe_settle(earlier)]
+        errors: list[str] = []
+        deferred = False
+        for earlier in resume:
+            try:
+                errors += settle(earlier)
+            except Exception as exc:
+                if not errors and is_throttling(exc):
+                    deferred = True
+                    break
+                errors.append(settle_error(earlier, exc))
         code = 1
-        if not errors and not watch.stop_event.is_set():
+        if not errors and not deferred and not watch.stop_event.is_set():
             code = runner(
                 job,
                 workdir,
@@ -994,10 +1068,15 @@ def run_attempt(
             upload_attempt()
             queue.end_lease(claim, "interrupted")
             return Outcome("interrupted")
-        if code and not errors:
+        if code and not errors and not deferred:
             # A failed or stopped run can leave queries running.
             errors = safe_settle(output)
         upload_attempt()
+
+    if deferred:
+        # Nothing ran, so the next attempt resumes from the same earlier attempts.
+        queue.end_lease(claim, "released")
+        return Outcome("deferred")
 
     def abandon() -> Outcome:
         # A claim lost only by its local expiry, for example while a renewal that
@@ -1070,7 +1149,8 @@ def work(
     the worker takes one shared slot per simultaneous paging query; while it
     waits, no later API-heavy job takes slots. After a failed job, the worker
     cancels the job's observed queries and waits until they stop before
-    claiming another job.
+    claiming another job. A takeover whose quiescing Athena throttled releases
+    its claim, and the worker continues with the next pending job.
 
     Args:
         queue: Queue to consume.
@@ -1080,8 +1160,9 @@ def work(
             and between checks for an unpublished queue.
         runner: Function that runs one attempt; see :func:`run_job`.
         settle: Function that quiesces a failed job, given its output
-            directory, and returns errors; defaults to :func:`quiesce` with the
-            queued configuration.
+            directory, and returns errors, raising a throttling error as
+            :func:`quiesce` does; defaults to :func:`quiesce` with the queued
+            configuration.
         lease_seconds: Seconds a claim or slot lasts without renewal; the
             worker renews its leases ten times per period.
         notice: Function that returns whether a Spot interruption notice
@@ -1167,6 +1248,14 @@ def work(
                 )
                 if outcome.state == "interrupted":
                     raise SpotInterruptionError(completed)
+                if outcome.state == "deferred":
+                    _logger.warning(
+                        f"Deferred {job['id']}: Athena throttled quiescing its earlier attempts"
+                    )
+                    if check_notice(notice):
+                        raise SpotInterruptionError(completed)
+                    # A later pass, or another worker, retries the job; try the next one.
+                    continue
                 if outcome.state == "lost" and outcome.errors:
                     # The job is unfinished, so the host is kept rather than retired.
                     raise RuntimeError(
