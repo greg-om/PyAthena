@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 from pyathena_bench.cases import Case
 from pyathena_bench.config import Settings
+from pyathena_bench.report import read_records
 from pyathena_bench.runner import Observer, completed_trials, output_files, run, supervise
 
 
@@ -388,3 +389,54 @@ class TestResume:
             ("trial", trials[1]),
             ("checkpoint", f"{trials[1]}.json"),
         ]
+
+    def test_a_trial_whose_start_checkpoint_fails_does_not_run(
+        self, monkeypatch, tmp_path, run_stubs
+    ):
+        ran = []
+        monkeypatch.setattr(
+            "pyathena_bench.runner.supervise",
+            lambda payload, events, settings: ran.append(payload["trial"]) or {"status": "ok"},
+        )
+        written = []
+
+        def checkpoint(name, record):
+            if name.endswith("-start.json"):
+                raise OSError("S3 unavailable")
+            written.append(name)
+
+        output = tmp_path / "run"
+        settings = replace(Settings(), warmups=0, repetitions=2)
+        assert not run(
+            settings, RUN_MANIFEST, [Case("cursor")], ["small"], output, checkpoint=checkpoint
+        )
+        # The next attempt could not quiesce the trial, so it fails without running.
+        assert ran == []
+        [record] = read_records(output / "trials.jsonl")
+        assert record["status"] == "error"
+        assert record["error"] == "Could not write the start checkpoint: OSError: S3 unavailable"
+        assert written == [f"{record['trial']}.json"]
+        assert read_records(output / "events.jsonl") == []
+
+    def test_a_failed_record_checkpoint_does_not_stop_the_run(
+        self, monkeypatch, tmp_path, run_stubs, caplog
+    ):
+        monkeypatch.setattr(
+            "pyathena_bench.runner.supervise", lambda payload, events, settings: {"status": "ok"}
+        )
+
+        def checkpoint(name, record):
+            if not name.endswith("-start.json"):
+                raise OSError("S3 unavailable")
+
+        settings = replace(Settings(), warmups=0, repetitions=2)
+        assert run(
+            settings,
+            RUN_MANIFEST,
+            [Case("cursor")],
+            ["small"],
+            tmp_path / "run",
+            checkpoint=checkpoint,
+        )
+        assert len(read_records(tmp_path / "run" / "trials.jsonl")) == 2
+        assert caplog.text.count("Could not write the checkpoint") == 2

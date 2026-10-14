@@ -408,34 +408,33 @@ def test_cleanup_covers_a_separate_results_location(aws_metadata, monkeypatch, t
     }
 
 
-def test_active_queries_keeps_the_matches_found_before_an_error():
-    pages = [{"QueryExecutionIds": ["match"]}, {"QueryExecutionIds": ["unprocessed"]}]
+def test_active_queries_scans_past_unprocessed_ids_before_raising():
+    pages = [{"QueryExecutionIds": ["match", "x"]}, {"QueryExecutionIds": ["later"]}]
+
+    def running(query_id):
+        return {
+            "QueryExecutionId": query_id,
+            "WorkGroup": "pyathena",
+            "ResultConfiguration": {"OutputLocation": f"s3://b/trials/t1/{query_id}"},
+            "Status": {"State": "RUNNING"},
+        }
 
     def batch_get_query_execution(**kwargs):
-        if kwargs["QueryExecutionIds"] == ["unprocessed"]:
+        if kwargs["QueryExecutionIds"] == ["match", "x"]:
             return {
-                "QueryExecutions": [],
+                "QueryExecutions": [running("match")],
                 "UnprocessedQueryExecutionIds": [{"QueryExecutionId": "x"}],
             }
-        return {
-            "QueryExecutions": [
-                {
-                    "QueryExecutionId": "match",
-                    "WorkGroup": "pyathena",
-                    "ResultConfiguration": {"OutputLocation": "s3://b/trials/t1/out"},
-                    "Status": {"State": "RUNNING"},
-                }
-            ]
-        }
+        return {"QueryExecutions": [running("later")]}
 
     athena = SimpleNamespace(
         get_paginator=lambda name: SimpleNamespace(paginate=lambda **kwargs: pages),
         batch_get_query_execution=batch_get_query_execution,
     )
     found = set()
-    with pytest.raises(RuntimeError, match="Could not inspect query history"):
+    with pytest.raises(RuntimeError, match=r"Could not inspect query history: .*'x'"):
         active_queries(athena, "pyathena", ("s3://b/trials/t1/",), found)
-    assert found == {"match"}
+    assert found == {"match", "later"}
 
 
 @pytest.mark.parametrize(("kwargs", "retries"), [({}, 5), ({"max_retries": 10}, 10)])

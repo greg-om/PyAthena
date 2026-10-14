@@ -55,6 +55,8 @@ THROTTLING_ERRORS = {"ThrottlingException", "TooManyRequestsException"}
 # Retries per Athena request while quiescing; the default client's 5 retries did
 # not outlast the throttling of concurrent history scans in a fleet.
 QUIESCE_RETRIES = 10
+# Times a worker quiesces its own failed job while Athena only throttles it.
+QUIESCE_ROUNDS = 3
 
 
 @dataclass(frozen=True)
@@ -759,7 +761,9 @@ def quiesce(settings: Settings, output: Path) -> list[str]:
     first. Then the workgroup history is scanned for queries that write under
     those trials' output prefixes, which covers queries whose IDs were never
     reported before a trial process stopped; without such a trial, nothing is
-    scanned. Each Athena request is retried up to ``QUIESCE_RETRIES`` times.
+    scanned. A failed scan does not skip the status checks of the queries
+    known so far. Each Athena request is retried up to ``QUIESCE_RETRIES``
+    times.
 
     Args:
         settings: Configuration with the AWS region, workgroup, and timeouts.
@@ -777,8 +781,9 @@ def quiesce(settings: Settings, output: Path) -> list[str]:
     reported, prefixes = trial_evidence(output)
     athena = client(session(settings), "athena", max_retries=QUIESCE_RETRIES)
     stop_errors: dict[str, str] = {}
-    # Queries left unconfirmed by throttled requests; they are not polled.
-    throttled: dict[str, ClientError] = {}
+    # Throttled requests by query ID, or of the history scan; those queries
+    # are not polled.
+    throttled: dict[str, Exception] = {}
 
     def stop(ids: Iterable[str]) -> None:
         for query_id in sorted(ids):
@@ -792,13 +797,17 @@ def quiesce(settings: Settings, output: Path) -> list[str]:
 
     stop(reported)
     found: set[str] = set()
-    try:
-        if prefixes:
-            active_queries(athena, settings.workgroup, prefixes, found)
-    finally:
-        # Queries found before a failed scan are still asked to stop.
-        stop(found - reported)
     errors = []
+    if prefixes:
+        try:
+            active_queries(athena, settings.workgroup, prefixes, found)
+        except Exception as exc:
+            # Queries found before a failed scan are still stopped and checked.
+            if is_throttling(exc):
+                throttled["query history scan"] = exc
+            else:
+                errors.append(f"query history scan: {type(exc).__name__}: {exc}")
+    stop(found - reported)
     deadline = time.monotonic() + settings.timeout_seconds
     for query_id in sorted((reported | found) - throttled.keys()):
         while True:
@@ -839,9 +848,9 @@ class JobWatch:
     for the claim's expiry, without S3 requests; another renews the claim and
     the API slots ten times per lease period. ``interrupted`` is set on a
     notice, and ``claim_lost`` when another worker took over the claim or
-    renewals failed or stalled until it expired; ``stop`` is set with either
-    and stops the runner. A lost slot is listed in ``lost_slots`` and does not
-    stop the job.
+    renewals failed or stalled until a third of the lease period was left;
+    ``stop`` is set with either and stops the runner. A lost slot is listed in
+    ``lost_slots`` and does not stop the job.
     """
 
     def __init__(
@@ -903,7 +912,11 @@ class JobWatch:
                 self.interrupted.set()
                 self.stop_event.set()
                 return
-            if time.time() >= self.claim.body["expires"]:
+            # A third of the lease, at least 100 seconds with the minimum
+            # --lease-seconds, is left for run_job() to stop the runner, which
+            # takes up to a minute, before another worker can take the claim
+            # over, so the attempt starts no query after that worker's scan.
+            if time.time() >= self.claim.body["expires"] - self.lease_seconds / 3:
                 self._lose_claim()
                 return
 
@@ -992,6 +1005,8 @@ def run_attempt(
     An interruption notice or a lost claim stops the runner: after a notice,
     the attempt is uploaded and the claim released as interrupted; after a
     lost claim, the attempt's queries are quiesced and nothing is recorded.
+    A failed run's queries are also quiesced; while the claim is held, this
+    is repeated up to ``QUIESCE_ROUNDS`` times if Athena only throttled it.
     Otherwise, after a conditional renewal confirms that the claim is still
     held, the job's report merges every attempt into ``job-summary.csv`` and
     ``job-summary.md`` of this attempt, and the first ``done`` marker of the
@@ -1025,12 +1040,6 @@ def run_attempt(
 
     def settle_error(path: Path, exc: Exception) -> str:
         return f"Could not quiesce {path.name}: {type(exc).__name__}: {exc}"
-
-    def safe_settle(path: Path) -> list[str]:
-        try:
-            return settle(path)
-        except Exception as exc:
-            return [settle_error(path, exc)]
 
     with JobWatch(queue, claim, slots, lease_seconds, notice) as watch:
         start = now()
@@ -1069,8 +1078,22 @@ def run_attempt(
             queue.end_lease(claim, "interrupted")
             return Outcome("interrupted")
         if code and not errors and not deferred:
-            # A failed or stopped run can leave queries running.
-            errors = safe_settle(output)
+            # A failed or stopped run can leave queries running. While the
+            # claim is held, quiescing that Athena only throttled is repeated,
+            # so that throttling alone does not stop the worker.
+            for round_ in range(1, QUIESCE_ROUNDS + 1):
+                try:
+                    errors = settle(output)
+                except Exception as exc:
+                    if (
+                        is_throttling(exc)
+                        and round_ < QUIESCE_ROUNDS
+                        and not watch.stop_event.is_set()
+                    ):
+                        _logger.warning(f"Athena throttled quiescing {job['id']}; retrying")
+                        continue
+                    errors = [settle_error(output, exc)]
+                break
         upload_attempt()
 
     if deferred:

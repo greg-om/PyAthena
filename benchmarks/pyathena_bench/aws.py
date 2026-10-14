@@ -452,21 +452,20 @@ def active_queries(
         IDs of matching queries that are still queued or running.
 
     Raises:
-        RuntimeError: If part of the history cannot be inspected.
+        RuntimeError: If part of the history cannot be inspected; this is
+            raised after the rest of the history was scanned.
     """
     if ids is None:
         ids = set()
+    unprocessed: list[dict[str, Any]] = []
     for page in athena.get_paginator("list_query_executions").paginate(WorkGroup=workgroup):
         query_ids = page["QueryExecutionIds"]
         for offset in range(0, len(query_ids), 50):
             batch = athena.batch_get_query_execution(
                 QueryExecutionIds=query_ids[offset : offset + 50]
             )
-            if batch.get("UnprocessedQueryExecutionIds"):
-                raise RuntimeError(
-                    f"Could not inspect query history: {batch['UnprocessedQueryExecutionIds']}"
-                )
-            for query in batch["QueryExecutions"]:
+            unprocessed += batch.get("UnprocessedQueryExecutionIds", [])
+            for query in batch.get("QueryExecutions", []):
                 if (
                     query.get("WorkGroup") == workgroup
                     and query.get("ResultConfiguration", {})
@@ -475,6 +474,8 @@ def active_queries(
                     and query["Status"]["State"] in {"RUNNING", "QUEUED"}
                 ):
                     ids.add(query["QueryExecutionId"])
+    if unprocessed:
+        raise RuntimeError(f"Could not inspect query history: {unprocessed}")
     return ids
 
 
