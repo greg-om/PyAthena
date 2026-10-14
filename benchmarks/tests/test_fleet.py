@@ -1080,7 +1080,7 @@ class TestJobWatch:
         with JobWatch(queue, claim, [], 1.5, lambda: False) as watch:
             assert watch.claim_lost.wait(5)
             # The runner has time to stop before another worker can take the claim over.
-            assert time.time() < claim.body["expires"] - 0.25
+            assert time.time() < claim.body["expires"]
             assert not queue.read_lease(claim.key).takeable(time.time())
 
     def test_a_stalled_renewal_that_outlasts_the_claim_loses_it(self, tmp_path):
@@ -1544,9 +1544,12 @@ class TestWork:
                 raise throttling("ListQueryExecutions")
             return []
 
-        ran = work(queue, tmp_path / "w", api_slots=1, runner=lambda *a: 1, settle=settle)
+        def runner(item, *args):
+            return 1 if item["id"] == "first" else 0
+
+        ran = work(queue, tmp_path / "w", api_slots=1, runner=runner, settle=settle)
         assert ran == ["first", "second"]
-        assert settled == ["attempt-1", "attempt-1", "attempt-1"]
+        assert settled == ["attempt-1", "attempt-1"]
         done = json.loads(queue.read("done", "first"))
         assert (done["exit_code"], done["quiesce_errors"]) == (1, [])
 

@@ -472,7 +472,7 @@ A worker claims a job by creating `claims/<job>` with an S3 conditional write, s
 A claim, like each API slot under `slots/`, is a lease that its worker renews every tenth of `--lease-seconds` (600 by default, at least 300) while the job runs.
 When a worker dies, its claim and slots expire, and another worker takes them over with a conditional write, so the job and the slots return to the fleet without manual steps.
 A worker releases a slot by overwriting its lease as released, never by deleting it, so a slot that another worker took over stays held.
-A worker whose claim was taken over, or whose renewals failed until a third of `--lease-seconds` was left, stops the attempt before another worker can take the claim over, quiesces its queries as after a failed job, and records nothing for the job; the new owner continues it, and the first `done` marker of a job is never replaced.
+A worker whose claim was taken over, or whose renewals failed until a third of `--lease-seconds` was left, stops the attempt, which leaves its trial time to stop before another worker can take the claim over, quiesces its queries as after a failed job, and records nothing for the job; the new owner continues it, and the first `done` marker of a job is never replaced.
 If that worker cannot confirm that the queries stopped, it raises an error and keeps its host, because the job may have no other worker.
 A lost API slot does not stop the job; the `done` marker lists it under `lost_slots`.
 Each attempt of a job writes to `results/<job>/attempt-<n>/`; between trials, its run writes each trial's start and record below `checkpoint/` there, so a lost host loses only its running trial, and the worker uploads the attempt's files when it ends.

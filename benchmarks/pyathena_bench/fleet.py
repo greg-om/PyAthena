@@ -771,7 +771,8 @@ def quiesce(settings: Settings, output: Path) -> list[str]:
             of a fleet attempt.
 
     Returns:
-        Queries that could not be confirmed as stopped, with the reason.
+        Queries that could not be confirmed as stopped, with the reason, and
+        a failed history scan as ``query history scan: <error>``.
 
     Raises:
         ClientError: If Athena still throttled a request after its retries
