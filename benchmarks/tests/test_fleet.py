@@ -1679,7 +1679,7 @@ class TestWork:
         with pytest.raises(SpotInterruptionError) as raised:
             work(queue, tmp_path / "w", api_slots=1, poll_seconds=0,
                  runner=recording_runner([], trials={"a": [ok_trial(0)], "b": [ok_trial(0)]}),
-                 settle=settle, lease_seconds=0.5, notice=notice)  # fmt: skip
+                 settle=settle, lease_seconds=2, notice=notice)  # fmt: skip
         assert raised.value.ran == []
         assert queue.read_lease(queue.key("claims", "a")).takeable(time.time())
         assert "b" not in queue.names("claims")
