@@ -7,9 +7,12 @@
 
 import csv
 import io
+import threading
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import ANY, MagicMock, PropertyMock, patch, sentinel
 
+import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -19,6 +22,7 @@ from pandas.testing import assert_frame_equal
 
 from pyathena.arrow.util import to_column_info
 from pyathena.error import OperationalError, ProgrammingError
+from pyathena.model import AthenaQueryExecution
 from pyathena.pandas.converter import DefaultPandasTypeConverter
 from pyathena.pandas.result_set import (
     AthenaPandasResultSet,
@@ -27,9 +31,64 @@ from pyathena.pandas.result_set import (
     _no_trunc_date,
     _read_csv_with_pyarrow,
 )
+from pyathena.util import RetryConfig
+
+
+def _typed_values(rows):
+    """Express the rows by the type and repr of each value, so that NaN and NA compare."""
+    return [[(type(value), repr(value)) for value in row] for row in rows]
 
 
 class TestPandasDataFrameIterator:
+    @pytest.mark.parametrize(
+        ("values", "dtype"),
+        [
+            ([1, 2, 3], "int64"),
+            ([1.5, None, 3.0], "float64"),
+            ([True, False, True], "bool"),
+            ([[1], None, {"a": 1}], object),
+            (["a", None, ""], "str"),
+            (["a", None, ""], pd.StringDtype("python", na_value=np.nan)),
+            (["a", None, ""], "string[pyarrow]"),
+            (["a", None, ""], "string[python]"),
+            ([1, None, 3], "Int64"),
+            ([1.5, None, 3.0], "Float64"),
+            ([True, None, False], "boolean"),
+            (["2024-01-01 01:02:03", None, "2024-01-02"], "datetime64[ns]"),
+            (["2024-01-01 01:02:03", None, "2024-01-02"], "datetime64[us, UTC]"),
+            (["a", None, "a"], "category"),
+            ([1, None, 3], pd.ArrowDtype(pa.int64())),
+            (["a", None, ""], pd.ArrowDtype(pa.string())),
+        ],
+    )
+    def test_itertuples_values(self, values, dtype):
+        """The rows hold the values that DataFrame.itertuples() gives, with their types."""
+        df = pd.DataFrame({"c": pd.Series(values, dtype=dtype), "n": [10, 11, 12]})
+        expected = list(df.itertuples(index=False, name=None))
+
+        rows = list(PandasDataFrameIterator(df, _no_trunc_date).itertuples())
+
+        assert _typed_values(rows) == _typed_values(expected)
+
+    def test_itertuples_large_chunk(self):
+        """The rows of a chunk larger than a block of rows keep their order."""
+        size = PandasDataFrameIterator._ROW_BLOCK_SIZE * 2 + 1
+        df = pd.DataFrame(
+            {"n": range(size), "s": pd.Series([f"v{i}" for i in range(size)], dtype="str")}
+        )
+
+        rows = list(PandasDataFrameIterator(df, _no_trunc_date).itertuples())
+
+        assert rows == [(i, f"v{i}") for i in range(size)]
+
+    def test_iterrows_continuous_row_numbers(self):
+        """Row numbers continue across chunks."""
+        chunks = [pd.DataFrame({"n": [1, 2]}), pd.DataFrame({"n": [3]}, index=[0])]
+
+        rows = list(PandasDataFrameIterator(iter(chunks), _no_trunc_date).iterrows())
+
+        assert rows == [(0, {"n": 1}), (1, {"n": 2}), (2, {"n": 3})]
+
     @pytest.mark.parametrize(
         ("csv", "read_csv_kwargs"),
         [
@@ -94,6 +153,154 @@ _READ_MODES = [
 
 
 class TestAthenaPandasResultSet:
+    def test_fetch_across_chunks(self):
+        """The fetch methods continue across chunks, reading a chunk when its rows are needed."""
+        read = []
+
+        def chunks():
+            for start in (0, 4, 8):
+                read.append(start)
+                stop = min(start + 4, 10)
+                yield pd.DataFrame(
+                    {
+                        "n": range(start, stop),
+                        "s": [f"v{i}" for i in range(start, stop)],
+                    },
+                    index=range(start, stop),
+                )
+
+        result_set = _fetching_result_set(chunks(), arraysize=3)
+        assert result_set.rownumber == 0
+        assert result_set.fetchone() == (0, "v0")
+        assert result_set.rownumber == 1
+        assert result_set.fetchmany(3) == [(1, "v1"), (2, "v2"), (3, "v3")]
+        assert result_set.rownumber == 4
+        assert read == [0]
+        assert result_set.fetchmany(5) == [(i, f"v{i}") for i in range(4, 9)]
+        assert result_set.rownumber == 9
+        assert read == [0, 4, 8]
+        assert result_set.fetchmany() == [(9, "v9")]
+        assert result_set.rownumber == 10
+        assert result_set.fetchmany() == []
+        assert result_set.fetchall() == []
+        assert result_set.fetchone() is None
+        assert result_set.rownumber == 10
+
+    def test_fetchall_across_chunks(self):
+        """fetchall() returns the remaining rows of all chunks, skipping empty chunks."""
+        chunks = [
+            pd.DataFrame({"n": [0, 1]}),
+            pd.DataFrame({"n": []}, dtype="int64"),
+            pd.DataFrame({"n": [2, 3]}, index=[2, 3]),
+        ]
+        result_set = _fetching_result_set(iter(chunks), arraysize=3)
+        assert result_set.fetchone() == (0,)
+        assert result_set.fetchall() == [(1,), (2,), (3,)]
+        assert result_set.rownumber == 4
+        assert result_set.fetchall() == []
+        assert result_set.rownumber == 4
+
+    def test_fetch_duplicate_column_names(self):
+        """Columns with the same label keep their own values by position."""
+        df = pd.DataFrame([[1, "a", 2], [3, "b", 4]], columns=["x", "y", "x"])
+        result_set = _fetching_result_set(df, arraysize=3)
+        assert result_set.fetchone() == (1, "a", 2)
+        assert result_set.fetchmany() == [(3, "b", 4)]
+
+    @pytest.mark.parametrize(
+        ("seconds", "method", "rownumber"),
+        [
+            ([0, 10**13, 0], "fetchone", 1),
+            ([0, 10**13, 0], "fetchmany", 1),
+            ([0, 10**13, 0], "fetchall", 1),
+            ([0, 0, 10**13], "fetchmany", 2),
+            ([0, 0, 10**13], "fetchall", 2),
+        ],
+    )
+    def test_fetch_after_conversion_error(self, seconds, method, rownumber):
+        """After a value fails to convert, the fetch methods return no more rows.
+
+        ``rownumber`` counts the rows taken before the error, as fetching row by row did.
+        """
+        # A timestamp that does not fit a Python datetime fails while its row is built.
+        timestamps = pa.array(seconds, type=pa.timestamp("s"))
+        chunks = [
+            pd.DataFrame(
+                {"n": [0, 1, 2], "t": pd.Series(timestamps, dtype=pd.ArrowDtype(timestamps.type))}
+            ),
+            pd.DataFrame({"n": [3]}),
+        ]
+        result_set = _fetching_result_set(iter(chunks), arraysize=3)
+        assert result_set.fetchone() == (0, pd.Timestamp(0, unit="s"))
+        with pytest.raises(OverflowError):
+            getattr(result_set, method)()
+        assert result_set.rownumber == rownumber
+        assert result_set.fetchone() is None
+        assert result_set.fetchmany() == []
+        assert result_set.fetchall() == []
+        assert result_set.rownumber == rownumber
+
+    def test_fetch_after_chunks_run_out(self):
+        """The rows of a chunk that a fetch started stay after iter_chunks() runs out."""
+        size = PandasDataFrameIterator._ROW_BLOCK_SIZE * 2
+        result_set = _fetching_result_set(iter([pd.DataFrame({"n": range(size)})]), arraysize=3)
+        assert result_set.fetchone() == (0,)
+        assert list(result_set.iter_chunks()) == []
+        assert result_set.fetchall() == [(i,) for i in range(1, size)]
+        assert result_set.rownumber == size
+
+    def test_close_during_fetchall(self):
+        """A fetchall() in another thread does not set rownumber after close()."""
+        requested = threading.Event()
+        closed = threading.Event()
+
+        class Chunks:
+            def __init__(self):
+                self._chunks = iter(
+                    [pd.DataFrame({"n": [0, 1]}), pd.DataFrame({"n": [2, 3]}, index=[2, 3])]
+                )
+                self._calls = 0
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                self._calls += 1
+                if self._calls == 2:
+                    requested.set()
+                    assert closed.wait(10)
+                return next(self._chunks)
+
+        result_set = _fetching_result_set(Chunks(), arraysize=3)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(result_set.fetchall)
+            assert requested.wait(10)
+            result_set.close()
+            closed.set()
+            # The fetch still returns the chunk that it was reading.
+            assert future.result(10) == [(0,), (1,), (2,), (3,)]
+        assert result_set.rownumber is None
+
+    def test_fetchmany_size_above_maxsize(self):
+        result_set = _fetching_result_set(pd.DataFrame({"n": [1, 2]}), arraysize=3)
+        assert result_set.fetchmany(10**100) == [(1,), (2,)]
+        assert result_set.rownumber == 2
+
+    def test_fetchmany_size_not_integer(self):
+        """A size that is not an integer raises TypeError without consuming rows."""
+        result_set = _fetching_result_set(pd.DataFrame({"n": [1, 2]}), arraysize=3)
+        with pytest.raises(TypeError):
+            result_set.fetchmany(1.5)
+        assert result_set.fetchall() == [(1,), (2,)]
+
+    def test_fetch_after_close(self):
+        result_set = _fetching_result_set(pd.DataFrame({"n": [1, 2]}), arraysize=3)
+        result_set.close()
+        assert result_set.fetchone() is None
+        assert result_set.fetchmany() == []
+        assert result_set.fetchall() == []
+        assert result_set.rownumber is None
+
     @pytest.mark.parametrize("engine", ["auto", "c", "python", "pyarrow"])
     @pytest.mark.parametrize(
         ("output_location", "file_size_bytes", "pyarrow_engine"),
@@ -1038,3 +1245,29 @@ def test_read_csv_with_pyarrow_multiline_values_across_blocks():
     )
     assert df["id"].tolist() == [i for i, _ in rows]
     assert df["v"].tolist() == [v for _, v in rows]
+
+
+def _fetching_result_set(result, arraysize):
+    """Create a result set of a succeeded query whose read gives ``result``, without AWS.
+
+    ``result`` is a DataFrame or an iterator of DataFrame chunks, as ``_as_pandas()``
+    returns them.
+    """
+    query_execution = MagicMock(
+        state=AthenaQueryExecution.STATE_SUCCEEDED, output_location="s3://bucket/result.csv"
+    )
+    with (
+        patch.object(AthenaPandasResultSet, "_pre_fetch"),
+        patch.object(AthenaPandasResultSet, "_create_s3_file_system"),
+        patch.object(AthenaPandasResultSet, "_as_pandas", return_value=result),
+        patch.object(
+            AthenaPandasResultSet, "is_unload", new_callable=PropertyMock, return_value=True
+        ),
+    ):
+        return AthenaPandasResultSet(
+            connection=MagicMock(),
+            converter=DefaultPandasTypeConverter(),
+            query_execution=query_execution,
+            arraysize=arraysize,
+            retry_config=RetryConfig(),
+        )
