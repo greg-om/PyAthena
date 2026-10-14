@@ -23,6 +23,8 @@ from typing import (
     cast,
 )
 
+import fsspec
+
 from pyathena import OperationalError
 from pyathena.arrow.reader import ParquetChunkReader
 from pyathena.converter import Converter
@@ -346,10 +348,10 @@ class AthenaPolarsResultSet(AthenaResultSet):
 
     @property
     def _csv_storage_options(self) -> dict[str, Any]:
-        """Get storage options for Polars CSV reading via fsspec.
+        """Get storage options for reading a CSV result file via fsspec.
 
-        Polars read_csv uses fsspec for cloud storage access, which works
-        with PyAthena's registered S3FileSystem.
+        ``_read_csv()`` opens the file with ``fsspec.open()``, which uses
+        PyAthena's registered S3FileSystem, and passes its contents to Polars.
 
         Returns:
             Dictionary with fsspec-compatible options for S3 access.
@@ -592,17 +594,22 @@ class AthenaPolarsResultSet(AthenaResultSet):
         if "schema_overrides" not in self._kwargs:
             # Renamed after reading, so that Polars matches the types to the header.
             kwargs.pop("new_columns", None)
+        # Polars 2.0 reads a path with its native object store, which does not take
+        # fsspec options, so the result file is read through fsspec here.
+        storage_options = kwargs.pop("storage_options")
         source: str | bytes
         if self.output_location:
-            source = location = self.output_location
+            location = self.output_location
         else:
             source = self._fetch_all_rows_as_csv()
             if not source:
                 return pl.DataFrame()
             location = "the GetQueryResults rows"
-            del kwargs["storage_options"]
 
         try:
+            if self.output_location:
+                with fsspec.open(self.output_location, "rb", **(storage_options or {})) as file:
+                    source = file.read()
             try:
                 df = pl.read_csv(source, **kwargs)
             except pl.exceptions.ComputeError:

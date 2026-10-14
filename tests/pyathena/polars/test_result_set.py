@@ -117,11 +117,13 @@ class TestAthenaPolarsResultSet:
         """Read arguments given to execute() replace the ones the result set chooses."""
         path = tmp_path / "result.csv"
         path.write_text("1;x\n2;y\n")
+        # Polars names headerless columns from column_1 before 2.0 and from column_0 since.
+        first, second = pl.read_csv(b"1;x\n", separator=";", has_header=False).columns
         result_set = _chunked_result_set()
         result_set._kwargs = {
             "separator": ";",
             "has_header": False,
-            "schema_overrides": {"column_1": pl.Utf8},
+            "schema_overrides": {first: pl.Utf8},
         }
         with (
             patch.object(
@@ -152,7 +154,7 @@ class TestAthenaPolarsResultSet:
         ):
             result = getattr(result_set, reader)()
             df = result if isinstance(result, pl.DataFrame) else pl.concat(list(result))
-        assert df.to_dict(as_series=False) == {"column_1": ["1", "2"], "column_2": ["x", "y"]}
+        assert df.to_dict(as_series=False) == {first: ["1", "2"], second: ["x", "y"]}
 
     @pytest.mark.parametrize("reader", ["_read_csv", "_iter_csv_chunks"])
     def test_txt_new_columns_with_schema_overrides(self, tmp_path, reader):
@@ -160,7 +162,8 @@ class TestAthenaPolarsResultSet:
         path = tmp_path / "result.txt"
         path.write_text("001\tx\n")
         result_set = _chunked_result_set()
-        result_set._kwargs = {"new_columns": ["z"], "schema_overrides": {"z": pl.Utf8}}
+        # Polars 2.0 requires new_columns to name every column of the file.
+        result_set._kwargs = {"new_columns": ["z", "w"], "schema_overrides": {"z": pl.Utf8}}
         with (
             patch.object(
                 AthenaPolarsResultSet,
@@ -188,12 +191,11 @@ class TestAthenaPolarsResultSet:
         ):
             result = getattr(result_set, reader)()
             df = result if isinstance(result, pl.DataFrame) else pl.concat(list(result))
-        assert df.to_dict(as_series=False) == {"z": ["001"], "b": ["x"]}
+        assert df.to_dict(as_series=False) == {"z": ["001"], "w": ["x"]}
 
     @pytest.mark.parametrize(
         ("reader", "function"),
         [
-            ("_read_csv", "read_csv"),
             ("_iter_csv_chunks", "scan_csv"),
             ("_read_parquet", "read_parquet"),
             ("_iter_parquet_chunks", "scan_parquet"),
@@ -236,6 +238,34 @@ class TestAthenaPolarsResultSet:
             if not isinstance(result, (pl.DataFrame, tuple)):
                 list(result)
         assert read.call_args.kwargs["storage_options"] == {"anon": True}
+
+    def test_csv_storage_options_replace_defaults(self):
+        """storage_options given to execute() open a CSV result through fsspec, not Polars."""
+        result_set = _chunked_result_set()
+        result_set._kwargs = {"storage_options": {"anon": True}}
+        with (
+            patch.object(
+                AthenaPolarsResultSet,
+                "output_location",
+                new_callable=PropertyMock,
+                return_value="s3://bucket/result.csv",
+            ),
+            patch.object(
+                AthenaPolarsResultSet, "_csv_dtypes", new_callable=PropertyMock, return_value={}
+            ),
+            patch.object(
+                AthenaPolarsResultSet,
+                "_csv_storage_options",
+                new_callable=PropertyMock,
+                side_effect=AssertionError("replaced storage options were computed"),
+            ),
+            patch.object(AthenaPolarsResultSet, "_is_csv_readable", return_value=True),
+            patch("pyathena.polars.result_set.fsspec.open") as open_,
+        ):
+            open_.return_value.__enter__.return_value.read.return_value = b"a\n1\n"
+            df = result_set._read_csv()
+        open_.assert_called_once_with("s3://bucket/result.csv", "rb", anon=True)
+        assert df.to_dict(as_series=False) == {"a": [1]}
 
     @pytest.mark.parametrize(
         ("kwargs", "expected"),
