@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import pytest
 from botocore.exceptions import ClientError
 from pyathena_bench.aws import (
+    active_queries,
     cleanup,
     client,
     prepare,
@@ -405,6 +406,36 @@ def test_cleanup_covers_a_separate_results_location(aws_metadata, monkeypatch, t
         ("results", f"bench/stack/runs/{RUN}/trials/"),
         ("temporary", f"runs/{RUN}/trials/"),
     }
+
+
+def test_active_queries_keeps_the_matches_found_before_an_error():
+    pages = [{"QueryExecutionIds": ["match"]}, {"QueryExecutionIds": ["unprocessed"]}]
+
+    def batch_get_query_execution(**kwargs):
+        if kwargs["QueryExecutionIds"] == ["unprocessed"]:
+            return {
+                "QueryExecutions": [],
+                "UnprocessedQueryExecutionIds": [{"QueryExecutionId": "x"}],
+            }
+        return {
+            "QueryExecutions": [
+                {
+                    "QueryExecutionId": "match",
+                    "WorkGroup": "pyathena",
+                    "ResultConfiguration": {"OutputLocation": "s3://b/trials/t1/out"},
+                    "Status": {"State": "RUNNING"},
+                }
+            ]
+        }
+
+    athena = SimpleNamespace(
+        get_paginator=lambda name: SimpleNamespace(paginate=lambda **kwargs: pages),
+        batch_get_query_execution=batch_get_query_execution,
+    )
+    found = set()
+    with pytest.raises(RuntimeError, match="Could not inspect query history"):
+        active_queries(athena, "pyathena", ("s3://b/trials/t1/",), found)
+    assert found == {"match"}
 
 
 @pytest.mark.parametrize(("kwargs", "retries"), [({}, 5), ({"max_retries": 10}, 10)])

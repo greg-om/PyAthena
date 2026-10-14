@@ -791,8 +791,13 @@ def quiesce(settings: Settings, output: Path) -> list[str]:
                     stop_errors[query_id] = str(exc)
 
     stop(reported)
-    found = active_queries(athena, settings.workgroup, prefixes) if prefixes else set()
-    stop(found - reported)
+    found: set[str] = set()
+    try:
+        if prefixes:
+            active_queries(athena, settings.workgroup, prefixes, found)
+    finally:
+        # Queries found before a failed scan are still asked to stop.
+        stop(found - reported)
     errors = []
     deadline = time.monotonic() + settings.timeout_seconds
     for query_id in sorted((reported | found) - throttled.keys()):

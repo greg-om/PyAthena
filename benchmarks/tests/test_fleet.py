@@ -662,7 +662,12 @@ def use_athena(monkeypatch):
         monkeypatch.setattr("pyathena_bench.fleet.session", lambda settings: None)
         monkeypatch.setattr("pyathena_bench.fleet.client", lambda session_, name, **_: athena)
         if active is not None:
-            monkeypatch.setattr("pyathena_bench.fleet.active_queries", active)
+
+            def scan(client_, workgroup, prefixes, ids):
+                ids.update(active(client_, workgroup, prefixes))
+                return ids
+
+            monkeypatch.setattr("pyathena_bench.fleet.active_queries", scan)
 
     return install
 
@@ -747,23 +752,29 @@ class TestQuiesce:
         assert quiesce(Settings(poll_interval=0.01), tmp_path) == []
         assert athena.stopped == []
 
-    def test_a_throttled_history_scan_raises_after_the_reported_queries_stop(
-        self, tmp_path, use_athena
+    def test_a_throttled_history_scan_raises_after_the_known_queries_stop(
+        self, tmp_path, monkeypatch, use_athena
     ):
         write_events(
             tmp_path,
             {"event": "trial_start", "trial": "t1", "output": "s3://b/trials/t1/"},
             {"event": "query", "trial": "t1", "query_id": "reported"},
         )
-        athena = FakeAthena({"reported": "RUNNING"})
+        athena = FakeAthena({"reported": "RUNNING", "found": "RUNNING"})
+        stopped_at_scan = []
 
-        def active(client_, workgroup, prefixes):
+        def active(client_, workgroup, prefixes, ids):
+            stopped_at_scan.extend(athena.stopped)
+            # A later page of the history is throttled after a match was found.
+            ids.add("found")
             raise throttling("ListQueryExecutions")
 
-        use_athena(athena, active)
+        use_athena(athena)
+        monkeypatch.setattr("pyathena_bench.fleet.active_queries", active)
         with pytest.raises(ClientError, match="ThrottlingException"):
             quiesce(Settings(poll_interval=0.01), tmp_path)
-        assert athena.stopped == ["reported"]
+        assert stopped_at_scan == ["reported"]
+        assert athena.stopped == ["reported", "found"]
 
     def test_a_throttled_stop_does_not_skip_the_other_queries(self, tmp_path, use_athena):
         write_events(

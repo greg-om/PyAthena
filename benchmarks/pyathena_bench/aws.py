@@ -433,7 +433,9 @@ def cancel_queries(settings: Settings, query_ids: set[str]) -> list[str]:
     return errors
 
 
-def active_queries(athena: Any, workgroup: str, prefixes: tuple[str, ...]) -> set[str]:
+def active_queries(
+    athena: Any, workgroup: str, prefixes: tuple[str, ...], ids: set[str] | None = None
+) -> set[str]:
     """Find queued or running queries whose output location starts with a prefix.
 
     This scans the workgroup's live history, so it also finds queries whose
@@ -443,6 +445,8 @@ def active_queries(athena: Any, workgroup: str, prefixes: tuple[str, ...]) -> se
         athena: Athena client.
         workgroup: Workgroup whose history is scanned.
         prefixes: S3 output location prefixes to match.
+        ids: Set that receives each match as it is found, so that the matches
+            found before an error remain available; a new set by default.
 
     Returns:
         IDs of matching queries that are still queued or running.
@@ -450,7 +454,8 @@ def active_queries(athena: Any, workgroup: str, prefixes: tuple[str, ...]) -> se
     Raises:
         RuntimeError: If part of the history cannot be inspected.
     """
-    ids: set[str] = set()
+    if ids is None:
+        ids = set()
     for page in athena.get_paginator("list_query_executions").paginate(WorkGroup=workgroup):
         query_ids = page["QueryExecutionIds"]
         for offset in range(0, len(query_ids), 50):
