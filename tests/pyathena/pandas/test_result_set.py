@@ -281,6 +281,11 @@ class TestAthenaPandasResultSet:
             assert future.result(10) == [(0,), (1,), (2,), (3,)]
         assert result_set.rownumber is None
 
+    def test_fetchmany_size_above_maxsize(self):
+        result_set = _fetching_result_set(pd.DataFrame({"n": [1, 2]}), arraysize=3)
+        assert result_set.fetchmany(10**100) == [(1,), (2,)]
+        assert result_set.rownumber == 2
+
     def test_fetchmany_size_not_integer(self):
         """A size that is not an integer raises TypeError without consuming rows."""
         result_set = _fetching_result_set(pd.DataFrame({"n": [1, 2]}), arraysize=3)
