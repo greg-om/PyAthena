@@ -3073,12 +3073,14 @@ class S3File(AbstractBufferedFile):
     def _upload_chunk(self, final: bool = False) -> bool:
         """Upload the buffered data as parts of the multipart upload.
 
-        Data smaller than the block size is left in the buffer for
-        :meth:`commit`, which uploads it with PutObject. Otherwise, a part is
-        submitted only while fewer than ``max_workers`` uploaded parts are in
-        flight; the write waits for one of them to finish first. A failed
-        part is reported by :meth:`commit`. If the upload of the chunk fails
-        or is interrupted, the file is closed without committing it.
+        A file smaller than the block size, unless an append copied the
+        existing object as parts, is left in the buffer for :meth:`commit`,
+        which uploads it with PutObject. Otherwise, the buffered data is
+        uploaded as parts, and a part is submitted only while fewer than
+        ``max_workers`` uploaded parts are in flight; the write waits for
+        one of them to finish first. A failed part is reported by
+        :meth:`commit`. If the upload of the chunk fails or is interrupted,
+        the file is closed without committing it.
 
         Args:
             final: Whether this is the last flush of the file, after which
