@@ -188,6 +188,7 @@ class TestAthenaPolarsResultSet:
         assert result_set.rownumber is None
 
     def test_fetchmany_size_above_maxsize(self):
+        """A size above sys.maxsize returns the remaining rows."""
         result_set = _fetching_result_set([pl.DataFrame({"n": [1, 2]})], ["n"], arraysize=3)
         assert result_set.fetchmany(10**100) == [(1,), (2,)]
         assert result_set.rownumber == 2
@@ -200,6 +201,7 @@ class TestAthenaPolarsResultSet:
         assert result_set.fetchall() == [(1,), (2,)]
 
     def test_fetch_after_close(self):
+        """The fetch methods return no rows after close()."""
         result_set = _fetching_result_set([pl.DataFrame({"n": [1, 2]})], ["n"], arraysize=3)
         result_set.close()
         assert result_set.fetchone() is None
@@ -556,9 +558,8 @@ class TestPolarsDataFrameIterator:
         """Without column names, each row of a chunk is empty."""
         df = pl.DataFrame({"n": [1, 2]})
 
-        df_iter = PolarsDataFrameIterator(df, {}, [])
-
-        assert list(df_iter.iterrows()) == [(0, {}), (1, {})]
+        assert list(PolarsDataFrameIterator(df, {}, []).itertuples()) == [(), ()]
+        assert list(PolarsDataFrameIterator(df, {}, []).iterrows()) == [(0, {}), (1, {})]
 
     def test_iterrows_continuous_row_numbers(self):
         """Row numbers continue across chunks, with each row keyed by the column names."""
