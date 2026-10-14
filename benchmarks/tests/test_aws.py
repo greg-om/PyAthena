@@ -407,12 +407,12 @@ def test_cleanup_covers_a_separate_results_location(aws_metadata, monkeypatch, t
     }
 
 
-@pytest.mark.parametrize(("kwargs", "attempts"), [({}, 5), ({"max_attempts": 10}, 10)])
-def test_client_retries_in_standard_mode(kwargs, attempts):
+@pytest.mark.parametrize(("kwargs", "retries"), [({}, 5), ({"max_retries": 10}, 10)])
+def test_client_retries_in_standard_mode(kwargs, retries):
     created = []
     session_ = SimpleNamespace(client=lambda service, config: created.append(config) or service)
     assert client(session_, "athena", **kwargs) == "athena"
-    assert created[0].retries == {"mode": "standard", "max_attempts": attempts}
+    assert created[0].retries == {"mode": "standard", "max_attempts": retries}
 
 
 @pytest.mark.parametrize(

@@ -52,9 +52,9 @@ METADATA_ERRORS = (OSError, http.client.HTTPException)
 PRECONDITION_ERRORS = {"PreconditionFailed", "ConditionalRequestConflict"}
 # Error codes of requests that Athena throttled.
 THROTTLING_ERRORS = {"ThrottlingException", "TooManyRequestsException"}
-# Attempts per Athena request while quiescing, including the first; the default
-# client makes 5, which concurrent history scans of a fleet exhausted.
-QUIESCE_ATTEMPTS = 10
+# Retries per Athena request while quiescing; the default client's 5 retries did
+# not outlast the throttling of concurrent history scans in a fleet.
+QUIESCE_RETRIES = 10
 
 
 @dataclass(frozen=True)
@@ -759,7 +759,7 @@ def quiesce(settings: Settings, output: Path) -> list[str]:
     first. Then the workgroup history is scanned for queries that write under
     those trials' output prefixes, which covers queries whose IDs were never
     reported before a trial process stopped; without such a trial, nothing is
-    scanned. Each Athena request makes up to ``QUIESCE_ATTEMPTS`` attempts.
+    scanned. Each Athena request is retried up to ``QUIESCE_RETRIES`` times.
 
     Args:
         settings: Configuration with the AWS region, workgroup, and timeouts.
@@ -770,11 +770,11 @@ def quiesce(settings: Settings, output: Path) -> list[str]:
         Queries that could not be confirmed as stopped, with the reason.
 
     Raises:
-        ClientError: If Athena still throttled a request after its attempts;
+        ClientError: If Athena still throttled a request after its retries;
             see :func:`is_throttling`.
     """
     reported, prefixes = trial_evidence(output)
-    athena = client(session(settings), "athena", max_attempts=QUIESCE_ATTEMPTS)
+    athena = client(session(settings), "athena", max_retries=QUIESCE_RETRIES)
     stop_errors: dict[str, str] = {}
 
     def stop(ids: Iterable[str]) -> None:

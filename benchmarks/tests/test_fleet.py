@@ -23,7 +23,7 @@ from pyathena_bench.__main__ import main
 from pyathena_bench.cases import Case
 from pyathena_bench.config import Settings
 from pyathena_bench.fleet import (
-    QUIESCE_ATTEMPTS,
+    QUIESCE_RETRIES,
     Filters,
     JobWatch,
     Lease,
@@ -720,16 +720,16 @@ class TestQuiesce:
             return {"reported", "unreported"}
 
         use_athena(athena, active)
-        attempts = []
+        retries = []
         monkeypatch.setattr(
             "pyathena_bench.fleet.client",
-            lambda session_, name, max_attempts: attempts.append(max_attempts) or athena,
+            lambda session_, name, max_retries: retries.append(max_retries) or athena,
         )
         assert quiesce(Settings(poll_interval=0.01), tmp_path) == []
         # The successful trial is neither stopped nor scanned for.
         assert scans == [(("s3://b/trials/t1/", "s3://b/trials/t2/"), ["reported"])]
         assert athena.stopped == ["reported", "unreported"]
-        assert attempts == [QUIESCE_ATTEMPTS]
+        assert retries == [QUIESCE_RETRIES]
 
     def test_a_job_whose_trials_succeeded_is_not_scanned(self, tmp_path, use_athena):
         write_events(
