@@ -545,6 +545,34 @@ class TestPolarsDataFrameIterator:
 
         assert rows == [("a", ("missing", None), date(2024, 1, 1)), (None, ("missing", None), None)]
 
+    def test_itertuples_converter_stop_iteration(self):
+        """A StopIteration from a converter raises instead of ending the rows of its block."""
+
+        def convert(value):
+            if value == "bad":
+                raise StopIteration
+            return value
+
+        chunks = [pl.DataFrame({"s": ["good", "bad", "lost"]}), pl.DataFrame({"s": ["later"]})]
+        rows = PolarsDataFrameIterator(iter(chunks), {"s": convert}, ["s"]).itertuples()
+
+        assert next(rows) == ("good",)
+        with pytest.raises(RuntimeError):
+            next(rows)
+        assert list(rows) == []
+
+    def test_itertuples_value_python_does_not_hold(self):
+        """The rows before a value that Python does not hold are returned before it raises."""
+        # 0 is 1970-01-01, and -719528 is 0000-01-01, a year that Python's date does not hold.
+        dates = pl.Series([0, 0, -719528, 0], dtype=pl.Int32).cast(pl.Date)
+        df = pl.DataFrame({"d": dates, "n": [1, 2, 3, 4]})
+        rows = PolarsDataFrameIterator(df, {}, ["d", "n"]).itertuples()
+
+        assert [next(rows), next(rows)] == [(date(1970, 1, 1), 1), (date(1970, 1, 1), 2)]
+        with pytest.raises(ValueError, match="year 0"):
+            next(rows)
+        assert list(rows) == []
+
     def test_itertuples_large_chunk(self):
         """The rows of a chunk larger than a block of rows keep their order."""
         size = PolarsDataFrameIterator._ROW_BLOCK_SIZE * 2 + 1

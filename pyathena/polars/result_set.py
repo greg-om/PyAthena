@@ -183,15 +183,35 @@ class PolarsDataFrameIterator(abc.Iterator):  # type: ignore[type-arg]
             columns.append(
                 (df.get_column(name, default=None), None if converter is _to_default else converter)
             )
+
+        def take_values(block: pl.Series) -> Iterator[Any]:
+            # A value that Python does not hold, such as a date in year 0, fails
+            # to_list() for the whole block, so the values are taken one at a time
+            # and the rows before it are still returned.
+            for i in range(block.len()):
+                yield block.slice(i, 1).to_list()[0]
+
+        def convert(converter: Callable[[Any], Any], values: Iterable[Any]) -> Iterator[Any]:
+            # Unlike map(), a generator turns a StopIteration from the converter into a
+            # RuntimeError instead of ending the rows early.
+            for value in values:
+                yield converter(value)
+
         size = self._ROW_BLOCK_SIZE
         for start in range(0, df.height, size):
             length = min(size, df.height - start)
             blocks: list[Iterable[Any]] = []
             for series, converter in columns:
-                values = (
-                    [None] * length if series is None else series.slice(start, length).to_list()
-                )
-                blocks.append(values if converter is None else map(converter, values))
+                values: Iterable[Any]
+                if series is None:
+                    values = [None] * length
+                else:
+                    block = series.slice(start, length)
+                    try:
+                        values = block.to_list()
+                    except Exception:
+                        values = take_values(block)
+                blocks.append(values if converter is None else convert(converter, values))
             # Without column names, each row is empty, as iter_rows() gave it.
             yield zip(*blocks, strict=True) if blocks else repeat((), length)
 
