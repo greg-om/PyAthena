@@ -335,7 +335,6 @@ class PandasDataFrameIterator(abc.Iterator):  # type: ignore[type-arg]
             self._reader = reader
         self._trunc_date = trunc_date
         self._csv_stream = csv_stream
-        self._closed = False
 
     @override
     def __next__(self) -> DataFrame:
@@ -371,7 +370,6 @@ class PandasDataFrameIterator(abc.Iterator):  # type: ignore[type-arg]
         """Close the iterator and release resources."""
         from pandas.io.parsers import TextFileReader
 
-        self._closed = True
         reader = self._reader
         self._reader = iter(())
         try:
@@ -403,8 +401,7 @@ class PandasDataFrameIterator(abc.Iterator):  # type: ignore[type-arg]
         ``DataFrame.itertuples(index=False, name=None)`` gives them, so columns
         with the same name keep their own values. The next chunk is read when the
         rows of the current one run out. After an exception, such as a value that
-        fails to convert, the iteration ends. After ``close()``, it ends at the
-        next block of rows.
+        fails to convert, the iteration ends.
 
         Yields:
             The rows of all remaining chunks.
@@ -412,8 +409,6 @@ class PandasDataFrameIterator(abc.Iterator):  # type: ignore[type-arg]
         # Resuming a block after an exception within a row would misalign its columns.
         for df in self:
             for block in self._iter_row_blocks(df):
-                if self._closed:
-                    return
                 yield from block
 
     def _iter_row_blocks(self, df: DataFrame) -> Iterator[Iterator[tuple[Any, ...]]]:

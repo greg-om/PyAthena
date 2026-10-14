@@ -81,17 +81,6 @@ class TestPandasDataFrameIterator:
 
         assert rows == [(i, f"v{i}") for i in range(size)]
 
-    def test_itertuples_after_close(self):
-        """After close(), the rows end with the block that is being read."""
-        size = PandasDataFrameIterator._ROW_BLOCK_SIZE
-        df_iter = PandasDataFrameIterator(pd.DataFrame({"n": range(size * 2)}), _no_trunc_date)
-        rows = df_iter.itertuples()
-        assert next(rows) == (0,)
-
-        df_iter.close()
-
-        assert list(rows) == [(i,) for i in range(1, size)]
-
     def test_iterrows_continuous_row_numbers(self):
         """Row numbers continue across chunks."""
         chunks = [pd.DataFrame({"n": [1, 2]}), pd.DataFrame({"n": [3]}, index=[0])]
@@ -251,8 +240,17 @@ class TestAthenaPandasResultSet:
         assert result_set.fetchall() == []
         assert result_set.rownumber == rownumber
 
+    def test_fetch_after_chunks_run_out(self):
+        """The rows of a chunk that a fetch started stay after iter_chunks() runs out."""
+        size = PandasDataFrameIterator._ROW_BLOCK_SIZE * 2
+        result_set = _fetching_result_set(iter([pd.DataFrame({"n": range(size)})]), arraysize=3)
+        assert result_set.fetchone() == (0,)
+        assert list(result_set.iter_chunks()) == []
+        assert result_set.fetchall() == [(i,) for i in range(1, size)]
+        assert result_set.rownumber == size
+
     def test_close_during_fetchall(self):
-        """A fetchall() in another thread stops when the result set is closed."""
+        """A fetchall() in another thread does not set rownumber after close()."""
         requested = threading.Event()
         closed = threading.Event()
 
@@ -279,8 +277,8 @@ class TestAthenaPandasResultSet:
             assert requested.wait(10)
             result_set.close()
             closed.set()
-            rows = future.result(10)
-        assert rows == [(0,), (1,)]
+            # The fetch still returns the chunk that it was reading.
+            assert future.result(10) == [(0,), (1,), (2,), (3,)]
         assert result_set.rownumber is None
 
     def test_fetchmany_size_not_integer(self):
