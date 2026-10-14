@@ -916,8 +916,9 @@ class JobWatch:
                 return
             # A third of the lease, at least 100 seconds with the minimum
             # --lease-seconds, is left for run_job() to stop the runner, which
-            # takes up to a minute, before another worker can take the claim
-            # over, so the attempt starts no query after that worker's scan.
+            # takes about a minute, before another worker can take the claim
+            # over, so that unless this host stalls, the attempt starts no
+            # query after that worker's scan.
             if time.time() >= self.claim.body["expires"] - self.lease_seconds / 3:
                 self._lose_claim()
                 return
