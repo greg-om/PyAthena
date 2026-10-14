@@ -162,7 +162,7 @@ class TestAthenaPolarsResultSet:
         path = tmp_path / "result.txt"
         path.write_text("001\tx\n")
         result_set = _chunked_result_set()
-        # Polars 2.0 requires new_columns to name every column of the file.
+        # Polars 2.0 rejects new_columns that do not name every column of the file.
         result_set._kwargs = {"new_columns": ["z", "w"], "schema_overrides": {"z": pl.Utf8}}
         with (
             patch.object(

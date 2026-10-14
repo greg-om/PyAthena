@@ -924,7 +924,7 @@ class TestPolarsCursor:
     def test_new_columns_with_schema_overrides(self, polars_cursor):
         """schema_overrides given with new_columns are keyed by the new names, as in Polars.
 
-        Polars 2.0 requires new_columns to name every column of the file.
+        Polars 2.0 rejects new_columns that do not name every column of the file.
         """
         polars_cursor.execute(
             "SELECT '001' AS x, 2 AS y", new_columns=["z", "w"], schema_overrides={"z": pl.String}

@@ -397,6 +397,7 @@ df = cursor.execute("SELECT * FROM many_rows").as_polars()
 They apply to the reads through PyAthena's filesystem: CSV results read without the chunksize option, which use `"bytes"` and 5 MiB blocks by default, and the Parquet files of UNLOAD results read with the chunksize option when pyarrow is installed and `execute()` is given no Polars read options.
 Of the latter, a file of up to 32 MiB is read at once, and a larger one is read with the given `cache_type`, or without it with the `"none"` cache, which requests only the ranges that pyarrow reads.
 With `storage_options` given to `execute()`, the given options replace PyAthena's S3 settings, and `block_size` and `cache_type` do not apply.
+For a CSV result read without the chunksize option, the options are passed to `fsspec.open()`, which uses PyAthena's S3FileSystem; for the other reads, they are passed to Polars, which uses its native S3 access.
 
 (async-polars-cursor)=
 
