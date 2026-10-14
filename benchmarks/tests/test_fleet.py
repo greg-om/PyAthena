@@ -1640,6 +1640,50 @@ class TestWork:
         assert queue.read_lease(queue.key("claims", "a")).takeable(time.time())
         assert "b" not in queue.names("claims")
 
+    def test_a_notice_observed_after_a_throttled_takeover_outlasts_a_failed_check(self, tmp_path):
+        _, queue = queue_with([job("a"), job("b")], tmp_path)
+        queue.acquire(queue.key("claims", "a"), {"host": "dead", "job": "a"}, -1)
+        queue.put(queue.key("results", "a", "attempt-1", "events.jsonl"), {})
+        armed = threading.Event()
+        polling = threading.Event()
+        uploading = threading.Event()
+        upload_tree = queue.upload_tree
+
+        def upload(*args, **kwargs):
+            uploading.set()
+            return upload_tree(*args, **kwargs)
+
+        queue.upload_tree = upload
+
+        def notice():
+            # Only one request of the watch thread sees the notice; the worker's
+            # own check fails.
+            if (
+                not armed.is_set()
+                or polling.is_set()
+                or threading.current_thread() is threading.main_thread()
+            ):
+                return False
+            # The request is still in flight when the attempt checks for a notice.
+            polling.set()
+            return uploading.wait(5)
+
+        def settle(output):
+            if armed.is_set():
+                return []
+            armed.set()
+            assert polling.wait(5)
+            raise throttling("ListQueryExecutions")
+
+        # Without the observed notice, the worker would run "b" and then "a".
+        with pytest.raises(SpotInterruptionError) as raised:
+            work(queue, tmp_path / "w", api_slots=1, poll_seconds=0,
+                 runner=recording_runner([], trials={"a": [ok_trial(0)], "b": [ok_trial(0)]}),
+                 settle=settle, lease_seconds=2, notice=notice)  # fmt: skip
+        assert raised.value.ran == []
+        assert queue.read_lease(queue.key("claims", "a")).takeable(time.time())
+        assert "b" not in queue.names("claims")
+
 
 class TestWorkerCommand:
     def test_worker_uses_the_results_location_without_the_stack(self, tmp_path, monkeypatch):
