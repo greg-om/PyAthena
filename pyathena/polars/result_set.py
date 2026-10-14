@@ -12,14 +12,18 @@ from __future__ import annotations
 import csv
 import importlib.util
 import logging
+import operator
+import sys
 from collections import abc
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from io import BytesIO, StringIO
+from itertools import islice, repeat
 from multiprocessing import cpu_count
 from types import GeneratorType
 from typing import (
     TYPE_CHECKING,
     Any,
+    ClassVar,
     cast,
 )
 
@@ -27,7 +31,7 @@ import fsspec
 
 from pyathena import OperationalError
 from pyathena.arrow.reader import ParquetChunkReader
-from pyathena.converter import Converter
+from pyathena.converter import Converter, _to_default
 from pyathena.error import ProgrammingError
 from pyathena.filesystem.s3 import S3FileSystem
 from pyathena.model import AthenaQueryExecution
@@ -43,11 +47,6 @@ if TYPE_CHECKING:
     from pyathena.connection import Connection
 
 _logger = logging.getLogger(__name__)
-
-
-def _identity(x: Any) -> Any:
-    """Identity function for use as default converter."""
-    return x
 
 
 class PolarsDataFrameIterator(abc.Iterator):  # type: ignore[type-arg]
@@ -74,6 +73,9 @@ class PolarsDataFrameIterator(abc.Iterator):  # type: ignore[type-arg]
         This class is primarily for internal use by AthenaPolarsResultSet.
         Most users should access results through PolarsCursor methods.
     """
+
+    # The number of rows whose values the row iterators convert at once.
+    _ROW_BLOCK_SIZE: ClassVar[int] = 10_000
 
     def __init__(
         self,
@@ -139,16 +141,82 @@ class PolarsDataFrameIterator(abc.Iterator):  # type: ignore[type-arg]
         Yields:
             Tuple of (row_index, row_dict) for each row across all chunks.
         """
-        row_num = 0
+        for row_num, row in enumerate(self.itertuples()):
+            yield (row_num, dict(zip(self._column_names, row, strict=True)))
+
+    def itertuples(self) -> Iterator[tuple[Any, ...]]:
+        """Iterate over rows as tuples of their converted values across all chunks.
+
+        The tuples hold the values of the columns in the order of the column names
+        that the iterator was created with, as ``iterrows()`` gives them. A name
+        that a chunk does not have gives None to the name's converter. The next
+        chunk is read when the rows of the current one run out. After an exception,
+        such as a value that fails to convert, the iteration ends.
+
+        Yields:
+            The rows of all remaining chunks.
+        """
+        # Resuming a block after an exception within a row would misalign its columns.
         for df in self:
-            for row_dict in df.iter_rows(named=True):
-                # Apply converters (use module-level _identity to avoid creating lambdas)
-                processed_row = {
-                    col: self._converters.get(col, _identity)(row_dict.get(col))
-                    for col in self._column_names
-                }
-                yield (row_num, processed_row)
-                row_num += 1
+            for block in self._iter_row_blocks(df):
+                yield from block
+
+    def _iter_row_blocks(self, df: pl.DataFrame) -> Iterator[Iterator[tuple[Any, ...]]]:
+        """Iterate over the rows of a chunk in blocks of rows.
+
+        A block takes the values of a column at once with ``Series.to_list()`` and
+        applies the column's converter unless the column has none or has the default
+        converter, which returns the values as they are. Blocks bound the values held
+        at once for a large chunk.
+
+        Args:
+            df: The DataFrame chunk.
+
+        Yields:
+            An iterator of the rows of each block.
+        """
+        import polars as pl
+
+        # Each column's Series, or None for a name the chunk does not have, and its
+        # converter, or None for the identity.
+        columns: list[tuple[pl.Series | None, Callable[[Any], Any] | None]] = []
+        for name in self._column_names:
+            converter = self._converters.get(name)
+            columns.append(
+                (df.get_column(name, default=None), None if converter is _to_default else converter)
+            )
+
+        def take_values(block: pl.Series) -> Iterator[Any]:
+            # A value that Python does not hold, such as a date in year 0, fails
+            # to_list() for the whole block, so the values are taken one at a time
+            # and the rows before it are still returned. Within a nested value,
+            # Polars raises such a failure as a PanicException, a BaseException.
+            for i in range(block.len()):
+                yield block.slice(i, 1).to_list()[0]
+
+        def convert(converter: Callable[[Any], Any], values: Iterable[Any]) -> Iterator[Any]:
+            # Unlike map(), a generator turns a StopIteration from the converter into a
+            # RuntimeError instead of ending the rows early.
+            for value in values:
+                yield converter(value)
+
+        size = self._ROW_BLOCK_SIZE
+        for start in range(0, df.height, size):
+            length = min(size, df.height - start)
+            blocks: list[Iterable[Any]] = []
+            for series, converter in columns:
+                values: Iterable[Any]
+                if series is None:
+                    values = [None] * length
+                else:
+                    block = series.slice(start, length)
+                    try:
+                        values = block.to_list()
+                    except (Exception, pl.exceptions.PanicException):
+                        values = take_values(block)
+                blocks.append(values if converter is None else convert(converter, values))
+            # Without column names, each row is empty, as iter_rows() gave it.
+            yield zip(*blocks, strict=True) if blocks else repeat((), length)
 
     def as_polars(self) -> pl.DataFrame:
         """Collect all chunks into a single DataFrame.
@@ -303,12 +371,7 @@ class AthenaPolarsResultSet(AthenaResultSet):
             self._df_iter = PolarsDataFrameIterator(
                 self._df.clone(), self._df_converters, self._get_frame_column_names()
             )
-
-        # Cache column names for efficient access in fetchone()
-        # Must be after _as_polars() and _create_dataframe_iterator(), which update
-        # _metadata for unload
-        self._column_names_cache: list[str] = self._get_frame_column_names()
-        self._iterrows = self._df_iter.iterrows()
+        self._row_iter: Iterator[tuple[Any, ...]] = self._df_iter.itertuples()
 
     def _storage_options(self, default: Callable[[], dict[str, Any]]) -> Any:
         """Get the storage options for a Polars read function.
@@ -525,18 +588,61 @@ class AthenaPolarsResultSet(AthenaResultSet):
     def fetchone(
         self,
     ) -> tuple[Any | None, ...] | dict[Any, Any | None] | None:
-        """Fetch the next row of the query result.
+        row = next(self._row_iter, None)
+        if row is not None:
+            self._count_rows(1)
+        return row
+
+    @override
+    def fetchmany(
+        self, size: int | None = None
+    ) -> list[tuple[Any | None, ...] | dict[Any, Any | None]]:
+        if not size or size <= 0:
+            size = self._arraysize
+        # A size that is not an integer raises TypeError, as with the base class, and
+        # islice() takes no size above sys.maxsize.
+        return self._take_rows(min(operator.index(size), sys.maxsize))
+
+    @override
+    def fetchall(
+        self,
+    ) -> list[tuple[Any | None, ...] | dict[Any, Any | None]]:
+        return self._take_rows(None)
+
+    def _take_rows(self, size: int | None) -> list[tuple[Any | None, ...] | dict[Any, Any | None]]:
+        """Take the next rows and count them in ``rownumber``.
+
+        The rows taken before an exception are counted too, as the base class's
+        ``fetchone()`` per row counted them.
+
+        Args:
+            size: The maximum number of rows, or None for all remaining rows.
 
         Returns:
-            A single row as a tuple, or None if no more rows are available.
+            The rows, fewer than ``size`` when the result is exhausted.
         """
+        rows: list[tuple[Any | None, ...] | dict[Any, Any | None]] = []
         try:
-            row = next(self._iterrows)
-        except StopIteration:
-            return None
-        else:
-            self._rownumber = row[0] + 1
-            return tuple([row[1][col] for col in self._column_names_cache])
+            # extend() keeps the rows that it appended before an exception.
+            rows.extend(islice(self._row_iter, size))
+        finally:
+            if rows:
+                self._count_rows(len(rows))
+        return rows
+
+    def _count_rows(self, count: int) -> None:
+        """Count the rows that a fetch took in ``rownumber``.
+
+        ``rownumber`` stays None for a result set that another thread closed before
+        the update. It is read once, so that a ``close()`` during the update raises no
+        TypeError, though it may leave the count in place.
+
+        Args:
+            count: The number of rows taken.
+        """
+        rownumber = self._rownumber
+        if rownumber is not None:
+            self._rownumber = rownumber + count
 
     def _is_csv_readable(self) -> bool:
         """Check if CSV output is available and can be read.
@@ -922,4 +1028,4 @@ class AthenaPolarsResultSet(AthenaResultSet):
         self._df_iter.close()
         self._df = pl.DataFrame()
         self._df_iter = PolarsDataFrameIterator(self._df, {}, [])
-        self._iterrows = iter([])
+        self._row_iter = iter(())

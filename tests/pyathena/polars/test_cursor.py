@@ -697,6 +697,35 @@ class TestPolarsCursor:
             rows = cursor.fetchall()
             assert len(rows) == 15
 
+    @pytest.mark.parametrize(
+        ("polars_cursor", "ordered"),
+        [
+            ({"cursor_kwargs": {"unload": False}}, True),
+            # The rows of an UNLOAD result can be in any order of its files.
+            ({"cursor_kwargs": {"unload": True}}, False),
+        ],
+        indirect=["polars_cursor"],
+    )
+    def test_fetch_across_chunks(self, polars_cursor, ordered):
+        """The fetch methods continue across chunks and count the rows they return."""
+        polars_cursor.execute(
+            "SELECT * FROM (VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e')) AS t(k, s)",
+            chunksize=2,
+        )
+        rows = [polars_cursor.fetchone()]
+        assert polars_cursor.rownumber == 1
+        rows += polars_cursor.fetchmany(3)
+        assert polars_cursor.rownumber == 4
+        rows += polars_cursor.fetchall()
+        assert polars_cursor.rownumber == 5
+        assert (rows if ordered else sorted(rows)) == [
+            (1, "a"),
+            (2, "b"),
+            (3, "c"),
+            (4, "d"),
+            (5, "e"),
+        ]
+
     def test_iterator_with_chunksize(self):
         """Test that cursor iteration works correctly with chunksize enabled."""
         with contextlib.closing(connect(schema_name=ENV.schema)) as conn:
