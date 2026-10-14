@@ -1104,19 +1104,19 @@ def run_attempt(
                     break
         upload_attempt()
 
-    # The watch has stopped, so a notice it observed after the check above is final.
-    noticed = watch.interrupted.is_set()
+    # Each outcome reads the watch's notice last: after a lost claim, the watch
+    # is joined for only 10 seconds, and a notice check may still finish.
     if deferred:
         # Nothing ran, so the next attempt resumes from the same earlier attempts.
         queue.end_lease(claim, "released")
-        return Outcome("deferred", noticed=noticed)
+        return Outcome("deferred", noticed=watch.interrupted.is_set())
 
     def abandon() -> Outcome:
         # A claim lost only by its local expiry, for example while a renewal that
         # S3 accepted stalled, may still be this worker's; releasing it, which
         # works only then, returns the job to the fleet.
         queue.end_lease(claim, "released")
-        return Outcome("lost", tuple(errors), noticed=noticed)
+        return Outcome("lost", tuple(errors), noticed=watch.interrupted.is_set())
 
     # The conditional renewal proves that this worker still owns the job, so a
     # former owner never records it, and leaves at least --lease-seconds for
@@ -1161,7 +1161,7 @@ def run_attempt(
     )
     if recorded is None:
         return abandon()
-    return Outcome("done", tuple(errors), noticed=noticed)
+    return Outcome("done", tuple(errors), noticed=watch.interrupted.is_set())
 
 
 def work(
