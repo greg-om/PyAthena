@@ -5,16 +5,22 @@
 #
 # SPDX-License-Identifier: MIT
 
-from datetime import datetime
-from unittest.mock import PropertyMock, patch
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
+from unittest.mock import MagicMock, PropertyMock, patch
 
 import polars as pl
 import pytest
 from fsspec.implementations.local import LocalFileSystem
 
+from pyathena.converter import _to_date, _to_default
 from pyathena.error import OperationalError
+from pyathena.model import AthenaQueryExecution
 from pyathena.polars.converter import DefaultPolarsTypeConverter
 from pyathena.polars.result_set import AthenaPolarsResultSet, PolarsDataFrameIterator
+from pyathena.util import RetryConfig
 
 _ROWS_BEFORE_FAILURE = 300_000
 
@@ -33,7 +39,174 @@ def _chunked_result_set() -> AthenaPolarsResultSet:
     return result_set
 
 
+def _fetching_result_set(chunks, names, arraysize, converters=None) -> AthenaPolarsResultSet:
+    """Create a result set of a succeeded query whose chunks are ``chunks``, without AWS.
+
+    Args:
+        chunks: An iterable of DataFrame chunks.
+        names: The column names of the rows.
+        arraysize: The result set's arraysize.
+        converters: The converters keyed by column name; identities by default.
+
+    Returns:
+        An AthenaPolarsResultSet that reads ``chunks`` as its chunked result.
+    """
+    query_execution = MagicMock(
+        state=AthenaQueryExecution.STATE_SUCCEEDED, output_location="s3://bucket/result.csv"
+    )
+    with (
+        patch.object(AthenaPolarsResultSet, "_pre_fetch"),
+        patch.object(
+            AthenaPolarsResultSet,
+            "_create_dataframe_iterator",
+            return_value=PolarsDataFrameIterator(iter(chunks), converters or {}, names),
+        ),
+    ):
+        return AthenaPolarsResultSet(
+            connection=MagicMock(),
+            converter=DefaultPolarsTypeConverter(),
+            query_execution=query_execution,
+            arraysize=arraysize,
+            retry_config=RetryConfig(),
+            chunksize=10_000,
+        )
+
+
 class TestAthenaPolarsResultSet:
+    def test_fetch_across_chunks(self):
+        """The fetch methods continue across chunks, reading a chunk when its rows are needed."""
+        read = []
+
+        def chunks():
+            for start in (0, 4, 8):
+                read.append(start)
+                stop = min(start + 4, 10)
+                yield pl.DataFrame(
+                    {"n": range(start, stop), "s": [f"v{i}" for i in range(start, stop)]}
+                )
+
+        result_set = _fetching_result_set(chunks(), ["n", "s"], arraysize=3)
+        assert result_set.rownumber == 0
+        assert result_set.fetchone() == (0, "v0")
+        assert result_set.rownumber == 1
+        assert result_set.fetchmany(3) == [(1, "v1"), (2, "v2"), (3, "v3")]
+        assert result_set.rownumber == 4
+        assert read == [0]
+        assert result_set.fetchmany(5) == [(i, f"v{i}") for i in range(4, 9)]
+        assert result_set.rownumber == 9
+        assert read == [0, 4, 8]
+        assert result_set.fetchmany() == [(9, "v9")]
+        assert result_set.rownumber == 10
+        assert result_set.fetchmany() == []
+        assert result_set.fetchall() == []
+        assert result_set.fetchone() is None
+        assert result_set.rownumber == 10
+
+    def test_fetchall_across_chunks(self):
+        """fetchall() returns the remaining rows of all chunks, skipping empty chunks."""
+        chunks = [
+            pl.DataFrame({"n": [0, 1]}),
+            pl.DataFrame({"n": []}, schema={"n": pl.Int64}),
+            pl.DataFrame({"n": [2, 3]}),
+        ]
+        result_set = _fetching_result_set(chunks, ["n"], arraysize=3)
+        assert result_set.fetchone() == (0,)
+        assert result_set.fetchall() == [(1,), (2,), (3,)]
+        assert result_set.rownumber == 4
+        assert result_set.fetchall() == []
+        assert result_set.rownumber == 4
+
+    @pytest.mark.parametrize(
+        ("dates", "method", "rownumber"),
+        [
+            (["2024-01-01", "bad", "2024-01-03"], "fetchone", 1),
+            (["2024-01-01", "bad", "2024-01-03"], "fetchmany", 1),
+            (["2024-01-01", "bad", "2024-01-03"], "fetchall", 1),
+            (["2024-01-01", "2024-01-02", "bad"], "fetchmany", 2),
+            (["2024-01-01", "2024-01-02", "bad"], "fetchall", 2),
+        ],
+    )
+    def test_fetch_after_conversion_error(self, dates, method, rownumber):
+        """After a value fails to convert, the fetch methods return no more rows.
+
+        ``rownumber`` counts the rows taken before the error, as fetching row by row did.
+        """
+        chunks = [
+            pl.DataFrame({"n": [0, 1, 2], "d": dates}),
+            pl.DataFrame({"n": [3], "d": ["2024-01-04"]}),
+        ]
+        result_set = _fetching_result_set(
+            chunks, ["n", "d"], arraysize=3, converters={"d": _to_date}
+        )
+        assert result_set.fetchone() == (0, date(2024, 1, 1))
+        with pytest.raises(ValueError, match="bad"):
+            getattr(result_set, method)()
+        assert result_set.rownumber == rownumber
+        assert result_set.fetchone() is None
+        assert result_set.fetchmany() == []
+        assert result_set.fetchall() == []
+        assert result_set.rownumber == rownumber
+
+    def test_fetch_after_chunks_run_out(self):
+        """The rows of a chunk that a fetch started stay after iter_chunks() runs out."""
+        size = PolarsDataFrameIterator._ROW_BLOCK_SIZE * 2
+        result_set = _fetching_result_set([pl.DataFrame({"n": range(size)})], ["n"], arraysize=3)
+        assert result_set.fetchone() == (0,)
+        assert list(result_set.iter_chunks()) == []
+        assert result_set.fetchall() == [(i,) for i in range(1, size)]
+        assert result_set.rownumber == size
+
+    def test_close_during_fetchall(self):
+        """A fetchall() in another thread does not set rownumber after close()."""
+        requested = threading.Event()
+        closed = threading.Event()
+
+        # Not a generator, which close() cannot close while it runs (#1172).
+        class Chunks:
+            def __init__(self):
+                self._chunks = iter([pl.DataFrame({"n": [0, 1]}), pl.DataFrame({"n": [2, 3]})])
+                self._calls = 0
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                self._calls += 1
+                if self._calls == 2:
+                    requested.set()
+                    assert closed.wait(10)
+                return next(self._chunks)
+
+        result_set = _fetching_result_set(Chunks(), ["n"], arraysize=3)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(result_set.fetchall)
+            assert requested.wait(10)
+            result_set.close()
+            closed.set()
+            # The fetch still returns the chunk that it was reading.
+            assert future.result(10) == [(0,), (1,), (2,), (3,)]
+        assert result_set.rownumber is None
+
+    def test_fetchmany_size_above_maxsize(self):
+        result_set = _fetching_result_set([pl.DataFrame({"n": [1, 2]})], ["n"], arraysize=3)
+        assert result_set.fetchmany(10**100) == [(1,), (2,)]
+        assert result_set.rownumber == 2
+
+    def test_fetchmany_size_not_integer(self):
+        """A size that is not an integer raises TypeError without consuming rows."""
+        result_set = _fetching_result_set([pl.DataFrame({"n": [1, 2]})], ["n"], arraysize=3)
+        with pytest.raises(TypeError):
+            result_set.fetchmany(1.5)
+        assert result_set.fetchall() == [(1,), (2,)]
+
+    def test_fetch_after_close(self):
+        result_set = _fetching_result_set([pl.DataFrame({"n": [1, 2]})], ["n"], arraysize=3)
+        result_set.close()
+        assert result_set.fetchone() is None
+        assert result_set.fetchmany() == []
+        assert result_set.fetchall() == []
+        assert result_set.rownumber is None
+
     def test_iter_csv_chunks_raises_when_read_fails_partway(self, tmp_path):
         """A CSV read that fails partway through the data raises instead of ending early."""
         path = tmp_path / "result.csv"
@@ -314,6 +487,70 @@ class TestAthenaPolarsResultSet:
 
 
 class TestPolarsDataFrameIterator:
+    @pytest.mark.parametrize(
+        "series",
+        [
+            pl.Series([True, None, False]),
+            pl.Series([1, None, 3], dtype=pl.Int8),
+            pl.Series([1, None, 2**62]),
+            pl.Series([1.5, None, float("inf")], dtype=pl.Float32),
+            pl.Series(["a", None, ""]),
+            pl.Series([Decimal("1.23"), None, Decimal("-4.50")], dtype=pl.Decimal(10, 2)),
+            pl.Series([date(2024, 1, 1), None, date(1, 1, 1)]),
+            pl.Series([datetime(2024, 1, 2, 3, 4, 5, 123456), None, datetime(1970, 1, 1)]),
+            pl.Series([datetime(2024, 1, 2, tzinfo=UTC), None, None]).dt.convert_time_zone(
+                "Asia/Tokyo"
+            ),
+            pl.Series([timedelta(seconds=1), None, timedelta(days=-1)]),
+            pl.Series([b"\x00\x01", None, b""]),
+            pl.Series([[1, 2], None, []]),
+            pl.Series([{"a": 1, "b": "x"}, None, {"a": None, "b": None}]),
+            pl.Series([[{"a": [1]}], None, [{"a": None}]]),
+            pl.Series([None, None, None], dtype=pl.Null),
+        ],
+        ids=lambda series: str(series.dtype),
+    )
+    def test_itertuples_values(self, series):
+        """The rows hold the values that DataFrame.iter_rows() gives, with their types."""
+        df = pl.DataFrame({"c": series, "n": [10, 11, 12]})
+        expected = [(row["c"], row["n"]) for row in df.iter_rows(named=True)]
+
+        rows = list(PolarsDataFrameIterator(df, {}, ["c", "n"]).itertuples())
+
+        assert [[(type(v), repr(v)) for v in row] for row in rows] == [
+            [(type(v), repr(v)) for v in row] for row in expected
+        ]
+
+    def test_itertuples_converters(self):
+        """Each column's converter applies to its values, by the iterator's column names.
+
+        A name that the chunk does not have gives None to its converter, and a column
+        that the names do not include is left out.
+        """
+        df = pl.DataFrame({"d": ["2024-01-01", None], "s": ["a", None], "extra": [1, 2]})
+        converters = {"d": _to_date, "s": _to_default, "missing": lambda v: ("missing", v)}
+
+        rows = list(PolarsDataFrameIterator(df, converters, ["s", "missing", "d"]).itertuples())
+
+        assert rows == [("a", ("missing", None), date(2024, 1, 1)), (None, ("missing", None), None)]
+
+    def test_itertuples_large_chunk(self):
+        """The rows of a chunk larger than a block of rows keep their order."""
+        size = PolarsDataFrameIterator._ROW_BLOCK_SIZE * 2 + 1
+        df = pl.DataFrame({"n": range(size), "s": [f"v{i}" for i in range(size)]})
+
+        rows = list(PolarsDataFrameIterator(df, {"s": _to_default}, ["n", "s"]).itertuples())
+
+        assert rows == [(i, f"v{i}") for i in range(size)]
+
+    def test_iterrows_continuous_row_numbers(self):
+        """Row numbers continue across chunks, with each row keyed by the column names."""
+        chunks = [pl.DataFrame({"n": [1, 2]}), pl.DataFrame({"n": [3]})]
+
+        rows = list(PolarsDataFrameIterator(iter(chunks), {}, ["n"]).iterrows())
+
+        assert rows == [(0, {"n": 1}), (1, {"n": 2}), (2, {"n": 3})]
+
     @pytest.mark.parametrize(
         "reader",
         ["dataframe", "generator"],
