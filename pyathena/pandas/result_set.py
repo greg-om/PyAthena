@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import importlib
 import logging
+import operator
 from collections import abc
 from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
@@ -951,7 +952,8 @@ class AthenaPandasResultSet(AthenaResultSet):
     ) -> list[tuple[Any | None, ...] | dict[Any, Any | None]]:
         if not size or size <= 0:
             size = self._arraysize
-        return self._take_rows(size)
+        # A size that is not an integer raises TypeError, as with the base class.
+        return self._take_rows(operator.index(size))
 
     @override
     def fetchall(

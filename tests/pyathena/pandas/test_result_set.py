@@ -225,6 +225,13 @@ class TestAthenaPandasResultSet:
         assert result_set.fetchall() == []
         assert result_set.rownumber == 1
 
+    def test_fetchmany_size_not_integer(self):
+        """A size that is not an integer raises TypeError without consuming rows."""
+        result_set = _fetching_result_set(pd.DataFrame({"n": [1, 2]}), arraysize=3)
+        with pytest.raises(TypeError):
+            result_set.fetchmany(1.5)
+        assert result_set.fetchall() == [(1,), (2,)]
+
     def test_fetch_after_close(self):
         result_set = _fetching_result_set(pd.DataFrame({"n": [1, 2]}), arraysize=3)
         result_set.close()
