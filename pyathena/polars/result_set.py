@@ -186,7 +186,7 @@ class PolarsDataFrameIterator(abc.Iterator):  # type: ignore[type-arg]
             converter: Callable[[Any], Any] | None = self._converters.get(name, _identity)
             if converter is _identity or converter is _to_default:
                 converter = None
-            columns.append((df.get_column(name) if name in df.schema else None, converter))
+            columns.append((df.get_column(name, default=None), converter))
         size = self._ROW_BLOCK_SIZE
         for start in range(0, df.height, size):
             length = min(size, df.height - start)
