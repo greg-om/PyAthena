@@ -30,11 +30,24 @@ def session(settings: Settings) -> Any:
     return boto3.Session(profile_name=settings.profile, region_name=settings.region)
 
 
-def client(session_: Any, service: str) -> Any:
+def client(session_: Any, service: str, max_attempts: int = 5) -> Any:
+    """Create a client that retries in botocore's standard mode.
+
+    Args:
+        session_: Session that creates the client.
+        service: Service name.
+        max_attempts: Attempts per request, including the first; retries wait
+            with jittered exponential backoff of up to 20 seconds.
+
+    Returns:
+        The client.
+    """
     return session_.client(
         service,
         config=Config(
-            connect_timeout=10, read_timeout=60, retries={"mode": "standard", "max_attempts": 5}
+            connect_timeout=10,
+            read_timeout=60,
+            retries={"mode": "standard", "max_attempts": max_attempts},
         ),
     )
 

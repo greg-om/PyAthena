@@ -12,6 +12,7 @@ import pytest
 from botocore.exceptions import ClientError
 from pyathena_bench.aws import (
     cleanup,
+    client,
     prepare,
     prepare_objects,
     run_locations,
@@ -404,6 +405,14 @@ def test_cleanup_covers_a_separate_results_location(aws_metadata, monkeypatch, t
         ("results", f"bench/stack/runs/{RUN}/trials/"),
         ("temporary", f"runs/{RUN}/trials/"),
     }
+
+
+@pytest.mark.parametrize(("kwargs", "attempts"), [({}, 5), ({"max_attempts": 10}, 10)])
+def test_client_retries_in_standard_mode(kwargs, attempts):
+    created = []
+    session_ = SimpleNamespace(client=lambda service, config: created.append(config) or service)
+    assert client(session_, "athena", **kwargs) == "athena"
+    assert created[0].retries == {"mode": "standard", "max_attempts": attempts}
 
 
 @pytest.mark.parametrize(
