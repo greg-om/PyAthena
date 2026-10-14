@@ -2755,8 +2755,11 @@ class S3File(AbstractBufferedFile):
             version_id: The version ID to read. Must match the version ID in
                 the path if both are given. A version cannot be given, in
                 either form, for writing or appending.
-            max_workers: The number of parallel workers for range reads and
-                part copies.
+            max_workers: The number of parallel workers for range reads, part
+                copies, and part uploads. A write keeps at most
+                ``max_workers`` parts of the written data in flight: it
+                submits a part only after the part submitted ``max_workers``
+                parts before it has finished.
             executor: The executor for parallel operations. If None, a new
                 ``S3ThreadPoolExecutor`` is created.
             block_size: The block size for reads and writes. Must be between
@@ -3088,6 +3091,13 @@ class S3File(AbstractBufferedFile):
             for part_number, data in writer.iter_parts(
                 buffer, first_part_number=len(self.multipart_upload_parts) + 1
             ):
+                if len(self.multipart_upload_parts) >= self.max_workers:
+                    # At most max_workers parts of the written data are in
+                    # flight, so that the parts waiting for a worker do not
+                    # pile up in memory: each part waits for the one
+                    # submitted max_workers parts before it. A failed part is
+                    # reported by commit().
+                    wait([self.multipart_upload_parts[-self.max_workers]])
                 # Tracked before it is scheduled, so that an interrupt while
                 # it is being scheduled still lets discard() cancel it or wait
                 # for it before the abort.
