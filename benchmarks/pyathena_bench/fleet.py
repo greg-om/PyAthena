@@ -33,7 +33,7 @@ from botocore.exceptions import ClientError
 from pyathena_bench.aws import active_queries, client, session
 from pyathena_bench.cases import Case, matrix
 from pyathena_bench.config import Settings
-from pyathena_bench.report import read_trial_starts, read_trials, report
+from pyathena_bench.report import read_records, read_trial_starts, read_trials, report
 
 # Row cursors page through GetQueryResults, which has an account-wide request-rate quota;
 # so does read_sql_query() through the REST driver.
@@ -721,20 +721,11 @@ def trial_evidence(output: Path) -> tuple[set[str], tuple[str, ...]]:
     """
     records = read_trials(output)
     succeeded = {t.get("trial") for t in records if t.get("status") == "ok"}
-    ids: set[str] = set()
-    events = output / "events.jsonl"
-    if events.exists():
-        for line in events.read_text().splitlines():
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if (
-                event.get("event") == "query"
-                and event.get("query_id")
-                and event.get("trial") not in succeeded
-            ):
-                ids.add(event["query_id"])
+    ids = {
+        e["query_id"]
+        for e in read_records(output / "events.jsonl")
+        if e.get("event") == "query" and e.get("query_id") and e.get("trial") not in succeeded
+    }
     for record in records:
         if record.get("trial") not in succeeded:
             ids.update(record.get("query_ids", []))
@@ -787,13 +778,17 @@ def quiesce(settings: Settings, output: Path) -> list[str]:
     stop_errors: dict[str, str] = {}
 
     def stop(ids: Iterable[str]) -> None:
+        throttled = None
         for query_id in sorted(ids):
             try:
                 athena.stop_query_execution(QueryExecutionId=query_id)
             except ClientError as exc:
                 if is_throttling(exc):
-                    raise
+                    throttled = throttled or exc
                 stop_errors[query_id] = str(exc)
+        if throttled:
+            # The other queries were still asked to stop.
+            raise throttled
 
     stop(reported)
     found = active_queries(athena, settings.workgroup, prefixes) if prefixes else set()
@@ -1043,8 +1038,8 @@ def run_attempt(
             try:
                 errors += settle(earlier)
             except Exception as exc:
-                deferred = not errors and is_throttling(exc)
-                if deferred:
+                if not errors and is_throttling(exc):
+                    deferred = True
                     break
                 errors.append(settle_error(earlier, exc))
         code = 1
@@ -1246,7 +1241,7 @@ def work(
                     raise SpotInterruptionError(completed)
                 if outcome.state == "deferred":
                     _logger.warning(
-                        f"Released {job['id']}: Athena throttled quiescing its earlier attempts"
+                        f"Deferred {job['id']}: Athena throttled quiescing its earlier attempts"
                     )
                     if check_notice(notice):
                         raise SpotInterruptionError(completed)

@@ -637,24 +637,42 @@ class TestQueueSafety:
 
 
 class FakeAthena:
-    def __init__(self, states, stop_errors=()):
+    def __init__(self, states, stop_errors=None):
         self.states = states
-        self.stop_errors = set(stop_errors)
+        # Error codes of failing StopQueryExecution requests, by query ID.
+        self.stop_errors = stop_errors or {}
         self.stopped = []
 
     def stop_query_execution(self, **kwargs):
         query_id = kwargs["QueryExecutionId"]
         self.stopped.append(query_id)
         if query_id in self.stop_errors:
-            raise ClientError({"Error": {"Code": "InvalidRequestException"}}, "StopQueryExecution")
+            raise ClientError({"Error": {"Code": self.stop_errors[query_id]}}, "StopQueryExecution")
         self.states[query_id] = "CANCELLED"
 
     def get_query_execution(self, **kwargs):
         return {"QueryExecution": {"Status": {"State": self.states[kwargs["QueryExecutionId"]]}}}
 
 
+@pytest.fixture
+def use_athena(monkeypatch):
+    """Return a function that makes quiesce() use a fake client and history scan."""
+
+    def install(athena, active=None):
+        monkeypatch.setattr("pyathena_bench.fleet.session", lambda settings: None)
+        monkeypatch.setattr("pyathena_bench.fleet.client", lambda session_, name, **_: athena)
+        if active is not None:
+            monkeypatch.setattr("pyathena_bench.fleet.active_queries", active)
+
+    return install
+
+
+def write_events(path, *events):
+    (path / "events.jsonl").write_text("".join(json.dumps(e) + "\n" for e in events))
+
+
 class TestQuiesce:
-    def test_unreported_queries_under_trial_prefixes_are_stopped(self, tmp_path, monkeypatch):
+    def test_unreported_queries_under_trial_prefixes_are_stopped(self, tmp_path, use_athena):
         (tmp_path / "events.jsonl").write_text(
             json.dumps({"event": "trial_start", "output": "s3://b/runs/r/trials/t1/"}) + "\n"
         )
@@ -665,24 +683,21 @@ class TestQuiesce:
             found["prefixes"] = prefixes
             return {"unreported"}
 
-        monkeypatch.setattr("pyathena_bench.fleet.session", lambda settings: None)
-        monkeypatch.setattr("pyathena_bench.fleet.client", lambda session_, name, **_: athena)
-        monkeypatch.setattr("pyathena_bench.fleet.active_queries", active)
+        use_athena(athena, active)
         assert quiesce(Settings(poll_interval=0.01), tmp_path) == []
         assert found["prefixes"] == ("s3://b/runs/r/trials/t1/",)
         assert athena.stopped == ["unreported"]
 
-    def test_stop_errors_are_ignored_once_the_query_is_terminal(self, tmp_path, monkeypatch):
+    def test_stop_errors_are_ignored_once_the_query_is_terminal(self, tmp_path, use_athena):
         (tmp_path / "events.jsonl").write_text(
             json.dumps({"event": "query", "query_id": "done"}) + "\n"
         )
-        athena = FakeAthena({"done": "SUCCEEDED"}, stop_errors={"done"})
-        monkeypatch.setattr("pyathena_bench.fleet.session", lambda settings: None)
-        monkeypatch.setattr("pyathena_bench.fleet.client", lambda session_, name, **_: athena)
+        athena = FakeAthena({"done": "SUCCEEDED"}, stop_errors={"done": "InvalidRequestException"})
+        use_athena(athena)
         assert quiesce(Settings(poll_interval=0.01), tmp_path) == []
 
     def test_reported_queries_stop_before_unfinished_trials_are_scanned(
-        self, tmp_path, monkeypatch
+        self, tmp_path, monkeypatch, use_athena
     ):
         # The host was lost, so only the attempt's checkpoint exists.
         checkpoint = tmp_path / "checkpoint"
@@ -704,25 +719,23 @@ class TestQuiesce:
             scans.append((prefixes, list(athena.stopped)))
             return {"reported", "unreported"}
 
+        use_athena(athena, active)
         attempts = []
-        monkeypatch.setattr("pyathena_bench.fleet.session", lambda settings: None)
         monkeypatch.setattr(
             "pyathena_bench.fleet.client",
             lambda session_, name, max_attempts: attempts.append(max_attempts) or athena,
         )
-        monkeypatch.setattr("pyathena_bench.fleet.active_queries", active)
         assert quiesce(Settings(poll_interval=0.01), tmp_path) == []
         # The successful trial is neither stopped nor scanned for.
         assert scans == [(("s3://b/trials/t1/", "s3://b/trials/t2/"), ["reported"])]
         assert athena.stopped == ["reported", "unreported"]
         assert attempts == [QUIESCE_ATTEMPTS]
 
-    def test_a_job_whose_trials_succeeded_is_not_scanned(self, tmp_path, monkeypatch):
-        (tmp_path / "events.jsonl").write_text(
-            json.dumps({"event": "trial_start", "trial": "t0", "output": "s3://b/trials/t0/"})
-            + "\n"
-            + json.dumps({"event": "query", "trial": "t0", "query_id": "finished"})
-            + "\n"
+    def test_a_job_whose_trials_succeeded_is_not_scanned(self, tmp_path, use_athena):
+        write_events(
+            tmp_path,
+            {"event": "trial_start", "trial": "t0", "output": "s3://b/trials/t0/"},
+            {"event": "query", "trial": "t0", "query_id": "finished"},
         )
         (tmp_path / "trials.jsonl").write_text(json.dumps(ok_trial(0)) + "\n")
         athena = FakeAthena({})
@@ -730,58 +743,66 @@ class TestQuiesce:
         def active(client_, workgroup, prefixes):
             pytest.fail("A job whose trials all succeeded needs no history scan")
 
-        monkeypatch.setattr("pyathena_bench.fleet.session", lambda settings: None)
-        monkeypatch.setattr("pyathena_bench.fleet.client", lambda session_, name, **_: athena)
-        monkeypatch.setattr("pyathena_bench.fleet.active_queries", active)
+        use_athena(athena, active)
         assert quiesce(Settings(poll_interval=0.01), tmp_path) == []
         assert athena.stopped == []
 
-    @pytest.mark.parametrize(
-        "operation", ["ListQueryExecutions", "StopQueryExecution", "GetQueryExecution"]
-    )
-    def test_throttled_requests_are_raised(self, tmp_path, monkeypatch, operation):
-        (tmp_path / "events.jsonl").write_text(
-            json.dumps({"event": "trial_start", "trial": "t1", "output": "s3://b/trials/t1/"})
-            + "\n"
-            + json.dumps({"event": "query", "trial": "t1", "query_id": "reported"})
-            + "\n"
+    def test_a_throttled_history_scan_raises_after_the_reported_queries_stop(
+        self, tmp_path, use_athena
+    ):
+        write_events(
+            tmp_path,
+            {"event": "trial_start", "trial": "t1", "output": "s3://b/trials/t1/"},
+            {"event": "query", "trial": "t1", "query_id": "reported"},
         )
         athena = FakeAthena({"reported": "RUNNING"})
 
-        def throttled(**kwargs):
-            raise throttling(operation)
-
         def active(client_, workgroup, prefixes):
-            if operation == "ListQueryExecutions":
-                throttled()
-            return set()
+            raise throttling("ListQueryExecutions")
 
-        if operation == "StopQueryExecution":
-            athena.stop_query_execution = throttled
-        if operation == "GetQueryExecution":
-            athena.get_query_execution = throttled
-        monkeypatch.setattr("pyathena_bench.fleet.session", lambda settings: None)
-        monkeypatch.setattr("pyathena_bench.fleet.client", lambda session_, name, **_: athena)
-        monkeypatch.setattr("pyathena_bench.fleet.active_queries", active)
-        with pytest.raises(ClientError) as raised:
+        use_athena(athena, active)
+        with pytest.raises(ClientError, match="ThrottlingException"):
             quiesce(Settings(poll_interval=0.01), tmp_path)
-        assert is_throttling(raised.value)
-        if operation == "ListQueryExecutions":
-            # The reported query was stopped before the history scan.
-            assert athena.stopped == ["reported"]
+        assert athena.stopped == ["reported"]
+
+    def test_a_throttled_stop_does_not_skip_the_other_queries(self, tmp_path, use_athena):
+        write_events(
+            tmp_path,
+            *({"event": "query", "trial": "t1", "query_id": q} for q in ("first", "second")),
+        )
+        athena = FakeAthena(
+            {"first": "RUNNING", "second": "RUNNING"}, stop_errors={"first": "ThrottlingException"}
+        )
+        use_athena(athena)
+        with pytest.raises(ClientError, match="ThrottlingException"):
+            quiesce(Settings(poll_interval=0.01), tmp_path)
+        assert athena.stopped == ["first", "second"]
+        assert athena.states["second"] == "CANCELLED"
+
+    def test_a_throttled_status_check_raises(self, tmp_path, use_athena):
+        write_events(tmp_path, {"event": "query", "trial": "t1", "query_id": "reported"})
+        athena = FakeAthena({"reported": "RUNNING"})
+
+        def throttled(**kwargs):
+            raise throttling("GetQueryExecution")
+
+        athena.get_query_execution = throttled
+        use_athena(athena)
+        with pytest.raises(ClientError, match="ThrottlingException"):
+            quiesce(Settings(poll_interval=0.01), tmp_path)
 
 
 @pytest.mark.parametrize(
-    ("code", "expected"),
+    ("error", "expected"),
     [
-        ("ThrottlingException", True),
-        ("TooManyRequestsException", True),
-        ("InvalidRequestException", False),
+        (throttling("ListQueryExecutions"), True),
+        (throttling("StartQueryExecution", "TooManyRequestsException"), True),
+        (throttling("StopQueryExecution", "InvalidRequestException"), False),
+        (RuntimeError("ThrottlingException"), False),
     ],
 )
-def test_is_throttling(code, expected):
-    assert is_throttling(throttling("ListQueryExecutions", code)) is expected
-    assert not is_throttling(RuntimeError(code))
+def test_is_throttling(error, expected):
+    assert is_throttling(error) is expected
 
 
 class TestFollowUpSafety:
