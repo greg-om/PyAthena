@@ -49,11 +49,6 @@ if TYPE_CHECKING:
 _logger = logging.getLogger(__name__)
 
 
-def _identity(x: Any) -> Any:
-    """Identity function for use as default converter."""
-    return x
-
-
 class PolarsDataFrameIterator(abc.Iterator):  # type: ignore[type-arg]
     """Iterator for chunked DataFrame results from Athena queries.
 
@@ -183,10 +178,10 @@ class PolarsDataFrameIterator(abc.Iterator):  # type: ignore[type-arg]
         # converter, or None for the identity.
         columns: list[tuple[pl.Series | None, Callable[[Any], Any] | None]] = []
         for name in self._column_names:
-            converter: Callable[[Any], Any] | None = self._converters.get(name, _identity)
-            if converter is _identity or converter is _to_default:
-                converter = None
-            columns.append((df.get_column(name, default=None), converter))
+            converter = self._converters.get(name)
+            columns.append(
+                (df.get_column(name, default=None), None if converter is _to_default else converter)
+            )
         size = self._ROW_BLOCK_SIZE
         for start in range(0, df.height, size):
             length = min(size, df.height - start)
