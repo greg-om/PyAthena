@@ -782,27 +782,33 @@ class TestQuiesce:
         assert athena.stopped == ["first", "second", "unreported"]
         assert athena.states["second"] == athena.states["unreported"] == "CANCELLED"
 
-    def test_throttling_does_not_hide_a_query_that_did_not_stop(self, tmp_path, use_athena):
+    @pytest.mark.parametrize("operation", ["StopQueryExecution", "GetQueryExecution"])
+    def test_throttling_does_not_hide_a_query_that_did_not_stop(
+        self, tmp_path, use_athena, operation
+    ):
         write_events(
             tmp_path,
-            *({"event": "query", "trial": "t1", "query_id": q} for q in ("first", "second")),
+            *({"event": "query", "trial": "t1", "query_id": q} for q in ("running", "throttled")),
         )
         athena = FakeAthena(
-            {"first": "RUNNING", "second": "RUNNING"},
-            stop_errors={"first": "InvalidRequestException"},
+            {"running": "RUNNING", "throttled": "RUNNING"},
+            stop_errors={"running": "InvalidRequestException"},
         )
         status = athena.get_query_execution
 
-        def throttled_second(**kwargs):
-            if kwargs["QueryExecutionId"] == "second":
-                raise throttling("GetQueryExecution")
+        def throttled_status(**kwargs):
+            if kwargs["QueryExecutionId"] == "throttled":
+                raise throttling(operation)
             return status(**kwargs)
 
-        athena.get_query_execution = throttled_second
+        if operation == "StopQueryExecution":
+            athena.stop_errors["throttled"] = "ThrottlingException"
+        else:
+            athena.get_query_execution = throttled_status
         use_athena(athena)
-        first, second = quiesce(Settings(poll_interval=0.01, timeout_seconds=0.05), tmp_path)
-        assert first.startswith("first: still RUNNING")
-        assert second.startswith("second: An error occurred (ThrottlingException)")
+        running, throttled = quiesce(Settings(poll_interval=0.01, timeout_seconds=0.05), tmp_path)
+        assert running.startswith("running: still RUNNING")
+        assert throttled.startswith("throttled: An error occurred (ThrottlingException)")
 
     def test_a_throttled_status_check_raises(self, tmp_path, use_athena):
         write_events(tmp_path, {"event": "query", "trial": "t1", "query_id": "reported"})

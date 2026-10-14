@@ -777,7 +777,8 @@ def quiesce(settings: Settings, output: Path) -> list[str]:
     reported, prefixes = trial_evidence(output)
     athena = client(session(settings), "athena", max_retries=QUIESCE_RETRIES)
     stop_errors: dict[str, str] = {}
-    throttled: list[ClientError] = []
+    # Queries left unconfirmed by throttled requests; they are not polled.
+    throttled: dict[str, ClientError] = {}
 
     def stop(ids: Iterable[str]) -> None:
         for query_id in sorted(ids):
@@ -785,18 +786,16 @@ def quiesce(settings: Settings, output: Path) -> list[str]:
                 athena.stop_query_execution(QueryExecutionId=query_id)
             except ClientError as exc:
                 if is_throttling(exc):
-                    throttled.append(exc)
-                stop_errors[query_id] = str(exc)
+                    throttled[query_id] = exc
+                else:
+                    stop_errors[query_id] = str(exc)
 
     stop(reported)
     found = active_queries(athena, settings.workgroup, prefixes) if prefixes else set()
     stop(found - reported)
-    if throttled:
-        # Raised only after every known query was asked to stop.
-        raise throttled[0]
     errors = []
     deadline = time.monotonic() + settings.timeout_seconds
-    for query_id in sorted(reported | found):
+    for query_id in sorted((reported | found) - throttled.keys()):
         while True:
             try:
                 state = athena.get_query_execution(QueryExecutionId=query_id)["QueryExecution"][
@@ -804,8 +803,9 @@ def quiesce(settings: Settings, output: Path) -> list[str]:
                 ]["State"]
             except ClientError as exc:
                 if is_throttling(exc):
-                    throttled.append(exc)
-                errors.append(f"{query_id}: {stop_errors.get(query_id, exc)}")
+                    throttled[query_id] = exc
+                else:
+                    errors.append(f"{query_id}: {stop_errors.get(query_id, exc)}")
                 break
             if state not in {"QUEUED", "RUNNING"}:
                 break
@@ -813,10 +813,10 @@ def quiesce(settings: Settings, output: Path) -> list[str]:
                 errors.append(f"{query_id}: still {state}; {stop_errors.get(query_id, '')}")
                 break
             time.sleep(settings.poll_interval)
-    if errors and len(throttled) == len(errors):
+    if throttled and not errors:
         # Only throttling kept the queries from being confirmed as stopped.
-        raise throttled[0]
-    return errors
+        raise next(iter(throttled.values()))
+    return errors + [f"{query_id}: {exc}" for query_id, exc in sorted(throttled.items())]
 
 
 class SpotInterruptionError(Exception):
