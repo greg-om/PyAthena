@@ -2426,6 +2426,47 @@ class TestAioS3File:
         sync_fs.core.complete_multipart_upload.assert_called_once()
         assert in_flight == [1, 2, 2, 2]
 
+    @pytest.mark.parametrize("asynchronous", [False, True])
+    @pytest.mark.asyncio
+    async def test_open_failed_part_while_waiting(self, asynchronous):
+        # GH-1173: a part found failed when a write waits for a part stops the
+        # write with its error with the executor of either kind. The write
+        # used to upload the rest of the data.
+        fs = AioS3FileSystem(
+            connection=mock.MagicMock(), asynchronous=asynchronous, skip_instance_cache=True
+        )
+        block_size = S3Core.MULTIPART_UPLOAD_MIN_PART_SIZE
+        sync_fs = fs._sync_fs
+        sync_fs.core.create_multipart_upload = mock.MagicMock(
+            return_value=S3MultipartUpload(
+                {"Bucket": "bucket", "Key": "key", "UploadId": "uploadid"}
+            )
+        )
+        sync_fs.core.upload_part = mock.MagicMock(side_effect=PermissionError("Access Denied"))
+        sync_fs.core.abort_multipart_upload = mock.MagicMock()
+        sync_fs.core.complete_multipart_upload = mock.MagicMock()
+        submit_to = S3Executor.submit_to
+        submitted = []
+
+        def record_upload(executor, future, fn, *args, **kwargs):
+            if "body" in kwargs:
+                submitted.append(kwargs["part_number"])
+            submit_to(executor, future, fn, *args, **kwargs)
+
+        def write():
+            with fs.open("s3://bucket/key", "wb", block_size=block_size, max_workers=2) as f:
+                f.write(b"a" * block_size * 3)
+
+        with (
+            mock.patch.object(S3Executor, "submit_to", autospec=True, side_effect=record_upload),
+            pytest.raises(PermissionError, match="Access Denied"),
+        ):
+            await asyncio.to_thread(write)
+
+        assert submitted == [1, 2]
+        sync_fs.core.abort_multipart_upload.assert_called_once()
+        sync_fs.core.complete_multipart_upload.assert_not_called()
+
     def test_open_invalid_max_workers(self):
         fs = AioS3FileSystem(connection=mock.MagicMock(), skip_instance_cache=True)
         with pytest.raises(ValueError, match="max_workers must be greater than 0"):
