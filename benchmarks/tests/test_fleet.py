@@ -822,9 +822,7 @@ class TestQuiesce:
         assert running.startswith("running: still RUNNING")
         assert throttled.startswith("throttled: An error occurred (ThrottlingException)")
 
-    def test_a_throttled_scan_does_not_hide_a_query_that_did_not_stop(
-        self, tmp_path, monkeypatch, use_athena
-    ):
+    def test_a_throttled_scan_does_not_hide_a_query_that_did_not_stop(self, tmp_path, use_athena):
         write_events(
             tmp_path,
             {"event": "trial_start", "trial": "t1", "output": "s3://b/trials/t1/"},
@@ -832,14 +830,16 @@ class TestQuiesce:
         )
         athena = FakeAthena({"q": "RUNNING"}, stop_errors={"q": "AccessDeniedException"})
 
-        def active(client_, workgroup, prefixes, ids):
+        def active(client_, workgroup, prefixes):
             raise throttling("ListQueryExecutions")
 
-        use_athena(athena)
-        monkeypatch.setattr("pyathena_bench.fleet.active_queries", active)
+        use_athena(athena, active)
         running, scan = quiesce(Settings(poll_interval=0.01, timeout_seconds=0.05), tmp_path)
         assert running.startswith("q: still RUNNING; An error occurred (AccessDeniedException)")
-        assert scan.startswith("query history scan: An error occurred (ThrottlingException)")
+        assert scan.startswith(
+            f"query history scan of {tmp_path.name}: ClientError: An error occurred "
+            "(ThrottlingException)"
+        )
 
     def test_a_failed_scan_is_reported_after_the_known_queries_stop(
         self, tmp_path, monkeypatch, use_athena
@@ -858,7 +858,8 @@ class TestQuiesce:
         use_athena(athena)
         monkeypatch.setattr("pyathena_bench.fleet.active_queries", active)
         assert quiesce(Settings(poll_interval=0.01), tmp_path) == [
-            "query history scan: RuntimeError: Could not inspect query history: [x]"
+            f"query history scan of {tmp_path.name}: RuntimeError: "
+            "Could not inspect query history: [x]"
         ]
         assert athena.states == {"reported": "CANCELLED", "found": "CANCELLED"}
 
@@ -1528,7 +1529,8 @@ class TestWork:
             raise throttling("ListQueryExecutions")
 
         # The job ran, so it is recorded as failed instead of being released.
-        ran = work(queue, tmp_path / "w", api_slots=1, runner=lambda *a: 1, settle=settle)
+        ran = work(queue, tmp_path / "w", api_slots=1, runner=lambda *a: 1, settle=settle,
+                   lease_seconds=0.5)  # fmt: skip
         assert ran == ["first"]
         assert settled == ["attempt-1"] * QUIESCE_ROUNDS
         [error] = status(queue)["failed"]["first"]["quiesce_errors"]
@@ -1547,7 +1549,8 @@ class TestWork:
         def runner(item, *args):
             return 1 if item["id"] == "first" else 0
 
-        ran = work(queue, tmp_path / "w", api_slots=1, runner=runner, settle=settle)
+        ran = work(queue, tmp_path / "w", api_slots=1, runner=runner, settle=settle,
+                   lease_seconds=0.5)  # fmt: skip
         assert ran == ["first", "second"]
         assert settled == ["attempt-1", "attempt-1"]
         done = json.loads(queue.read("done", "first"))

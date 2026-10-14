@@ -484,7 +484,7 @@ Then it stops every queued or running query in the workgroup that writes under t
 It waits until they stop before claiming another job.
 Each of these Athena requests is retried up to 10 times, compared with 5 elsewhere, and each retry waits with jittered exponential backoff of up to 20 seconds.
 A history scan that fails does not skip the status checks of the queries already found.
-If only throttling kept the queries from being confirmed as stopped, the worker quiesces them again, up to three times in total, while it holds the claim.
+If only throttling kept the queries from being confirmed as stopped, the worker quiesces them again, up to three times in total and a tenth of `--lease-seconds` apart, while it holds the claim.
 If it cannot confirm that the queries stopped, it records the errors in the `done` marker and exits.
 
 Each worker checks instance metadata for a Spot interruption notice (`spot/instance-action`), which EC2 publishes about two minutes before it reclaims an instance.

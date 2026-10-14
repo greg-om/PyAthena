@@ -772,7 +772,7 @@ def quiesce(settings: Settings, output: Path) -> list[str]:
 
     Returns:
         Queries that could not be confirmed as stopped, with the reason, and
-        a failed history scan as ``query history scan: <error>``.
+        a failed history scan as ``query history scan of <output>: <error>``.
 
     Raises:
         ClientError: If Athena still throttled a request after its retries
@@ -782,9 +782,8 @@ def quiesce(settings: Settings, output: Path) -> list[str]:
     reported, prefixes = trial_evidence(output)
     athena = client(session(settings), "athena", max_retries=QUIESCE_RETRIES)
     stop_errors: dict[str, str] = {}
-    # Throttled requests by query ID, or of the history scan; those queries
-    # are not polled.
-    throttled: dict[str, Exception] = {}
+    # Queries left unconfirmed by throttled requests; they are not polled.
+    throttled: dict[str, ClientError] = {}
 
     def stop(ids: Iterable[str]) -> None:
         for query_id in sorted(ids):
@@ -798,17 +797,15 @@ def quiesce(settings: Settings, output: Path) -> list[str]:
 
     stop(reported)
     found: set[str] = set()
-    errors = []
+    scan_error: Exception | None = None
     if prefixes:
         try:
             active_queries(athena, settings.workgroup, prefixes, found)
         except Exception as exc:
             # Queries found before a failed scan are still stopped and checked.
-            if is_throttling(exc):
-                throttled["query history scan"] = exc
-            else:
-                errors.append(f"query history scan: {type(exc).__name__}: {exc}")
+            scan_error = exc
     stop(found - reported)
+    errors = []
     deadline = time.monotonic() + settings.timeout_seconds
     for query_id in sorted((reported | found) - throttled.keys()):
         while True:
@@ -828,10 +825,14 @@ def quiesce(settings: Settings, output: Path) -> list[str]:
                 errors.append(f"{query_id}: still {state}; {stop_errors.get(query_id, '')}")
                 break
             time.sleep(settings.poll_interval)
-    if throttled and not errors:
+    throttling = [f"{query_id}: {exc}" for query_id, exc in sorted(throttled.items())]
+    if scan_error is not None:
+        failure = f"query history scan of {output.name}: {type(scan_error).__name__}: {scan_error}"
+        (throttling if is_throttling(scan_error) else errors).append(failure)
+    if throttling and not errors:
         # Only throttling kept the queries from being confirmed as stopped.
-        raise next(iter(throttled.values()))
-    return errors + [f"{query_id}: {exc}" for query_id, exc in sorted(throttled.items())]
+        raise scan_error or next(iter(throttled.values()))
+    return errors + throttling
 
 
 class SpotInterruptionError(Exception):
@@ -934,7 +935,8 @@ class JobWatch:
         try:
             return self.queue.renew(lease, self.lease_seconds)
         except Exception:
-            # The lease has time left for a retry until it expires.
+            # The lease has time left for a retry until it expires; _watch gives
+            # the claim up earlier.
             return time.time() < lease.body["expires"]
 
     def _lose_claim(self) -> None:
@@ -1007,7 +1009,8 @@ def run_attempt(
     the attempt is uploaded and the claim released as interrupted; after a
     lost claim, the attempt's queries are quiesced and nothing is recorded.
     A failed run's queries are also quiesced; while the claim is held, this
-    is repeated up to ``QUIESCE_ROUNDS`` times if Athena only throttled it.
+    is repeated up to ``QUIESCE_ROUNDS`` times, a renewal interval apart, if
+    Athena only throttled it.
     Otherwise, after a conditional renewal confirms that the claim is still
     held, the job's report merges every attempt into ``job-summary.csv`` and
     ``job-summary.md`` of this attempt, and the first ``done`` marker of the
@@ -1085,16 +1088,16 @@ def run_attempt(
             for round_ in range(1, QUIESCE_ROUNDS + 1):
                 try:
                     errors = settle(output)
+                    break
                 except Exception as exc:
-                    if (
-                        is_throttling(exc)
-                        and round_ < QUIESCE_ROUNDS
-                        and not watch.stop_event.is_set()
-                    ):
-                        _logger.warning(f"Athena throttled quiescing {job['id']}; retrying")
-                        continue
                     errors = [settle_error(output, exc)]
-                break
+                    if not is_throttling(exc) or round_ == QUIESCE_ROUNDS:
+                        break
+                _logger.warning(f"Athena throttled quiescing {job['id']}; retrying")
+                # The pause lets concurrent history scans thin out; a notice or
+                # a lost claim ends it and the rounds.
+                if watch.stop_event.wait(lease_seconds / 10):
+                    break
         upload_attempt()
 
     if deferred:
