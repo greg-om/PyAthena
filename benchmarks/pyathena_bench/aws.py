@@ -453,27 +453,36 @@ def active_queries(
 
     Raises:
         RuntimeError: If part of the history cannot be inspected; this is
-            raised after the rest of the history was scanned.
+            raised after the rest of the history was scanned, or instead of
+            the error of a later request.
     """
     if ids is None:
         ids = set()
     unprocessed: list[dict[str, Any]] = []
-    for page in athena.get_paginator("list_query_executions").paginate(WorkGroup=workgroup):
-        query_ids = page["QueryExecutionIds"]
-        for offset in range(0, len(query_ids), 50):
-            batch = athena.batch_get_query_execution(
-                QueryExecutionIds=query_ids[offset : offset + 50]
-            )
-            unprocessed += batch.get("UnprocessedQueryExecutionIds", [])
-            for query in batch.get("QueryExecutions", []):
-                if (
-                    query.get("WorkGroup") == workgroup
-                    and query.get("ResultConfiguration", {})
-                    .get("OutputLocation", "")
-                    .startswith(prefixes)
-                    and query["Status"]["State"] in {"RUNNING", "QUEUED"}
-                ):
-                    ids.add(query["QueryExecutionId"])
+    try:
+        for page in athena.get_paginator("list_query_executions").paginate(WorkGroup=workgroup):
+            query_ids = page["QueryExecutionIds"]
+            for offset in range(0, len(query_ids), 50):
+                batch = athena.batch_get_query_execution(
+                    QueryExecutionIds=query_ids[offset : offset + 50]
+                )
+                unprocessed += batch.get("UnprocessedQueryExecutionIds", [])
+                for query in batch.get("QueryExecutions", []):
+                    if (
+                        query.get("WorkGroup") == workgroup
+                        and query.get("ResultConfiguration", {})
+                        .get("OutputLocation", "")
+                        .startswith(prefixes)
+                        and query["Status"]["State"] in {"RUNNING", "QUEUED"}
+                    ):
+                        ids.add(query["QueryExecutionId"])
+    except Exception as exc:
+        if not unprocessed:
+            raise
+        # A later error, such as throttling, must not hide the uninspected IDs.
+        raise RuntimeError(
+            f"Could not inspect query history: {unprocessed}; then {type(exc).__name__}: {exc}"
+        ) from exc
     if unprocessed:
         raise RuntimeError(f"Could not inspect query history: {unprocessed}")
     return ids

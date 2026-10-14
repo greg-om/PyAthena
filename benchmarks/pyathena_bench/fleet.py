@@ -1206,7 +1206,9 @@ def work(
         ValueError: If the queue has not been completely published and
             ``wait`` is false, or a job needs more API slots than ``api_slots``.
         SpotInterruptionError: After an interruption notice, once the running attempt's
-            records are uploaded and its claim is released as interrupted.
+            records are uploaded and its claim is released as interrupted, or
+            once a failed job is recorded with queries that could not be
+            confirmed as stopped.
         RuntimeError: If an attempt stopped by a lost claim could not be quiesced;
             the worker's host is then kept.
     """
@@ -1293,6 +1295,9 @@ def work(
                 if outcome.state == "done":
                     completed.append(job["id"])
                 if outcome.errors:
+                    if check_notice(notice):
+                        # The host is being reclaimed, so it must not be retired.
+                        raise SpotInterruptionError(completed)
                     # Unconfirmed queries could overlap later trials on this host.
                     return completed
                 started = True

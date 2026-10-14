@@ -1556,6 +1556,23 @@ class TestWork:
         done = json.loads(queue.read("done", "first"))
         assert (done["exit_code"], done["quiesce_errors"]) == (1, [])
 
+    def test_a_notice_while_quiescing_a_failed_job_keeps_the_host(self, tmp_path):
+        _, queue = queue_with([job("first"), job("second")], tmp_path)
+        notice = threading.Event()
+
+        def settle(output):
+            notice.set()
+            raise throttling("ListQueryExecutions")
+
+        # A normal return would retire the host, which is being reclaimed anyway.
+        with pytest.raises(SpotInterruptionError) as raised:
+            work(queue, tmp_path / "w", api_slots=1, runner=lambda *a: 1, settle=settle,
+                 lease_seconds=0.5, notice=notice.is_set)  # fmt: skip
+        assert raised.value.ran == ["first"]
+        [error] = status(queue)["failed"]["first"]["quiesce_errors"]
+        assert error.startswith("Could not quiesce attempt-1: ClientError: ")
+        assert "second" not in queue.names("claims")
+
     def test_a_lost_claim_does_not_repeat_throttled_quiescing(self, tmp_path):
         _, queue = queue_with([job("a")], tmp_path)
         settled = []

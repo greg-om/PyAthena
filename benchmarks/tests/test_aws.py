@@ -437,6 +437,26 @@ def test_active_queries_scans_past_unprocessed_ids_before_raising():
     assert found == {"match", "later"}
 
 
+def test_active_queries_keeps_unprocessed_ids_when_a_later_request_fails():
+    pages = [{"QueryExecutionIds": ["x"]}, {"QueryExecutionIds": ["later"]}]
+
+    def batch_get_query_execution(**kwargs):
+        if kwargs["QueryExecutionIds"] == ["x"]:
+            return {
+                "QueryExecutions": [],
+                "UnprocessedQueryExecutionIds": [{"QueryExecutionId": "x"}],
+            }
+        raise ClientError({"Error": {"Code": "ThrottlingException"}}, "BatchGetQueryExecution")
+
+    athena = SimpleNamespace(
+        get_paginator=lambda name: SimpleNamespace(paginate=lambda **kwargs: pages),
+        batch_get_query_execution=batch_get_query_execution,
+    )
+    # A throttling error must not hide the IDs that could not be inspected.
+    with pytest.raises(RuntimeError, match=r"'x'.*; then ClientError: .*ThrottlingException"):
+        active_queries(athena, "pyathena", ("s3://b/trials/t1/",))
+
+
 @pytest.mark.parametrize(("kwargs", "retries"), [({}, 5), ({"max_retries": 10}, 10)])
 def test_client_retries_in_standard_mode(kwargs, retries):
     created = []
