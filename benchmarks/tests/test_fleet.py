@@ -1573,6 +1573,26 @@ class TestWork:
         assert error.startswith("Could not quiesce attempt-1: ClientError: ")
         assert "second" not in queue.names("claims")
 
+    def test_a_notice_observed_while_quiescing_outlasts_a_failed_check(self, tmp_path):
+        _, queue = queue_with([job("first"), job("second")], tmp_path)
+        armed = threading.Event()
+
+        def notice():
+            # Only the watch thread sees the notice; the worker's own check fails.
+            return armed.is_set() and threading.current_thread() is not threading.main_thread()
+
+        def settle(output):
+            armed.set()
+            # Leave time for the watch, which polls every 0.2 seconds, to see it.
+            time.sleep(0.5)
+            raise throttling("ListQueryExecutions")
+
+        with pytest.raises(SpotInterruptionError) as raised:
+            work(queue, tmp_path / "w", api_slots=1, runner=lambda *a: 1, settle=settle,
+                 lease_seconds=2, notice=notice)  # fmt: skip
+        assert raised.value.ran == ["first"]
+        assert "second" not in queue.names("claims")
+
     def test_a_lost_claim_does_not_repeat_throttled_quiescing(self, tmp_path):
         _, queue = queue_with([job("a")], tmp_path)
         settled = []

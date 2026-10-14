@@ -980,11 +980,13 @@ class Outcome:
     worker took over the job's claim or a slot, and ``deferred`` when Athena
     throttled the quiescing of an earlier attempt, so the job was released
     without running. ``errors`` lists queries that could not be confirmed as
-    stopped.
+    stopped. ``noticed`` tells whether an interruption notice was observed
+    after the run, while its queries were quiesced.
     """
 
     state: str
     errors: tuple[str, ...] = ()
+    noticed: bool = False
 
 
 def run_attempt(
@@ -1154,7 +1156,9 @@ def run_attempt(
         },
         IfNoneMatch="*",
     )
-    return abandon() if recorded is None else Outcome("done", tuple(errors))
+    if recorded is None:
+        return abandon()
+    return Outcome("done", tuple(errors), noticed=watch.interrupted.is_set())
 
 
 def work(
@@ -1295,7 +1299,7 @@ def work(
                 if outcome.state == "done":
                     completed.append(job["id"])
                 if outcome.errors:
-                    if check_notice(notice):
+                    if outcome.noticed or check_notice(notice):
                         # The host is being reclaimed, so it must not be retired.
                         raise SpotInterruptionError(completed)
                     # Unconfirmed queries could overlap later trials on this host.
