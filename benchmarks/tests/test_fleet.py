@@ -1573,8 +1573,12 @@ class TestWork:
         assert error.startswith("Could not quiesce attempt-1: ClientError: ")
         assert "second" not in queue.names("claims")
 
-    @pytest.mark.parametrize("throttled", [True, False])
-    def test_a_notice_observed_while_quiescing_outlasts_a_failed_check(self, tmp_path, throttled):
+    @pytest.mark.parametrize(
+        ("quiescing", "ran"), [("throttled", ["first"]), ("ok", ["first"]), ("lost", [])]
+    )
+    def test_a_notice_observed_while_quiescing_outlasts_a_failed_check(
+        self, tmp_path, quiescing, ran
+    ):
         _, queue = queue_with([job("first"), job("second")], tmp_path)
         armed = threading.Event()
         seen = threading.Event()
@@ -1589,14 +1593,17 @@ class TestWork:
         def settle(output):
             armed.set()
             assert seen.wait(5)
-            if throttled:
+            if quiescing == "throttled":
                 raise throttling("ListQueryExecutions")
+            if quiescing == "lost":
+                # Another worker took the claim over before it was renewed.
+                take_over(queue, "first")
             return []
 
         with pytest.raises(SpotInterruptionError) as raised:
             work(queue, tmp_path / "w", api_slots=1, runner=lambda *a: 1, settle=settle,
-                 lease_seconds=2, notice=notice)  # fmt: skip
-        assert raised.value.ran == ["first"]
+                 lease_seconds=0.5, notice=notice)  # fmt: skip
+        assert raised.value.ran == ran
         assert "second" not in queue.names("claims")
 
     def test_a_lost_claim_does_not_repeat_throttled_quiescing(self, tmp_path):

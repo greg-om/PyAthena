@@ -1113,7 +1113,7 @@ def run_attempt(
         # S3 accepted stalled, may still be this worker's; releasing it, which
         # works only then, returns the job to the fleet.
         queue.end_lease(claim, "released")
-        return Outcome("lost", tuple(errors))
+        return Outcome("lost", tuple(errors), noticed=watch.interrupted.is_set())
 
     # The conditional renewal proves that this worker still owns the job, so a
     # former owner never records it, and leaves at least --lease-seconds for
@@ -1211,8 +1211,9 @@ def work(
             ``wait`` is false, or a job needs more API slots than ``api_slots``.
         SpotInterruptionError: After an interruption notice, once the running attempt's
             records are uploaded and its claim is released as interrupted, or
-            once a failed job whose queries were quiesced meanwhile, or could
-            not be confirmed as stopped, is recorded.
+            once the attempt of a failed job ends, if the notice arrived while
+            its queries were quiesced or is found after they could not be
+            confirmed as stopped.
         RuntimeError: If an attempt stopped by a lost claim could not be quiesced;
             the worker's host is then kept.
     """
