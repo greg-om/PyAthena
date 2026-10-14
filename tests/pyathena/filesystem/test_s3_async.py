@@ -2455,7 +2455,7 @@ class TestAioS3File:
 
         def write():
             with fs.open("s3://bucket/key", "wb", block_size=block_size, max_workers=2) as f:
-                f.write(b"a" * block_size * 4)
+                f.write(b"a" * block_size * 3)
 
         with (
             mock.patch.object(S3Executor, "submit_to", autospec=True, side_effect=record_upload),

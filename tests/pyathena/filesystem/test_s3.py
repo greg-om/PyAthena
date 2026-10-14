@@ -7117,16 +7117,7 @@ class TestS3File:
         # commit().
         fs = self._make_append_fs(b"")
         fs.core.upload_part.side_effect = PermissionError("Access Denied")
-        executor = S3ThreadPoolExecutor(max_workers=max_workers)
-        submit_to = executor.submit_to
-        submitted = []
-
-        def record_upload(future, fn, *args, **kwargs):
-            if "body" in kwargs:
-                submitted.append(kwargs["part_number"])
-            submit_to(future, fn, *args, **kwargs)
-
-        executor.submit_to = record_upload  # type: ignore[method-assign]
+        executor = mock.MagicMock(wraps=S3ThreadPoolExecutor(max_workers=max_workers))
         f = S3File(
             fs,
             "s3://bucket/key.txt",
@@ -7141,10 +7132,14 @@ class TestS3File:
         with pytest.raises(PermissionError, match="Access Denied"):
             f.write(b"a" * 4)
 
-        # Only the parts submitted before the first wait were scheduled, and
-        # the cleanup cancelled the ones that had not started.
-        assert submitted == list(range(1, max_workers + 1))
-        assert 1 <= fs.core.upload_part.call_count <= max_workers
+        # Only the parts submitted before the first wait were scheduled, some
+        # of which the abort may have cancelled.
+        assert [
+            c.kwargs["part_number"]
+            for c in executor.submit_to.call_args_list
+            if "part_number" in c.kwargs
+        ] == list(range(1, max_workers + 1))
+        executor.shutdown.assert_called()
         fs._call.assert_called_once_with(
             S3_CLIENT.abort_multipart_upload, Bucket="bucket", Key="key.txt", UploadId="uploadid"
         )

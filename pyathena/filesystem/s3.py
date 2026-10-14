@@ -3090,6 +3090,13 @@ class S3File(AbstractBufferedFile):
         Returns:
             Whether fsspec's ``flush()`` resets the buffer afterwards, which
             it does for any value other than False.
+
+        Raises:
+            BaseException: The error of an uploaded part that the write found
+                failed while it waited for a part in flight.
+            RuntimeError: If no multipart upload is initialized.
+            ValueError: If the data needs more parts than a multipart upload
+                allows.
         """
         # Returning ``not final`` keeps the buffer intact on the final flush so a
         # deferred commit() (autocommit=False, i.e. inside an fsspec transaction)
