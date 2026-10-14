@@ -48,6 +48,7 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
 ]
 dynamic = ["version"]
 
@@ -91,9 +92,13 @@ dev = [
     "sqlalchemy[asyncio]>=2.0.0",
     "pandas>=3.0.0",
     "pyarrow>=22.0.0",
+    # pyarrow 26.0.0 is the first release with Python 3.15 wheels; without this,
+    # the lock keeps the version that the benchmarks' awswrangler allows.
+    "pyarrow>=26.0.0; python_version >= '3.15'",
     "polars>=1.39.0",
-    # Pull requests test the newest Python with Polars 2, and the older Pythons keep
-    # the newest Polars 1.x release.
+    # Python 3.14 and later, including the newest version that pull requests test,
+    # use Polars 2; Polars 1.x Series methods return None on Python 3.15
+    # (pola-rs/polars#29419). The older versions keep the newest Polars 1.x release.
     "polars>=2.0.0; python_version >= '3.14'",
     "polars<2.0.0; python_version < '3.14'",
     "Jinja2>=3.1.0",
@@ -230,7 +235,7 @@ exclude = [
 legacy_tox_ini = """
 [tox]
 isolated_build = true
-envlist = py{311,312,313,314}-{pyathena,sqla,sqla_async}
+envlist = py{311,312,313,314,315}-{pyathena,sqla,sqla_async}
 
 [gh-actions]
 python =
@@ -238,6 +243,7 @@ python =
     3.12: py312
     3.13: py313
     3.14: py314
+    3.15: py315
 
 [gh-actions:env]
 TEST_TYPE =
