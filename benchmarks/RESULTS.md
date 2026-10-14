@@ -16,3 +16,5 @@ Compare entries only when they used the same instance type, architecture, and sc
 | Date | Commit | PyAthena | Hosts | Purchase | Scales | Entry |
 | --- | --- | --- | --- | --- | --- | --- |
 | 2026-10-11 | `8a69ce03` | 4.0.0 | `r7g.2xlarge` (arm64), fleet of 12 | Spot | medium, large, xlarge | [2026-10-11-8a69ce03](history/2026-10-11-8a69ce03.md) |
+| 2026-10-13 | `437276e1` | 4.1.0 release commit | `r7g.2xlarge` (arm64), fleet of 8 | Spot | medium, large, xlarge | [2026-10-13-437276e1](history/2026-10-13-437276e1.md) |
+| 2026-10-13 | `437276e1` | 4.1.0 release commit, filesystem suite | `c8gn.2xlarge` (arm64), one host | Spot | small, medium, large, xlarge (objects) | [2026-10-13-437276e1-filesystem](history/2026-10-13-437276e1-filesystem.md) |
