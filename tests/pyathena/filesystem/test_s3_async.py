@@ -2368,18 +2368,18 @@ class TestAioS3File:
     @pytest.mark.parametrize("asynchronous", [False, True])
     @pytest.mark.asyncio
     async def test_open_parts_in_flight(self, asynchronous):
-        # GH-1158: a write keeps at most max_workers parts in flight with the
-        # executor of either kind. The parts waiting for a worker used to be
-        # queued with their data.
+        # GH-1158: a write keeps at most max_workers uploaded parts in flight
+        # with the executor of either kind. The parts waiting for a worker
+        # used to be queued with their data.
         fs = AioS3FileSystem(
             connection=mock.MagicMock(), asynchronous=asynchronous, skip_instance_cache=True
         )
         block_size = S3Core.MULTIPART_UPLOAD_MIN_PART_SIZE
-        release = threading.Event()
+        gates: dict[int, threading.Event] = {}
 
         def upload_part(**kwargs):
-            # Uploading until the write waits for a part, or exceeds the limit.
-            assert release.wait(5)
+            # Uploading until the test releases the part.
+            assert gates[kwargs["part_number"]].wait(5)
             return S3MultipartUploadPart(kwargs["part_number"], {"ETag": '"e"'})
 
         sync_fs = fs._sync_fs
@@ -2391,35 +2391,37 @@ class TestAioS3File:
         sync_fs.core.upload_part = mock.MagicMock(side_effect=upload_part)
         sync_fs.core.complete_multipart_upload = mock.MagicMock()
         submit_to = S3Executor.submit_to
-        parts = []
+        uploads = {}
         in_flight = []
 
-        def record_part(executor, future, fn, *args, **kwargs):
-            if "part_number" in kwargs:
-                parts.append(future)
-                in_flight.append(sum(not part.done() for part in parts))
-                if in_flight[-1] > 2:
-                    release.set()
+        def record_upload(executor, future, fn, *args, **kwargs):
+            if "body" in kwargs:
+                gates[kwargs["part_number"]] = threading.Event()
+                uploads[kwargs["part_number"]] = future
+                in_flight.append(sum(not upload.done() for upload in uploads.values()))
             submit_to(executor, future, fn, *args, **kwargs)
 
-        def wait_for_part(futures):
-            release.set()
-            return wait(futures)
+        def release_newest(futures, **kwargs):
+            # Only the newest part in flight finishes, so a write that waits
+            # for the oldest one would time out.
+            gates[max(n for n, upload in uploads.items() if not upload.done())].set()
+            return wait(futures, timeout=5, **kwargs)
 
         def write():
             with fs.open("s3://bucket/key", "wb", block_size=block_size, max_workers=2) as f:
                 f.write(b"a" * block_size * 4)
+                for gate in gates.values():
+                    gate.set()
 
         with (
-            mock.patch.object(S3Executor, "submit_to", autospec=True, side_effect=record_part),
-            mock.patch("pyathena.filesystem.s3.wait", side_effect=wait_for_part) as waited,
+            mock.patch.object(S3Executor, "submit_to", autospec=True, side_effect=record_upload),
+            mock.patch("pyathena.filesystem.s3.wait", side_effect=release_newest),
         ):
             await asyncio.to_thread(write)
 
         assert sync_fs.core.upload_part.call_count == 4
         sync_fs.core.complete_multipart_upload.assert_called_once()
-        assert max(in_flight) <= 2
-        assert waited.call_args_list == [mock.call([parts[0]]), mock.call([parts[1]])]
+        assert in_flight == [1, 2, 2, 2]
 
     def test_open_invalid_max_workers(self):
         fs = AioS3FileSystem(connection=mock.MagicMock(), skip_instance_cache=True)

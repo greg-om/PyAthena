@@ -9,7 +9,7 @@ import mimetypes
 import os.path
 import time
 from collections.abc import Callable, Mapping
-from concurrent.futures import Future, as_completed, wait
+from concurrent.futures import FIRST_COMPLETED, Future, as_completed, wait
 from copy import deepcopy
 from datetime import datetime
 from io import BytesIO
@@ -2676,7 +2676,10 @@ class S3FileSystem(AbstractFileSystem):
             block_size = self.default_block_size
         if cache_type is None:
             cache_type = self.default_cache_type
-        max_workers = kwargs.pop("max_workers", self.max_workers)
+        max_workers = kwargs.pop("max_workers", None)
+        if max_workers is None:
+            # None takes the default of the filesystem.
+            max_workers = self.max_workers
         # The parameters of the call take precedence over those of the
         # filesystem; the caller's dictionary is not modified.
         s3_additional_kwargs = {
@@ -2757,9 +2760,8 @@ class S3File(AbstractBufferedFile):
                 either form, for writing or appending.
             max_workers: The number of parallel workers for range reads, part
                 copies, and part uploads. A write keeps at most
-                ``max_workers`` parts of the written data in flight: it
-                submits a part only after the part submitted ``max_workers``
-                parts before it has finished.
+                ``max_workers`` uploaded parts in flight, waiting for one of
+                them to finish before it submits another.
             executor: The executor for parallel operations. If None, a new
                 ``S3ThreadPoolExecutor`` is created.
             block_size: The block size for reads and writes. Must be between
@@ -2893,6 +2895,9 @@ class S3File(AbstractBufferedFile):
         self.append_block = False
         self._multipart_writer: S3MultipartWriter | None = None
         self.multipart_upload_parts: list[Future[S3MultipartUploadPart]] = []
+        # The parts uploaded from the buffer that may not have finished. The
+        # part copies of an append hold no data and are not counted.
+        self._uploads_in_flight: set[Future[S3MultipartUploadPart]] = set()
         if append_info is not None:
             if append_data is not None:
                 self.write(append_data)
@@ -3066,8 +3071,23 @@ class S3File(AbstractBufferedFile):
             raise
 
     def _upload_chunk(self, final: bool = False) -> bool:
-        # The return value controls whether fsspec's flush() resets self.buffer
-        # afterwards: it does so only when this returns a value other than False.
+        """Upload the buffered data as parts of the multipart upload.
+
+        Data smaller than the block size is left in the buffer for
+        :meth:`commit`, which uploads it with PutObject. Otherwise, a part is
+        submitted only while fewer than ``max_workers`` uploaded parts are in
+        flight; the write waits for one of them to finish first. A failed
+        part is reported by :meth:`commit`. If the upload of the chunk fails
+        or is interrupted, the file is closed without committing it.
+
+        Args:
+            final: Whether this is the last flush of the file, after which
+                the upload is committed if ``autocommit`` is set.
+
+        Returns:
+            Whether fsspec's ``flush()`` resets the buffer afterwards, which
+            it does for any value other than False.
+        """
         # Returning ``not final`` keeps the buffer intact on the final flush so a
         # deferred commit() (autocommit=False, i.e. inside an fsspec transaction)
         # can still read the bytes; resetting it there would upload an empty
@@ -3091,18 +3111,17 @@ class S3File(AbstractBufferedFile):
             for part_number, data in writer.iter_parts(
                 buffer, first_part_number=len(self.multipart_upload_parts) + 1
             ):
-                if len(self.multipart_upload_parts) >= self.max_workers:
-                    # At most max_workers parts of the written data are in
-                    # flight, so that the parts waiting for a worker do not
-                    # pile up in memory: each part waits for the one
-                    # submitted max_workers parts before it. A failed part is
-                    # reported by commit().
-                    wait([self.multipart_upload_parts[-self.max_workers]])
+                if len(self._uploads_in_flight) >= self.max_workers:
+                    # Otherwise the parts waiting for a worker pile up in memory.
+                    _, self._uploads_in_flight = wait(
+                        self._uploads_in_flight, return_when=FIRST_COMPLETED
+                    )
                 # Tracked before it is scheduled, so that an interrupt while
                 # it is being scheduled still lets discard() cancel it or wait
                 # for it before the abort.
                 part: Future[S3MultipartUploadPart] = Future()
                 self.multipart_upload_parts.append(part)
+                self._uploads_in_flight.add(part)
                 self._executor.submit_to(
                     part,
                     writer.upload_part,
@@ -3191,6 +3210,7 @@ class S3File(AbstractBufferedFile):
 
         self.multipart_upload = None
         self.multipart_upload_parts = []
+        self._uploads_in_flight = set()
 
     def url(self, expiration: int = 3600, **kwargs) -> str:
         """Generate a presigned HTTP URL to read this file (if it already exists).

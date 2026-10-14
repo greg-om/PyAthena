@@ -88,11 +88,11 @@ With the `compression` argument (a codec of fsspec, or `"infer"` from the extens
 the path), `pipe`/`pipe_file` compress the data before uploading it, and the sizes in
 this section apply to the compressed data.
 
-A multipart write keeps at most `max_workers` parts of the written data in flight: each
-part is submitted only after the part submitted `max_workers` parts before it has
-finished. The parts waiting to be uploaded therefore take about `max_workers` × the
-block size of memory, in addition to the buffered data of the file. `max_workers` is an
-argument of `S3FileSystem`, `AioS3FileSystem`, `open`, `put`, and `pipe`.
+A multipart write keeps at most `max_workers` parts of the written data in flight and
+waits for one of them to finish before it uploads another. The parts take about
+`max_workers` × the block size of memory, in addition to the buffered data of the file.
+`max_workers` is an argument of `S3FileSystem`, `AioS3FileSystem`, `open`, `put`, and
+`pipe`.
 
 The block size for writing, given by the `block_size` argument of `open` or by the
 filesystem's `default_block_size`, must be between 5 MiB and 5 GiB, inclusive, the part

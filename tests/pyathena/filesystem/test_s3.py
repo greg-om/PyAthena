@@ -2713,12 +2713,15 @@ class TestS3FileSystem:
         fs.core.put_object.assert_not_called()
         fs._call.assert_not_called()
 
-    def test_open_max_workers(self):
+    @pytest.mark.parametrize("max_workers", [2, None])
+    def test_open_max_workers(self, max_workers):
+        # GH-1158: None takes the default of the filesystem, which a write
+        # compares with its parts in flight.
         fs = self._make_fs()
         fs.default_cache_type = "bytes"
 
-        with fs.open("s3://bucket/key", "wb", max_workers=2) as f:
-            assert f.max_workers == 2
+        with fs.open("s3://bucket/key", "wb", max_workers=max_workers) as f:
+            assert f.max_workers == (max_workers or fs.max_workers)
 
     def test_open_version_id(self):
         fs = self._make_fs()
@@ -6661,7 +6664,10 @@ class TestS3File:
         file.multipart_upload_parts = []
         file.buffer = io.BytesIO(data)
         file.loc = len(data)  # tell() returns self.loc
-        file.max_workers = 1
+        # Not reached by these files, as the mocked executor never finishes
+        # a part.
+        file.max_workers = S3Core.MULTIPART_UPLOAD_MAX_PARTS
+        file._uploads_in_flight = set()
         file._executor = mock.MagicMock()
         return file
 
@@ -6985,46 +6991,46 @@ class TestS3File:
             (b"", "wb", [b"b" * 4] * 6),
             # several parts flushed by one write(),
             (b"", "wb", [b"b" * 24]),
-            # and after the part copied in an append, which counts too.
+            # and after the part copied in an append, which is not counted.
             (b"a" * 6, "ab", [b"b" * 4] * 6),
         ],
     )
     @pytest.mark.parametrize("max_workers", [1, 2, 3])
     def test_write_parts_in_flight(self, existing, mode, writes, max_workers):
-        # GH-1158: a write submits a part only after the part submitted
-        # max_workers parts before it has finished, so that the data of the
-        # parts waiting for a worker does not pile up in memory. Every part
-        # used to be submitted without waiting.
+        # GH-1158: a write keeps at most max_workers uploaded parts in flight,
+        # so that the data of the parts waiting for a worker does not pile up
+        # in memory. Every part used to be submitted without waiting.
         fs = self._make_append_fs(existing)
-        release = threading.Event()
+        gates: dict[int, threading.Event] = {}
         respond = fs.core.upload_part.side_effect
 
         def upload_part(**kwargs):
-            # Uploading until the write waits for a part, or exceeds the limit.
-            assert release.wait(5)
+            # Uploading until the test releases the part.
+            assert gates[kwargs["part_number"]].wait(5)
             return respond(**kwargs)
 
         fs.core.upload_part.side_effect = upload_part
-        # More threads than max_workers, so that only the write limits the
-        # parts in flight.
+        # More threads than parts, so that only the write limits the parts
+        # in flight.
         executor = S3ThreadPoolExecutor(max_workers=8)
         submit_to = executor.submit_to
-        parts = []
+        uploads: dict[int, Future] = {}
         in_flight = []
 
-        def record_part(future, fn, *args, **kwargs):
-            if "part_number" in kwargs:
-                parts.append(future)
-                in_flight.append(sum(not part.done() for part in parts))
-                if in_flight[-1] > max_workers:
-                    release.set()
+        def record_upload(future, fn, *args, **kwargs):
+            if "body" in kwargs:
+                gates[kwargs["part_number"]] = threading.Event()
+                uploads[kwargs["part_number"]] = future
+                in_flight.append(sum(not upload.done() for upload in uploads.values()))
             submit_to(future, fn, *args, **kwargs)
 
-        executor.submit_to = record_part  # type: ignore[method-assign]
+        executor.submit_to = record_upload  # type: ignore[method-assign]
 
-        def wait_for_part(futures):
-            release.set()
-            return wait(futures)
+        def release_newest(futures, **kwargs):
+            # Only the newest part in flight finishes, so a write that waits
+            # for the oldest one would time out.
+            gates[max(n for n, upload in uploads.items() if not upload.done())].set()
+            return wait(futures, timeout=5, **kwargs)
 
         f = S3File(
             fs,
@@ -7034,16 +7040,17 @@ class TestS3File:
             max_workers=max_workers,
             executor=executor,
         )
-        with mock.patch("pyathena.filesystem.s3.wait", side_effect=wait_for_part) as waited:
-            self._write_and_close(f, writes)
+        with mock.patch("pyathena.filesystem.s3.wait", side_effect=release_newest) as waited:
+            for data in writes:
+                f.write(data)
+            for gate in gates.values():
+                gate.set()
+            f.close()
 
         assert self._uploaded_object(fs, existing) == existing + b"".join(writes)
-        assert max(in_flight) <= max_workers
-        # Each uploaded part waited for the part max_workers parts before it.
-        copied = fs.core.upload_part_copy.call_count
-        assert waited.call_args_list == [
-            mock.call([parts[i - max_workers]]) for i in range(max(copied, max_workers), len(parts))
-        ]
+        # Each part was submitted once fewer than max_workers were in flight.
+        assert in_flight == [min(n, max_workers) for n in range(1, len(uploads) + 1)]
+        assert waited.call_count == len(uploads) - max_workers
 
     def test_write_interrupted_while_waiting_for_part(self):
         # GH-1158: an interrupt while a write waits for a part closes the file
@@ -7066,14 +7073,14 @@ class TestS3File:
         fs._call.side_effect = lambda *args, **kwargs: events.append("abort")
         waited = []
 
-        def interrupt_first_wait(futures):
-            waited.append(futures)
+        def interrupt_first_wait(futures, **kwargs):
+            waited.append(set(futures))
             if len(waited) == 1:
                 # The write waits for the first part, which is uploading.
                 assert started.wait(5)
                 raise KeyboardInterrupt
             release.set()
-            return wait(futures)
+            return wait(futures, **kwargs)
 
         executor = S3ThreadPoolExecutor(max_workers=2)
         f = S3File(
