@@ -1647,7 +1647,6 @@ class TestWork:
         armed = threading.Event()
         polling = threading.Event()
         uploading = threading.Event()
-        fired = threading.Event()
         upload_tree = queue.upload_tree
 
         def upload(*args, **kwargs):
@@ -1661,13 +1660,12 @@ class TestWork:
             # own check fails.
             if (
                 not armed.is_set()
-                or fired.is_set()
+                or polling.is_set()
                 or threading.current_thread() is threading.main_thread()
             ):
                 return False
             # The request is still in flight when the attempt checks for a notice.
             polling.set()
-            fired.set()
             return uploading.wait(5)
 
         def settle(output):
