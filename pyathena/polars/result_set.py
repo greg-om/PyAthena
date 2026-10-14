@@ -165,8 +165,9 @@ class PolarsDataFrameIterator(abc.Iterator):  # type: ignore[type-arg]
         """Iterate over the rows of a chunk in blocks of rows.
 
         A block takes the values of a column at once with ``Series.to_list()`` and
-        applies the column's converter only when it is not the identity. Blocks
-        bound the values held at once for a large chunk.
+        applies the column's converter unless the column has none or has the default
+        converter, which returns the values as they are. Blocks bound the values held
+        at once for a large chunk.
 
         Args:
             df: The DataFrame chunk.
