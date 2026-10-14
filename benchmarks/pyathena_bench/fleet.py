@@ -55,6 +55,8 @@ THROTTLING_ERRORS = {"ThrottlingException", "TooManyRequestsException"}
 # Retries per Athena request while quiescing; the default client's 5 retries did
 # not outlast the throttling of concurrent history scans in a fleet.
 QUIESCE_RETRIES = 10
+# Times a worker quiesces its own failed job while Athena only throttles it.
+QUIESCE_ROUNDS = 3
 
 
 @dataclass(frozen=True)
@@ -759,7 +761,9 @@ def quiesce(settings: Settings, output: Path) -> list[str]:
     first. Then the workgroup history is scanned for queries that write under
     those trials' output prefixes, which covers queries whose IDs were never
     reported before a trial process stopped; without such a trial, nothing is
-    scanned. Each Athena request is retried up to ``QUIESCE_RETRIES`` times.
+    scanned. A failed scan does not skip the status checks of the queries
+    known so far. Each Athena request is retried up to ``QUIESCE_RETRIES``
+    times.
 
     Args:
         settings: Configuration with the AWS region, workgroup, and timeouts.
@@ -767,7 +771,8 @@ def quiesce(settings: Settings, output: Path) -> list[str]:
             of a fleet attempt.
 
     Returns:
-        Queries that could not be confirmed as stopped, with the reason.
+        Queries that could not be confirmed as stopped, with the reason, and
+        a failed history scan as ``query history scan of <output>: <error>``.
 
     Raises:
         ClientError: If Athena still throttled a request after its retries
@@ -792,12 +797,14 @@ def quiesce(settings: Settings, output: Path) -> list[str]:
 
     stop(reported)
     found: set[str] = set()
-    try:
-        if prefixes:
+    scan_error: Exception | None = None
+    if prefixes:
+        try:
             active_queries(athena, settings.workgroup, prefixes, found)
-    finally:
-        # Queries found before a failed scan are still asked to stop.
-        stop(found - reported)
+        except Exception as exc:
+            # Queries found before a failed scan are still stopped and checked.
+            scan_error = exc
+    stop(found - reported)
     errors = []
     deadline = time.monotonic() + settings.timeout_seconds
     for query_id in sorted((reported | found) - throttled.keys()):
@@ -818,10 +825,14 @@ def quiesce(settings: Settings, output: Path) -> list[str]:
                 errors.append(f"{query_id}: still {state}; {stop_errors.get(query_id, '')}")
                 break
             time.sleep(settings.poll_interval)
-    if throttled and not errors:
+    throttling = [f"{query_id}: {exc}" for query_id, exc in sorted(throttled.items())]
+    if scan_error is not None:
+        failure = f"query history scan of {output.name}: {type(scan_error).__name__}: {scan_error}"
+        (throttling if is_throttling(scan_error) else errors).append(failure)
+    if throttling and not errors:
         # Only throttling kept the queries from being confirmed as stopped.
-        raise next(iter(throttled.values()))
-    return errors + [f"{query_id}: {exc}" for query_id, exc in sorted(throttled.items())]
+        raise scan_error or next(iter(throttled.values()))
+    return errors + throttling
 
 
 class SpotInterruptionError(Exception):
@@ -839,9 +850,9 @@ class JobWatch:
     for the claim's expiry, without S3 requests; another renews the claim and
     the API slots ten times per lease period. ``interrupted`` is set on a
     notice, and ``claim_lost`` when another worker took over the claim or
-    renewals failed or stalled until it expired; ``stop`` is set with either
-    and stops the runner. A lost slot is listed in ``lost_slots`` and does not
-    stop the job.
+    renewals failed or stalled until a third of the lease period was left;
+    ``stop`` is set with either and stops the runner. A lost slot is listed in
+    ``lost_slots`` and does not stop the job.
     """
 
     def __init__(
@@ -903,7 +914,12 @@ class JobWatch:
                 self.interrupted.set()
                 self.stop_event.set()
                 return
-            if time.time() >= self.claim.body["expires"]:
+            # A third of the lease, at least 100 seconds with the minimum
+            # --lease-seconds, is left for run_job() to stop the runner, which
+            # takes about a minute, before another worker can take the claim
+            # over, so that unless this host stalls, the attempt starts no
+            # query after that worker's scan.
+            if time.time() >= self.claim.body["expires"] - self.lease_seconds / 3:
                 self._lose_claim()
                 return
 
@@ -920,7 +936,8 @@ class JobWatch:
         try:
             return self.queue.renew(lease, self.lease_seconds)
         except Exception:
-            # The lease has time left for a retry until it expires.
+            # The lease has time left for a retry until it expires; _watch gives
+            # the claim up earlier.
             return time.time() < lease.body["expires"]
 
     def _lose_claim(self) -> None:
@@ -963,11 +980,13 @@ class Outcome:
     worker took over the job's claim or a slot, and ``deferred`` when Athena
     throttled the quiescing of an earlier attempt, so the job was released
     without running. ``errors`` lists queries that could not be confirmed as
-    stopped.
+    stopped. ``noticed`` tells whether an interruption notice was observed
+    after the run, while its queries were quiesced.
     """
 
     state: str
     errors: tuple[str, ...] = ()
+    noticed: bool = False
 
 
 def run_attempt(
@@ -992,6 +1011,9 @@ def run_attempt(
     An interruption notice or a lost claim stops the runner: after a notice,
     the attempt is uploaded and the claim released as interrupted; after a
     lost claim, the attempt's queries are quiesced and nothing is recorded.
+    A failed run's queries are also quiesced; while the claim is held, this
+    is repeated up to ``QUIESCE_ROUNDS`` times, a renewal interval apart, if
+    Athena only throttled it.
     Otherwise, after a conditional renewal confirms that the claim is still
     held, the job's report merges every attempt into ``job-summary.csv`` and
     ``job-summary.md`` of this attempt, and the first ``done`` marker of the
@@ -1025,12 +1047,6 @@ def run_attempt(
 
     def settle_error(path: Path, exc: Exception) -> str:
         return f"Could not quiesce {path.name}: {type(exc).__name__}: {exc}"
-
-    def safe_settle(path: Path) -> list[str]:
-        try:
-            return settle(path)
-        except Exception as exc:
-            return [settle_error(path, exc)]
 
     with JobWatch(queue, claim, slots, lease_seconds, notice) as watch:
         start = now()
@@ -1069,8 +1085,22 @@ def run_attempt(
             queue.end_lease(claim, "interrupted")
             return Outcome("interrupted")
         if code and not errors and not deferred:
-            # A failed or stopped run can leave queries running.
-            errors = safe_settle(output)
+            # A failed or stopped run can leave queries running. While the
+            # claim is held, quiescing that Athena only throttled is repeated,
+            # so that throttling alone does not stop the worker.
+            for round_ in range(1, QUIESCE_ROUNDS + 1):
+                try:
+                    errors = settle(output)
+                    break
+                except Exception as exc:
+                    errors = [settle_error(output, exc)]
+                    if not is_throttling(exc) or round_ == QUIESCE_ROUNDS:
+                        break
+                _logger.warning(f"Athena throttled quiescing {job['id']}; retrying")
+                # The pause lets concurrent history scans thin out; a notice or
+                # a lost claim ends it and the rounds.
+                if watch.stop_event.wait(lease_seconds / 10):
+                    break
         upload_attempt()
 
     if deferred:
@@ -1083,7 +1113,7 @@ def run_attempt(
         # S3 accepted stalled, may still be this worker's; releasing it, which
         # works only then, returns the job to the fleet.
         queue.end_lease(claim, "released")
-        return Outcome("lost", tuple(errors))
+        return Outcome("lost", tuple(errors), noticed=watch.interrupted.is_set())
 
     # The conditional renewal proves that this worker still owns the job, so a
     # former owner never records it, and leaves at least --lease-seconds for
@@ -1126,7 +1156,9 @@ def run_attempt(
         },
         IfNoneMatch="*",
     )
-    return abandon() if recorded is None else Outcome("done", tuple(errors))
+    if recorded is None:
+        return abandon()
+    return Outcome("done", tuple(errors), noticed=watch.interrupted.is_set())
 
 
 def work(
@@ -1178,7 +1210,10 @@ def work(
         ValueError: If the queue has not been completely published and
             ``wait`` is false, or a job needs more API slots than ``api_slots``.
         SpotInterruptionError: After an interruption notice, once the running attempt's
-            records are uploaded and its claim is released as interrupted.
+            records are uploaded and its claim is released as interrupted, or
+            once the attempt of a failed job ends, if the notice arrived while
+            its queries were quiesced or is found after they could not be
+            confirmed as stopped.
         RuntimeError: If an attempt stopped by a lost claim could not be quiesced;
             the worker's host is then kept.
     """
@@ -1264,6 +1299,9 @@ def work(
                     )
                 if outcome.state == "done":
                     completed.append(job["id"])
+                if outcome.noticed or (outcome.errors and check_notice(notice)):
+                    # The host is being reclaimed, so it must not be retired.
+                    raise SpotInterruptionError(completed)
                 if outcome.errors:
                     # Unconfirmed queries could overlap later trials on this host.
                     return completed

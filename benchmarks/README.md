@@ -472,18 +472,20 @@ A worker claims a job by creating `claims/<job>` with an S3 conditional write, s
 A claim, like each API slot under `slots/`, is a lease that its worker renews every tenth of `--lease-seconds` (600 by default, at least 300) while the job runs.
 When a worker dies, its claim and slots expire, and another worker takes them over with a conditional write, so the job and the slots return to the fleet without manual steps.
 A worker releases a slot by overwriting its lease as released, never by deleting it, so a slot that another worker took over stays held.
-A worker whose claim was taken over, or whose renewals failed until the claim expired, stops the attempt, quiesces its queries as after a failed job, and records nothing for the job; the new owner continues it, and the first `done` marker of a job is never replaced.
+A worker whose claim was taken over, or whose renewals failed until a third of `--lease-seconds` was left, stops the attempt, which leaves its trial time to stop before another worker can take the claim over, quiesces its queries as after a failed job, and records nothing for the job; the new owner continues it, and the first `done` marker of a job is never replaced.
 If that worker cannot confirm that the queries stopped, it raises an error and keeps its host, because the job may have no other worker.
 A lost API slot does not stop the job; the `done` marker lists it under `lost_slots`.
 Each attempt of a job writes to `results/<job>/attempt-<n>/`; between trials, its run writes each trial's start and record below `checkpoint/` there, so a lost host loses only its running trial, and the worker uploads the attempt's files when it ends.
-A trial whose start checkpoint could not be written, which the run logs, is not quiesced by the next attempt; its queries write to their own trial prefix and are cancelled by `cleanup`.
+A trial whose start checkpoint could not be written does not run, because the next attempt could not quiesce its queries; the run records it as failed, which fails the job.
 After a job, the worker uploads the attempt's output directory and its log to `logs/`, renews its claim conditionally to confirm that it still owns the job, writes `job-summary.csv` and `job-summary.md` from every attempt into its attempt directory, and then creates `done/<job>` with the exit code, attempt, host, times, and the summary's attempt directory under `summary`.
 A failed trial stops only its own job; `status` lists jobs with a non-zero exit code or a report error, the claims of running jobs, and the slots in use, each with its host, attempt, and whether its lease has expired.
 After a failed job, the worker stops the queries that the job's trials reported, except those of trials recorded as successful.
 Then it stops every queued or running query in the workgroup that writes under the output prefixes of those trials, which also covers queries whose IDs were never reported before a trial process stopped; this scans the workgroup's query history, and is skipped when every started trial succeeded.
 It waits until they stop before claiming another job.
 Each of these Athena requests is retried up to 10 times, compared with 5 elsewhere, and each retry waits with jittered exponential backoff of up to 20 seconds.
-If it cannot confirm that the queries stopped, it records the errors in the `done` marker and exits.
+A history scan that fails does not skip the status checks of the queries already found.
+If only throttling kept the queries from being confirmed as stopped, the worker quiesces them again, up to three times in total and a tenth of `--lease-seconds` apart, while it holds the claim.
+If it cannot confirm that the queries stopped, it records the errors in the `done` marker and exits; after an interruption notice, it does not terminate the host.
 
 Each worker checks instance metadata for a Spot interruption notice (`spot/instance-action`), which EC2 publishes about two minutes before it reclaims an instance.
 On a notice, the worker interrupts the running trial with SIGINT, which cancels the trial's reported queries, uploads the attempt, releases its claim as `interrupted` and its slots, and exits without terminating the host.

@@ -422,20 +422,17 @@ def s3_checkpoint(s3: Any, location: str) -> Callable[[str, dict[str, Any]], Non
         location: The attempt's ``s3://`` prefix; records go below ``checkpoint/``.
 
     Returns:
-        A function that writes a record under a name, logging a failure: a
-        missing checkpoint only makes a resumed job repeat that trial.
+        A function that writes a record under a name and raises the error of a
+        failed write.
     """
     bucket, prefix = split_location(location)
 
     def write(name: str, record: dict[str, Any]) -> None:
-        try:
-            s3.put_object(
-                Bucket=bucket,
-                Key=f"{prefix}{CHECKPOINT}/{name}",
-                Body=json.dumps(record, sort_keys=True).encode(),
-            )
-        except Exception:
-            _logger.warning("Could not write the checkpoint %s", name, exc_info=True)
+        s3.put_object(
+            Bucket=bucket,
+            Key=f"{prefix}{CHECKPOINT}/{name}",
+            Body=json.dumps(record, sort_keys=True).encode(),
+        )
 
     return write
 
@@ -463,7 +460,10 @@ def run(
         checkpoint: Function from :func:`s3_checkpoint` that receives each
             trial's ``trial_start`` event before the trial and its record
             after it, between trials, so that a fleet worker can resume the
-            job if the host is lost.
+            job if the host is lost. A trial whose start could not be written
+            does not run and is recorded as failed, because a later attempt
+            could not stop its queries; a record that could not be written is
+            only logged, and a resumed job repeats that trial.
 
     Returns:
         True if every trial succeeded.
@@ -537,10 +537,19 @@ def run(
                         fixture=manifest["fixtures"].get(f"{scale}-{case.shape}-{case.transport}"),
                     )
                 start = {"event": "trial_start", **payload}
-                append_json(output / "events.jsonl", start)
-                if checkpoint:
-                    checkpoint(f"{trial}-start.json", start)
-                result = supervise(payload, output / "events.jsonl", settings)
+                result: dict[str, Any]
+                try:
+                    if checkpoint:
+                        checkpoint(f"{trial}-start.json", start)
+                except Exception as exc:
+                    result = {
+                        "status": "error",
+                        "error": f"Could not write the start checkpoint: "
+                        f"{type(exc).__name__}: {exc}",
+                    }
+                else:
+                    append_json(output / "events.jsonl", start)
+                    result = supervise(payload, output / "events.jsonl", settings)
                 if (
                     result["status"] == "ok"
                     and repetition >= 0
@@ -563,7 +572,12 @@ def run(
                 }
                 append_json(output / "trials.jsonl", record)
                 if checkpoint:
-                    checkpoint(f"{trial}.json", record)
+                    try:
+                        checkpoint(f"{trial}.json", record)
+                    except Exception:
+                        _logger.warning(
+                            f"Could not write the checkpoint {trial}.json", exc_info=True
+                        )
                 success = success and result["status"] == "ok"
                 # A failed worker can leave an unobserved query running in Athena.
                 # Do not let it contaminate subsequent trials before cleanup.

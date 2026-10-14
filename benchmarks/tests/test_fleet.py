@@ -24,6 +24,7 @@ from pyathena_bench.cases import Case
 from pyathena_bench.config import Settings
 from pyathena_bench.fleet import (
     QUIESCE_RETRIES,
+    QUIESCE_ROUNDS,
     Filters,
     JobWatch,
     Lease,
@@ -821,6 +822,47 @@ class TestQuiesce:
         assert running.startswith("running: still RUNNING")
         assert throttled.startswith("throttled: An error occurred (ThrottlingException)")
 
+    def test_a_throttled_scan_does_not_hide_a_query_that_did_not_stop(self, tmp_path, use_athena):
+        write_events(
+            tmp_path,
+            {"event": "trial_start", "trial": "t1", "output": "s3://b/trials/t1/"},
+            {"event": "query", "trial": "t1", "query_id": "q"},
+        )
+        athena = FakeAthena({"q": "RUNNING"}, stop_errors={"q": "AccessDeniedException"})
+
+        def active(client_, workgroup, prefixes):
+            raise throttling("ListQueryExecutions")
+
+        use_athena(athena, active)
+        running, scan = quiesce(Settings(poll_interval=0.01, timeout_seconds=0.05), tmp_path)
+        assert running.startswith("q: still RUNNING; An error occurred (AccessDeniedException)")
+        assert scan.startswith(
+            f"query history scan of {tmp_path.name}: ClientError: An error occurred "
+            "(ThrottlingException)"
+        )
+
+    def test_a_failed_scan_is_reported_after_the_known_queries_stop(
+        self, tmp_path, monkeypatch, use_athena
+    ):
+        write_events(
+            tmp_path,
+            {"event": "trial_start", "trial": "t1", "output": "s3://b/trials/t1/"},
+            {"event": "query", "trial": "t1", "query_id": "reported"},
+        )
+        athena = FakeAthena({"reported": "RUNNING", "found": "RUNNING"})
+
+        def active(client_, workgroup, prefixes, ids):
+            ids.add("found")
+            raise RuntimeError("Could not inspect query history: [x]")
+
+        use_athena(athena)
+        monkeypatch.setattr("pyathena_bench.fleet.active_queries", active)
+        assert quiesce(Settings(poll_interval=0.01), tmp_path) == [
+            f"query history scan of {tmp_path.name}: RuntimeError: "
+            "Could not inspect query history: [x]"
+        ]
+        assert athena.states == {"reported": "CANCELLED", "found": "CANCELLED"}
+
     def test_a_throttled_status_check_raises(self, tmp_path, use_athena):
         write_events(tmp_path, {"event": "query", "trial": "t1", "query_id": "reported"})
         athena = FakeAthena({"reported": "RUNNING"})
@@ -1027,6 +1069,20 @@ class TestJobWatch:
         assert watch.claim_lost.is_set()
         assert not watch.interrupted.is_set()
         assert queue.read_lease(claim.key).body["host"] == "other"
+
+    def test_a_claim_is_lost_while_a_third_of_the_lease_is_left(self, tmp_path):
+        _, queue = queue_with([], tmp_path)
+        claim = queue.acquire(queue.key("claims", "a"), {"host": "h"}, 1.5)
+
+        def fail(lease, seconds, **changes):
+            raise OSError("S3 unavailable")
+
+        queue.renew = fail
+        with JobWatch(queue, claim, [], 1.5, lambda: False) as watch:
+            assert watch.claim_lost.wait(5)
+            # The runner has time to stop before another worker can take the claim over.
+            assert time.time() < claim.body["expires"]
+            assert not queue.read_lease(claim.key).takeable(time.time())
 
     def test_a_stalled_renewal_that_outlasts_the_claim_loses_it(self, tmp_path):
         _, queue = queue_with([], tmp_path)
@@ -1466,15 +1522,107 @@ class TestWork:
 
     def test_a_failed_job_whose_quiescing_is_throttled_stops_the_worker(self, tmp_path):
         _, queue = queue_with([job("first"), job("second")], tmp_path)
+        settled = []
 
         def settle(output):
+            settled.append(output.name)
             raise throttling("ListQueryExecutions")
 
         # The job ran, so it is recorded as failed instead of being released.
-        ran = work(queue, tmp_path / "w", api_slots=1, runner=lambda *a: 1, settle=settle)
+        ran = work(queue, tmp_path / "w", api_slots=1, runner=lambda *a: 1, settle=settle,
+                   lease_seconds=0.5)  # fmt: skip
         assert ran == ["first"]
+        assert settled == ["attempt-1"] * QUIESCE_ROUNDS
         [error] = status(queue)["failed"]["first"]["quiesce_errors"]
         assert error.startswith("Could not quiesce attempt-1: ClientError: ")
+
+    def test_a_failed_job_quiesced_after_throttling_keeps_the_worker(self, tmp_path):
+        _, queue = queue_with([job("first"), job("second")], tmp_path)
+        settled = []
+
+        def settle(output):
+            settled.append(output.name)
+            if len(settled) == 1:
+                raise throttling("ListQueryExecutions")
+            return []
+
+        def runner(item, *args):
+            return 1 if item["id"] == "first" else 0
+
+        ran = work(queue, tmp_path / "w", api_slots=1, runner=runner, settle=settle,
+                   lease_seconds=0.5)  # fmt: skip
+        assert ran == ["first", "second"]
+        assert settled == ["attempt-1", "attempt-1"]
+        done = json.loads(queue.read("done", "first"))
+        assert (done["exit_code"], done["quiesce_errors"]) == (1, [])
+
+    def test_a_notice_while_quiescing_a_failed_job_keeps_the_host(self, tmp_path):
+        _, queue = queue_with([job("first"), job("second")], tmp_path)
+        notice = threading.Event()
+
+        def settle(output):
+            notice.set()
+            raise throttling("ListQueryExecutions")
+
+        # A normal return would retire the host, which is being reclaimed anyway.
+        with pytest.raises(SpotInterruptionError) as raised:
+            work(queue, tmp_path / "w", api_slots=1, runner=lambda *a: 1, settle=settle,
+                 lease_seconds=0.5, notice=notice.is_set)  # fmt: skip
+        assert raised.value.ran == ["first"]
+        [error] = status(queue)["failed"]["first"]["quiesce_errors"]
+        assert error.startswith("Could not quiesce attempt-1: ClientError: ")
+        assert "second" not in queue.names("claims")
+
+    @pytest.mark.parametrize(
+        ("quiescing", "ran"), [("throttled", ["first"]), ("ok", ["first"]), ("lost", [])]
+    )
+    def test_a_notice_observed_while_quiescing_outlasts_a_failed_check(
+        self, tmp_path, quiescing, ran
+    ):
+        _, queue = queue_with([job("first"), job("second")], tmp_path)
+        armed = threading.Event()
+        seen = threading.Event()
+
+        def notice():
+            # Only the watch thread sees the notice; the worker's own check fails.
+            if armed.is_set() and threading.current_thread() is not threading.main_thread():
+                seen.set()
+                return True
+            return False
+
+        def settle(output):
+            armed.set()
+            assert seen.wait(5)
+            if quiescing == "throttled":
+                raise throttling("ListQueryExecutions")
+            if quiescing == "lost":
+                # Another worker took the claim over before it was renewed.
+                take_over(queue, "first")
+            return []
+
+        with pytest.raises(SpotInterruptionError) as raised:
+            work(queue, tmp_path / "w", api_slots=1, runner=lambda *a: 1, settle=settle,
+                 lease_seconds=0.5, notice=notice)  # fmt: skip
+        assert raised.value.ran == ran
+        assert "second" not in queue.names("claims")
+
+    def test_a_lost_claim_does_not_repeat_throttled_quiescing(self, tmp_path):
+        _, queue = queue_with([job("a")], tmp_path)
+        settled = []
+
+        def runner(item, workdir, out, resume, stop, checkpoint):
+            take_over(queue, "a")
+            stop.wait(5)
+            return 130
+
+        def settle(output):
+            settled.append(output.name)
+            raise throttling("ListQueryExecutions")
+
+        with pytest.raises(RuntimeError, match="Could not quiesce a stopped attempt of a"):
+            work(queue, tmp_path / "w", api_slots=1, runner=runner, settle=settle,
+                 lease_seconds=0.5)  # fmt: skip
+        assert settled == ["attempt-1"]
 
     def test_a_notice_after_a_throttled_takeover_stops_before_the_next_claim(self, tmp_path):
         _, queue = queue_with([job("a"), job("b")], tmp_path)
