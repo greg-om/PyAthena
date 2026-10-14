@@ -7,7 +7,7 @@
 
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from unittest.mock import MagicMock, PropertyMock, patch
 
@@ -507,6 +507,15 @@ class TestPolarsDataFrameIterator:
             pl.Series([{"a": 1, "b": "x"}, None, {"a": None, "b": None}]),
             pl.Series([[{"a": [1]}], None, [{"a": None}]]),
             pl.Series([None, None, None], dtype=pl.Null),
+            pl.Series([1.5, None, float("nan")]),
+            pl.Series([2**64 - 1, None, 0], dtype=pl.UInt64),
+            pl.Series([2**100, None, -1], dtype=pl.Int128),
+            pl.Series([datetime(2024, 1, 2, 3, 4, 5, 123456), None, None]).cast(pl.Datetime("ns")),
+            pl.Series([time(1, 2, 3), None, time(23, 59, 59, 999999)]),
+            pl.Series([[1, 2], None, [3, 4]], dtype=pl.Array(pl.Int64, 2)),
+            pl.Series(["x", None, "y"], dtype=pl.Categorical),
+            pl.Series(["x", None, "y"], dtype=pl.Enum(["x", "y"])),
+            pl.Series([object, None, 1], dtype=pl.Object),
         ],
         ids=lambda series: str(series.dtype),
     )
@@ -542,6 +551,14 @@ class TestPolarsDataFrameIterator:
         rows = list(PolarsDataFrameIterator(df, {"s": _to_default}, ["n", "s"]).itertuples())
 
         assert rows == [(i, f"v{i}") for i in range(size)]
+
+    def test_itertuples_without_column_names(self):
+        """Without column names, each row of a chunk is empty."""
+        df = pl.DataFrame({"n": [1, 2]})
+
+        df_iter = PolarsDataFrameIterator(df, {}, [])
+
+        assert list(df_iter.iterrows()) == [(0, {}), (1, {})]
 
     def test_iterrows_continuous_row_numbers(self):
         """Row numbers continue across chunks, with each row keyed by the column names."""

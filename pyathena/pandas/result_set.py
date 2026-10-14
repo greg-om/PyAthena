@@ -945,9 +945,8 @@ class AthenaPandasResultSet(AthenaResultSet):
         self,
     ) -> tuple[Any | None, ...] | dict[Any, Any | None] | None:
         row = next(self._row_iter, None)
-        # A result set closed meanwhile, from another thread, keeps its rownumber None.
-        if row is not None and self._rownumber is not None:
-            self._rownumber += 1
+        if row is not None:
+            self._count_rows(1)
         return row
 
     @override
@@ -983,10 +982,23 @@ class AthenaPandasResultSet(AthenaResultSet):
             # extend() keeps the rows that it appended before an exception.
             rows.extend(islice(self._row_iter, size))
         finally:
-            # A result set closed meanwhile, from another thread, keeps its rownumber None.
-            if rows and self._rownumber is not None:
-                self._rownumber += len(rows)
+            if rows:
+                self._count_rows(len(rows))
         return rows
+
+    def _count_rows(self, count: int) -> None:
+        """Count the rows that a fetch took in ``rownumber``.
+
+        ``rownumber`` stays None for a result set that another thread closed before
+        the update. It is read once, so that a ``close()`` during the update raises no
+        TypeError, though it may leave the count in place.
+
+        Args:
+            count: The number of rows taken.
+        """
+        rownumber = self._rownumber
+        if rownumber is not None:
+            self._rownumber = rownumber + count
 
     def _read_csv(self) -> TextFileReader | DataFrame:
         """Read the CSV result file, or the GetQueryResults rows as one without it.
