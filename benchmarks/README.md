@@ -11,7 +11,7 @@ SPDX-License-Identifier: MIT
 
 This project measures result retrieval, memory use, and concurrent query behavior for PyAthena and AWS SDK for pandas (AWS Wrangler), and S3 transfers through PyAthena's filesystems.
 It includes a disposable CloudFormation environment and does not run benchmarks in CI.
-Recorded measurements are listed in [RESULTS.md](RESULTS.md); cursor recommendations are pending.
+Recorded measurements and the recommendations drawn from them are listed in [RESULTS.md](RESULTS.md).
 
 ## Input data
 
