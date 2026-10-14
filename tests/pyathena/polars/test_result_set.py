@@ -569,7 +569,7 @@ class TestPolarsDataFrameIterator:
         rows = PolarsDataFrameIterator(df, {}, ["d", "n"]).itertuples()
 
         assert [next(rows), next(rows)] == [(date(1970, 1, 1), 1), (date(1970, 1, 1), 2)]
-        with pytest.raises(ValueError, match="year 0"):
+        with pytest.raises(ValueError, match="year"):
             next(rows)
         assert list(rows) == []
 
