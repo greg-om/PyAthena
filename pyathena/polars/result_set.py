@@ -175,6 +175,8 @@ class PolarsDataFrameIterator(abc.Iterator):  # type: ignore[type-arg]
         Yields:
             An iterator of the rows of each block.
         """
+        import polars as pl
+
         # Each column's Series, or None for a name the chunk does not have, and its
         # converter, or None for the identity.
         columns: list[tuple[pl.Series | None, Callable[[Any], Any] | None]] = []
@@ -187,7 +189,8 @@ class PolarsDataFrameIterator(abc.Iterator):  # type: ignore[type-arg]
         def take_values(block: pl.Series) -> Iterator[Any]:
             # A value that Python does not hold, such as a date in year 0, fails
             # to_list() for the whole block, so the values are taken one at a time
-            # and the rows before it are still returned.
+            # and the rows before it are still returned. Within a nested value,
+            # Polars raises such a failure as a PanicException, a BaseException.
             for i in range(block.len()):
                 yield block.slice(i, 1).to_list()[0]
 
@@ -209,7 +212,7 @@ class PolarsDataFrameIterator(abc.Iterator):  # type: ignore[type-arg]
                     block = series.slice(start, length)
                     try:
                         values = block.to_list()
-                    except Exception:
+                    except (Exception, pl.exceptions.PanicException):
                         values = take_values(block)
                 blocks.append(values if converter is None else convert(converter, values))
             # Without column names, each row is empty, as iter_rows() gave it.

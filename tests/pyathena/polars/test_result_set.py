@@ -573,6 +573,23 @@ class TestPolarsDataFrameIterator:
             next(rows)
         assert list(rows) == []
 
+    def test_itertuples_nested_value_python_does_not_hold(self):
+        """The rows before a nested value that Python does not hold are returned too.
+
+        Polars raises the failure within a struct as a PanicException.
+        """
+        dates = pl.Series([0, 0, -719528], dtype=pl.Int32).cast(pl.Date)
+        df = pl.DataFrame({"s": pl.DataFrame({"d": dates}).to_struct(), "n": [1, 2, 3]})
+        rows = PolarsDataFrameIterator(df, {}, ["s", "n"]).itertuples()
+
+        assert [next(rows), next(rows)] == [
+            ({"d": date(1970, 1, 1)}, 1),
+            ({"d": date(1970, 1, 1)}, 2),
+        ]
+        with pytest.raises(pl.exceptions.PanicException):
+            next(rows)
+        assert list(rows) == []
+
     def test_itertuples_large_chunk(self):
         """The rows of a chunk larger than a block of rows keep their order."""
         size = PolarsDataFrameIterator._ROW_BLOCK_SIZE * 2 + 1
