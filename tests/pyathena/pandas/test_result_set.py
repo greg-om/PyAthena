@@ -79,14 +79,6 @@ class TestPandasDataFrameIterator:
 
         assert rows == [(i, f"v{i}") for i in range(size)]
 
-    def test_itertuples_duplicate_column_names(self):
-        """Columns with the same label keep their own values by position."""
-        df = pd.DataFrame([[1, "a", 2], [3, "b", 4]], columns=["x", "y", "x"])
-
-        rows = list(PandasDataFrameIterator(df, _no_trunc_date).itertuples())
-
-        assert rows == [(1, "a", 2), (3, "b", 4)]
-
     def test_iterrows_continuous_row_numbers(self):
         """Row numbers continue across chunks."""
         chunks = [pd.DataFrame({"n": [1, 2]}), pd.DataFrame({"n": [3]}, index=[0])]
@@ -212,6 +204,26 @@ class TestAthenaPandasResultSet:
         result_set = _fetching_result_set(df, arraysize=3)
         assert result_set.fetchone() == (1, "a", 2)
         assert result_set.fetchmany() == [(3, "b", 4)]
+
+    @pytest.mark.parametrize("method", ["fetchone", "fetchmany", "fetchall"])
+    def test_fetch_after_conversion_error(self, method):
+        """After a value fails to convert, the fetch methods return no more rows."""
+        # A timestamp that does not fit a Python datetime fails while its row is built.
+        timestamps = pa.array([0, 10**13, 0], type=pa.timestamp("s"))
+        chunks = [
+            pd.DataFrame(
+                {"n": [0, 1, 2], "t": pd.Series(timestamps, dtype=pd.ArrowDtype(timestamps.type))}
+            ),
+            pd.DataFrame({"n": [3]}),
+        ]
+        result_set = _fetching_result_set(iter(chunks), arraysize=3)
+        assert result_set.fetchone() == (0, pd.Timestamp(0, unit="s"))
+        with pytest.raises(OverflowError):
+            getattr(result_set, method)()
+        assert result_set.fetchone() is None
+        assert result_set.fetchmany() == []
+        assert result_set.fetchall() == []
+        assert result_set.rownumber == 1
 
     def test_fetch_after_close(self):
         result_set = _fetching_result_set(pd.DataFrame({"n": [1, 2]}), arraysize=3)

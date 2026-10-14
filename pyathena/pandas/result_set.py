@@ -399,12 +399,16 @@ class PandasDataFrameIterator(abc.Iterator):  # type: ignore[type-arg]
         The tuples hold the values of the columns by position, as
         ``DataFrame.itertuples(index=False, name=None)`` gives them, so columns
         with the same name keep their own values. The next chunk is read when the
-        rows of the current one run out.
+        rows of the current one run out. After an exception, such as a value that
+        fails to convert, the iteration ends.
 
-        Returns:
-            An iterator of the rows of all remaining chunks.
+        Yields:
+            The rows of all remaining chunks.
         """
-        return chain.from_iterable(chain.from_iterable(map(self._iter_row_blocks, self)))
+        # Resuming a block after an exception within a row would misalign its columns.
+        for df in self:
+            for block in self._iter_row_blocks(df):
+                yield from block
 
     def _iter_row_blocks(self, df: DataFrame) -> Iterator[Iterator[tuple[Any, ...]]]:
         """Iterate over the rows of a chunk in blocks of rows.
@@ -947,18 +951,26 @@ class AthenaPandasResultSet(AthenaResultSet):
     ) -> list[tuple[Any | None, ...] | dict[Any, Any | None]]:
         if not size or size <= 0:
             size = self._arraysize
-        rows: list[tuple[Any | None, ...] | dict[Any, Any | None]] = list(
-            islice(self._row_iter, size)
-        )
-        if rows:
-            self._rownumber = (self._rownumber or 0) + len(rows)
-        return rows
+        return self._take_rows(size)
 
     @override
     def fetchall(
         self,
     ) -> list[tuple[Any | None, ...] | dict[Any, Any | None]]:
-        rows: list[tuple[Any | None, ...] | dict[Any, Any | None]] = list(self._row_iter)
+        return self._take_rows(None)
+
+    def _take_rows(self, size: int | None) -> list[tuple[Any | None, ...] | dict[Any, Any | None]]:
+        """Take the next rows and count them in ``rownumber``.
+
+        Args:
+            size: The maximum number of rows, or None for all remaining rows.
+
+        Returns:
+            The rows, fewer than ``size`` when the result is exhausted.
+        """
+        rows: list[tuple[Any | None, ...] | dict[Any, Any | None]] = list(
+            islice(self._row_iter, size)
+        )
         if rows:
             self._rownumber = (self._rownumber or 0) + len(rows)
         return rows
