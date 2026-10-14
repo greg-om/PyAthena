@@ -980,8 +980,9 @@ class Outcome:
     worker took over the job's claim or a slot, and ``deferred`` when Athena
     throttled the quiescing of an earlier attempt, so the job was released
     without running. ``errors`` lists queries that could not be confirmed as
-    stopped. ``noticed`` tells whether an interruption notice was observed
-    after the run, while its queries were quiesced.
+    stopped. ``noticed`` tells whether the watch observed an interruption
+    notice after the attempt checked for one, for example while queries were
+    quiesced.
     """
 
     state: str
@@ -1106,7 +1107,7 @@ def run_attempt(
     if deferred:
         # Nothing ran, so the next attempt resumes from the same earlier attempts.
         queue.end_lease(claim, "released")
-        return Outcome("deferred")
+        return Outcome("deferred", noticed=watch.interrupted.is_set())
 
     def abandon() -> Outcome:
         # A claim lost only by its local expiry, for example while a renewal that
@@ -1213,7 +1214,8 @@ def work(
             records are uploaded and its claim is released as interrupted, or
             once the attempt of a failed job ends, if the notice arrived while
             its queries were quiesced or is found after they could not be
-            confirmed as stopped.
+            confirmed as stopped, or once a deferred takeover released its
+            claim.
         RuntimeError: If an attempt stopped by a lost claim could not be quiesced;
             the worker's host is then kept.
     """
@@ -1287,7 +1289,7 @@ def work(
                     _logger.warning(
                         f"Deferred {job['id']}: Athena throttled quiescing its earlier attempts"
                     )
-                    if check_notice(notice):
+                    if outcome.noticed or check_notice(notice):
                         raise SpotInterruptionError(completed)
                     # A later pass, or another worker, retries the job; try the next one.
                     continue
