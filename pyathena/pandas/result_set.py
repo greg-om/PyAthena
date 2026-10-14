@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from functools import partial
 from io import BufferedReader, BytesIO, IOBase, StringIO, TextIOWrapper
+from itertools import chain, islice
 from multiprocessing import cpu_count
 from types import GeneratorType
 from typing import (
@@ -308,6 +309,9 @@ class PandasDataFrameIterator(abc.Iterator):  # type: ignore[type-arg]
         Most users should access results through PandasCursor methods.
     """
 
+    # The number of rows whose values the row iterators convert at once.
+    _ROW_BLOCK_SIZE: ClassVar[int] = 10_000
+
     def __init__(
         self,
         reader: TextFileReader | Iterator[DataFrame] | DataFrame,
@@ -384,12 +388,62 @@ class PandasDataFrameIterator(abc.Iterator):  # type: ignore[type-arg]
         """
         row_num = 0
         for df in self:
-            # Use itertuples for memory efficiency instead of to_dict("records")
-            # which loads all rows into memory at once
             columns = df.columns.tolist()
-            for row in df.itertuples(index=False):
+            for row in chain.from_iterable(self._iter_row_blocks(df)):
                 yield (row_num, dict(zip(columns, row, strict=True)))
                 row_num += 1
+
+    def itertuples(self) -> Iterator[tuple[Any, ...]]:
+        """Iterate over rows as tuples of their values across all chunks.
+
+        The tuples hold the values of the columns by position, as
+        ``DataFrame.itertuples(index=False, name=None)`` gives them, so columns
+        with the same name keep their own values. The next chunk is read when the
+        rows of the current one run out.
+
+        Returns:
+            An iterator of the rows of all remaining chunks.
+        """
+        return chain.from_iterable(chain.from_iterable(map(self._iter_row_blocks, self)))
+
+    def _iter_row_blocks(self, df: DataFrame) -> Iterator[Iterator[tuple[Any, ...]]]:
+        """Iterate over the rows of a chunk in blocks of rows.
+
+        A block takes the values of a column at once with ``tolist()`` where that
+        gives the values that iterating over the column gives: for columns of a
+        NumPy array and of a pandas string dtype. The other columns, such as
+        nullable integer, datetime, and ``pyarrow``-backed columns, are iterated
+        over. Blocks bound the values held at once for a large chunk.
+
+        Args:
+            df: The DataFrame chunk.
+
+        Yields:
+            An iterator of the rows of each block.
+        """
+        import pandas as pd
+
+        # Each column's values, and whether a slice of them is converted with tolist().
+        columns: list[tuple[Any, bool]] = []
+        for i in range(df.shape[1]):
+            array = df.iloc[:, i].array
+            if isinstance(array.dtype, pd.StringDtype):
+                columns.append((array, True))
+            elif isinstance(array, pd.arrays.NumpyExtensionArray):
+                columns.append((array.to_numpy(), True))
+            else:
+                columns.append((array, False))
+        size = self._ROW_BLOCK_SIZE
+        for start in range(0, len(df), size):
+            yield zip(
+                *(
+                    values[start : start + size].tolist()
+                    if to_list
+                    else values[start : start + size]
+                    for values, to_list in columns
+                ),
+                strict=True,
+            )
 
     def get_chunk(self, size: int | None = None) -> DataFrame:
         """Get a chunk of specified size.
@@ -653,7 +707,7 @@ class AthenaPandasResultSet(AthenaResultSet):
             # out of the rows that the fetch methods return. Mutable values in its
             # cells, such as lists from JSON columns, are still shared.
             self._df_iter = PandasDataFrameIterator(self._df.copy(deep=False), _no_trunc_date)
-        self._iterrows = self._df_iter.iterrows()
+        self._row_iter: Iterator[tuple[Any, ...]] = self._df_iter.itertuples()
 
     def _get_parquet_engine(self) -> str:
         """Get the parquet engine to use, handling auto-detection.
@@ -882,14 +936,32 @@ class AthenaPandasResultSet(AthenaResultSet):
     def fetchone(
         self,
     ) -> tuple[Any | None, ...] | dict[Any, Any | None] | None:
-        try:
-            row = next(self._iterrows)
-        except StopIteration:
-            return None
-        else:
-            self._rownumber = row[0] + 1
-            # By position, so that columns with the same name keep their own values.
-            return tuple(row[1].values())
+        row = next(self._row_iter, None)
+        if row is not None:
+            self._rownumber = (self._rownumber or 0) + 1
+        return row
+
+    @override
+    def fetchmany(
+        self, size: int | None = None
+    ) -> list[tuple[Any | None, ...] | dict[Any, Any | None]]:
+        if not size or size <= 0:
+            size = self._arraysize
+        rows: list[tuple[Any | None, ...] | dict[Any, Any | None]] = list(
+            islice(self._row_iter, size)
+        )
+        if rows:
+            self._rownumber = (self._rownumber or 0) + len(rows)
+        return rows
+
+    @override
+    def fetchall(
+        self,
+    ) -> list[tuple[Any | None, ...] | dict[Any, Any | None]]:
+        rows: list[tuple[Any | None, ...] | dict[Any, Any | None]] = list(self._row_iter)
+        if rows:
+            self._rownumber = (self._rownumber or 0) + len(rows)
+        return rows
 
     def _read_csv(self) -> TextFileReader | DataFrame:
         """Read the CSV result file, or the GetQueryResults rows as one without it.
@@ -1665,5 +1737,5 @@ class AthenaPandasResultSet(AthenaResultSet):
         self._df_iter.close()
         self._df = pd.DataFrame()
         self._df_iter = PandasDataFrameIterator(self._df, _no_trunc_date)
-        self._iterrows = enumerate([])
+        self._row_iter = iter(())
         self._data_manifest = []

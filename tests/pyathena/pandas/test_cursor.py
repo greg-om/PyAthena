@@ -397,6 +397,25 @@ class TestPandasCursor:
         assert len(pandas_cursor.fetchmany(10)) == 5
 
     @pytest.mark.parametrize(
+        "pandas_cursor",
+        [{"cursor_kwargs": {"unload": False}}, {"cursor_kwargs": {"unload": True}}],
+        indirect=["pandas_cursor"],
+    )
+    def test_fetch_across_chunks(self, pandas_cursor):
+        """The fetch methods continue across chunks and count the rows they return."""
+        pandas_cursor.execute(
+            "SELECT * FROM (VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e')) AS t(k, s)",
+            chunksize=2,
+        )
+        rows = [pandas_cursor.fetchone()]
+        assert pandas_cursor.rownumber == 1
+        rows += pandas_cursor.fetchmany(3)
+        assert pandas_cursor.rownumber == 4
+        rows += pandas_cursor.fetchall()
+        assert pandas_cursor.rownumber == 5
+        assert sorted(rows) == [(1, "a"), (2, "b"), (3, "c"), (4, "d"), (5, "e")]
+
+    @pytest.mark.parametrize(
         ("pandas_cursor", "chunksize"),
         [
             ({}, None),

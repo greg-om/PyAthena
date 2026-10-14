@@ -389,7 +389,7 @@ awsathena+pandas://:@athena.{region_name}.amazonaws.com:443/{schema_name}?s3_sta
 
 When this option is used, the object returned by the as_pandas method is a `PandasDataFrameIterator` object.
 This object is an iterator of DataFrames, like the pandas `TextFileReader` object.
-It also provides `get_chunk()`, `as_pandas()`, `iterrows()`, and `close()`, and can be used as a context manager.
+It also provides `get_chunk()`, `as_pandas()`, `iterrows()`, `itertuples()`, and `close()`, and can be used as a context manager.
 
 ```python
 from pyathena import connect
