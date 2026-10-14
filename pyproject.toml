@@ -96,8 +96,9 @@ dev = [
     # the lock keeps the version that the benchmarks' awswrangler allows.
     "pyarrow>=26.0.0; python_version >= '3.15'",
     "polars>=1.39.0",
-    # Pull requests test the newest Python with Polars 2, and the older Pythons keep
-    # the newest Polars 1.x release.
+    # Python 3.14 and later, including the newest version that pull requests test,
+    # use Polars 2; Polars 1.x Series methods return None on Python 3.15
+    # (pola-rs/polars#29419). The older versions keep the newest Polars 1.x release.
     "polars>=2.0.0; python_version >= '3.14'",
     "polars<2.0.0; python_version < '3.14'",
     "Jinja2>=3.1.0",

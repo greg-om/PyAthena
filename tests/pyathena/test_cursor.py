@@ -630,8 +630,9 @@ class TestCursor:
         assert cursor.fetchall() == [("a string", "%%")]
 
     def test_contain_special_character_query_with_parameter(self, cursor):
+        # Python 3.15 raises ValueError instead of TypeError for a % without a mapping key.
         pytest.raises(
-            TypeError,
+            (TypeError, ValueError),
             lambda: cursor.execute(
                 """
                 SELECT col_string, %(param)s FROM one_row_complex
