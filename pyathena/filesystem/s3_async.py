@@ -782,7 +782,10 @@ class AioS3FileSystem(AsyncFileSystem):
             block_size = self._sync_fs.default_block_size
         if cache_type is None:
             cache_type = self._sync_fs.default_cache_type
-        max_workers = kwargs.pop("max_workers", self._sync_fs.max_workers)
+        max_workers = kwargs.pop("max_workers", None)
+        if max_workers is None:
+            # None takes the default of the filesystem.
+            max_workers = self._sync_fs.max_workers
         # The parameters of the call take precedence over those of the
         # filesystem; the caller's dictionary is not modified.
         s3_additional_kwargs = {
