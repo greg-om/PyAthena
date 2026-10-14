@@ -2288,11 +2288,14 @@ class TestAioS3FileSystem:
 
 
 class TestAioS3File:
-    def test_open_max_workers(self):
+    @pytest.mark.parametrize("max_workers", [2, None])
+    def test_open_max_workers(self, max_workers):
+        # GH-1158: None takes the default of the filesystem. It used to raise
+        # TypeError when the executor of the file was created.
         fs = AioS3FileSystem(connection=mock.MagicMock(), skip_instance_cache=True)
-        with fs.open("s3://bucket/key", "wb", max_workers=2) as f:
+        with fs.open("s3://bucket/key", "wb", max_workers=max_workers) as f:
             assert isinstance(f, AioS3File)
-            assert f.max_workers == 2
+            assert f.max_workers == (max_workers or fs._sync_fs.max_workers)
 
     @pytest.mark.parametrize("asynchronous", [False, True])
     @pytest.mark.asyncio
