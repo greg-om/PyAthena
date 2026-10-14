@@ -7,7 +7,9 @@
 
 import csv
 import io
+import threading
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import ANY, MagicMock, PropertyMock, patch, sentinel
 
 import numpy as np
@@ -78,6 +80,17 @@ class TestPandasDataFrameIterator:
         rows = list(PandasDataFrameIterator(df, _no_trunc_date).itertuples())
 
         assert rows == [(i, f"v{i}") for i in range(size)]
+
+    def test_itertuples_after_close(self):
+        """After close(), the rows end with the block that is being read."""
+        size = PandasDataFrameIterator._ROW_BLOCK_SIZE
+        df_iter = PandasDataFrameIterator(pd.DataFrame({"n": range(size * 2)}), _no_trunc_date)
+        rows = df_iter.itertuples()
+        assert next(rows) == (0,)
+
+        df_iter.close()
+
+        assert list(rows) == [(i,) for i in range(1, size)]
 
     def test_iterrows_continuous_row_numbers(self):
         """Row numbers continue across chunks."""
@@ -205,11 +218,23 @@ class TestAthenaPandasResultSet:
         assert result_set.fetchone() == (1, "a", 2)
         assert result_set.fetchmany() == [(3, "b", 4)]
 
-    @pytest.mark.parametrize("method", ["fetchone", "fetchmany", "fetchall"])
-    def test_fetch_after_conversion_error(self, method):
-        """After a value fails to convert, the fetch methods return no more rows."""
+    @pytest.mark.parametrize(
+        ("seconds", "method", "rownumber"),
+        [
+            ([0, 10**13, 0], "fetchone", 1),
+            ([0, 10**13, 0], "fetchmany", 1),
+            ([0, 10**13, 0], "fetchall", 1),
+            ([0, 0, 10**13], "fetchmany", 2),
+            ([0, 0, 10**13], "fetchall", 2),
+        ],
+    )
+    def test_fetch_after_conversion_error(self, seconds, method, rownumber):
+        """After a value fails to convert, the fetch methods return no more rows.
+
+        ``rownumber`` counts the rows taken before the error, as fetching row by row did.
+        """
         # A timestamp that does not fit a Python datetime fails while its row is built.
-        timestamps = pa.array([0, 10**13, 0], type=pa.timestamp("s"))
+        timestamps = pa.array(seconds, type=pa.timestamp("s"))
         chunks = [
             pd.DataFrame(
                 {"n": [0, 1, 2], "t": pd.Series(timestamps, dtype=pd.ArrowDtype(timestamps.type))}
@@ -220,10 +245,43 @@ class TestAthenaPandasResultSet:
         assert result_set.fetchone() == (0, pd.Timestamp(0, unit="s"))
         with pytest.raises(OverflowError):
             getattr(result_set, method)()
+        assert result_set.rownumber == rownumber
         assert result_set.fetchone() is None
         assert result_set.fetchmany() == []
         assert result_set.fetchall() == []
-        assert result_set.rownumber == 1
+        assert result_set.rownumber == rownumber
+
+    def test_close_during_fetchall(self):
+        """A fetchall() in another thread stops when the result set is closed."""
+        requested = threading.Event()
+        closed = threading.Event()
+
+        class Chunks:
+            def __init__(self):
+                self._chunks = iter(
+                    [pd.DataFrame({"n": [0, 1]}), pd.DataFrame({"n": [2, 3]}, index=[2, 3])]
+                )
+                self._calls = 0
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                self._calls += 1
+                if self._calls == 2:
+                    requested.set()
+                    assert closed.wait(10)
+                return next(self._chunks)
+
+        result_set = _fetching_result_set(Chunks(), arraysize=3)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(result_set.fetchall)
+            assert requested.wait(10)
+            result_set.close()
+            closed.set()
+            rows = future.result(10)
+        assert rows == [(0,), (1,)]
+        assert result_set.rownumber is None
 
     def test_fetchmany_size_not_integer(self):
         """A size that is not an integer raises TypeError without consuming rows."""

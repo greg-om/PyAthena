@@ -335,6 +335,7 @@ class PandasDataFrameIterator(abc.Iterator):  # type: ignore[type-arg]
             self._reader = reader
         self._trunc_date = trunc_date
         self._csv_stream = csv_stream
+        self._closed = False
 
     @override
     def __next__(self) -> DataFrame:
@@ -370,6 +371,7 @@ class PandasDataFrameIterator(abc.Iterator):  # type: ignore[type-arg]
         """Close the iterator and release resources."""
         from pandas.io.parsers import TextFileReader
 
+        self._closed = True
         reader = self._reader
         self._reader = iter(())
         try:
@@ -401,7 +403,8 @@ class PandasDataFrameIterator(abc.Iterator):  # type: ignore[type-arg]
         ``DataFrame.itertuples(index=False, name=None)`` gives them, so columns
         with the same name keep their own values. The next chunk is read when the
         rows of the current one run out. After an exception, such as a value that
-        fails to convert, the iteration ends.
+        fails to convert, the iteration ends. After ``close()``, it ends at the
+        next block of rows.
 
         Yields:
             The rows of all remaining chunks.
@@ -409,6 +412,8 @@ class PandasDataFrameIterator(abc.Iterator):  # type: ignore[type-arg]
         # Resuming a block after an exception within a row would misalign its columns.
         for df in self:
             for block in self._iter_row_blocks(df):
+                if self._closed:
+                    return
                 yield from block
 
     def _iter_row_blocks(self, df: DataFrame) -> Iterator[Iterator[tuple[Any, ...]]]:
@@ -431,11 +436,13 @@ class PandasDataFrameIterator(abc.Iterator):  # type: ignore[type-arg]
         # Each column's values, and whether a slice of them is converted with tolist().
         columns: list[tuple[Any, bool]] = []
         for i in range(df.shape[1]):
-            array = df.iloc[:, i].array
+            series = df.iloc[:, i]
+            array = series.array
             if isinstance(array.dtype, pd.StringDtype):
                 columns.append((array, True))
             elif isinstance(array, pd.arrays.NumpyExtensionArray):
-                columns.append((array.to_numpy(), True))
+                # NumpyExtensionArray.to_numpy() would scan the whole column for missing values.
+                columns.append((series.to_numpy(), True))
             else:
                 columns.append((array, False))
         size = self._ROW_BLOCK_SIZE
@@ -942,8 +949,9 @@ class AthenaPandasResultSet(AthenaResultSet):
         self,
     ) -> tuple[Any | None, ...] | dict[Any, Any | None] | None:
         row = next(self._row_iter, None)
-        if row is not None:
-            self._rownumber = (self._rownumber or 0) + 1
+        # A result set closed meanwhile, from another thread, keeps its rownumber None.
+        if row is not None and self._rownumber is not None:
+            self._rownumber += 1
         return row
 
     @override
@@ -964,17 +972,23 @@ class AthenaPandasResultSet(AthenaResultSet):
     def _take_rows(self, size: int | None) -> list[tuple[Any | None, ...] | dict[Any, Any | None]]:
         """Take the next rows and count them in ``rownumber``.
 
+        The rows taken before an exception are counted too, as the base class's
+        ``fetchone()`` per row counted them.
+
         Args:
             size: The maximum number of rows, or None for all remaining rows.
 
         Returns:
             The rows, fewer than ``size`` when the result is exhausted.
         """
-        rows: list[tuple[Any | None, ...] | dict[Any, Any | None]] = list(
-            islice(self._row_iter, size)
-        )
-        if rows:
-            self._rownumber = (self._rownumber or 0) + len(rows)
+        rows: list[tuple[Any | None, ...] | dict[Any, Any | None]] = []
+        try:
+            # extend() keeps the rows that it appended before an exception.
+            rows.extend(islice(self._row_iter, size))
+        finally:
+            # A result set closed meanwhile, from another thread, keeps its rownumber None.
+            if rows and self._rownumber is not None:
+                self._rownumber += len(rows)
         return rows
 
     def _read_csv(self) -> TextFileReader | DataFrame:
